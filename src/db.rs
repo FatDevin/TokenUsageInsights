@@ -1560,17 +1560,33 @@ fn portable_relative_path(root: &Path, path: &Path) -> String {
         .join("/")
 }
 
-#[cfg(windows)]
-fn codex_transcript_path_key(path: &str) -> String {
-    path.replace('\\', "/").to_ascii_lowercase()
+fn codex_transcript_path_key_for_platform(path: &str, is_windows: bool) -> String {
+    if is_windows {
+        path.replace('\\', "/").to_ascii_lowercase()
+    } else {
+        path.to_string()
+    }
 }
 
-#[cfg(not(windows))]
 fn codex_transcript_path_key(path: &str) -> String {
-    path.to_string()
+    codex_transcript_path_key_for_platform(path, cfg!(windows))
 }
 
-fn load_codex_transcript_paths(conn: &Connection) -> Result<HashSet<String>, String> {
+fn group_codex_transcript_paths(
+    paths: impl IntoIterator<Item = String>,
+    is_windows: bool,
+) -> HashMap<String, Vec<String>> {
+    let mut grouped_paths: HashMap<String, Vec<String>> = HashMap::new();
+    for path in paths {
+        grouped_paths
+            .entry(codex_transcript_path_key_for_platform(&path, is_windows))
+            .or_default()
+            .push(path);
+    }
+    grouped_paths
+}
+
+fn load_codex_transcript_paths(conn: &Connection) -> Result<HashMap<String, Vec<String>>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT DISTINCT transcript_path
@@ -1581,12 +1597,12 @@ fn load_codex_transcript_paths(conn: &Connection) -> Result<HashSet<String>, Str
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|error| format!("讀取 Codex transcript 路徑失敗: {error}"))?;
-    let mut paths = HashSet::new();
+    let mut paths = Vec::new();
     for row in rows {
         let path = row.map_err(|error| format!("解析 Codex transcript 路徑失敗: {error}"))?;
-        paths.insert(codex_transcript_path_key(&path));
+        paths.push(path);
     }
-    Ok(paths)
+    Ok(group_codex_transcript_paths(paths, cfg!(windows)))
 }
 
 fn codex_transcript_needs_sync(
@@ -1644,8 +1660,9 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
         };
         let current_size = metadata.len();
         let transcript_path = filepath.to_string_lossy().into_owned();
-        let transcript_is_current =
-            transcript_paths.contains(&codex_transcript_path_key(&transcript_path));
+        let transcript_path_key = codex_transcript_path_key(&transcript_path);
+        let known_transcript_paths = transcript_paths.get(&transcript_path_key);
+        let transcript_is_current = known_transcript_paths.is_some();
 
         if codex_transcript_needs_sync(current_size, last_synced_state, transcript_is_current) {
             let parsed_entries = match parse_codex_session_file(&filepath) {
@@ -1675,22 +1692,23 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 .transaction()
                 .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
 
-            #[cfg(windows)]
-            let transcript_delete_result = tx.execute(
-                "DELETE FROM usage_entries
-                 WHERE assistant_type = 'codex'
-                   AND (transcript_path = ? COLLATE NOCASE
-                        OR transcript_path = ? COLLATE NOCASE)",
-                params![transcript_path, transcript_path.replace('\\', "/")],
-            );
-            #[cfg(not(windows))]
-            let transcript_delete_result = tx.execute(
-                "DELETE FROM usage_entries
-                 WHERE assistant_type = 'codex' AND transcript_path = ?",
-                params![transcript_path],
-            );
-            transcript_delete_result
+            if let Some(existing_paths) = known_transcript_paths {
+                for existing_path in existing_paths {
+                    tx.execute(
+                        "DELETE FROM usage_entries
+                         WHERE assistant_type = 'codex' AND transcript_path = ?",
+                        params![existing_path],
+                    )
+                    .map_err(|e| format!("清空舊 Codex transcript 資料失敗: {}", e))?;
+                }
+            } else {
+                tx.execute(
+                    "DELETE FROM usage_entries
+                     WHERE assistant_type = 'codex' AND transcript_path = ?",
+                    params![transcript_path],
+                )
                 .map_err(|e| format!("清空舊 Codex transcript 資料失敗: {}", e))?;
+            }
 
             let session_ids: HashSet<String> = parsed_entries
                 .iter()
@@ -4986,6 +5004,18 @@ mod tests {
             Some((10, CODEX_EMPTY_TRANSCRIPT_SYNC_TIME)),
             false
         ));
+    }
+
+    #[test]
+    fn windows_codex_transcript_paths_keep_original_values_for_indexed_deletion() {
+        let stored_path =
+            "C:/USERS/RUNNER/APPDATA/LOCAL/TEMP/CODEX/SESSIONS/SESSION.JSONL".to_string();
+        let current_path = r"c:\users\runner\appdata\local\temp\codex\sessions\session.jsonl";
+
+        let grouped_paths = group_codex_transcript_paths([stored_path.clone()], true);
+        let current_key = codex_transcript_path_key_for_platform(current_path, true);
+
+        assert_eq!(grouped_paths.get(&current_key), Some(&vec![stored_path]));
     }
 
     #[test]

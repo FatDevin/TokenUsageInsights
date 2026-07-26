@@ -6,6 +6,17 @@
 
 目前沒有尚未發行的變更。
 
+## [0.6.1] - 2026-07-26
+
+### 修正
+
+- 修正 Windows 上既有 Codex transcript 路徑使用不同大小寫或斜線格式時，重新同步可能無法移除舊路徑記錄，造成同一 Session 留下重複資料的問題。
+- transcript 路徑會以正規化鍵進行跨格式比對，刪除資料時則使用資料庫保存的原始路徑精確命中索引。
+
+### 相容性
+
+- Windows、macOS 與 Linux 的既有 Codex Session、API、資料庫結構及 `CODEX_DIR` 設定維持相容，不需要手動遷移。
+
 ## [0.6.0] - 2026-07-26
 
 ### 新增與改善
@@ -275,7 +286,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.6.0...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.4.0...v0.4.1
