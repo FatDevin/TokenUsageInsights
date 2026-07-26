@@ -80,18 +80,18 @@ fn resolve_codex_transcript_path(
     }
 
     if !path.exists() {
-        return Err("找不到該 Codex CLI 會話的本地日誌檔案。".to_string());
+        return Err("找不到該 Codex 會話的本地日誌檔案。".to_string());
     }
 
     let codex_root = codex_dir
         .canonicalize()
-        .map_err(|_| "無法存取 Codex CLI 根目錄。".to_string())?;
+        .map_err(|_| "無法存取 Codex 根目錄。".to_string())?;
     let canonical_path = path
         .canonicalize()
-        .map_err(|_| "無法解析 Codex CLI 會話日誌路徑。".to_string())?;
+        .map_err(|_| "無法解析 Codex 會話日誌路徑。".to_string())?;
 
     if !canonical_path.starts_with(codex_root) {
-        return Err("Codex CLI 會話日誌路徑不在預期目錄內。".to_string());
+        return Err("Codex 會話日誌路徑不在預期目錄內。".to_string());
     }
 
     Ok(canonical_path)
@@ -204,7 +204,7 @@ fn resolve_session_file_path(
             let path = transcript_path_db.ok_or_else(|| {
                 (
                     StatusCode::NOT_FOUND,
-                    "找不到 Codex CLI 會話日誌檔案路徑。".to_string(),
+                    "找不到 Codex 會話日誌檔案路徑。".to_string(),
                 )
             })?;
             resolve_codex_transcript_path(&db::get_codex_dir(), path)
@@ -377,7 +377,8 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
         crate::paths::find_resource(&copilot_source_relative).unwrap_or(copilot_source_relative);
 
     let codex_dir = db::get_codex_dir();
-    let codex_exists = codex_dir.join("sessions").exists();
+    let codex_exists =
+        codex_dir.join("sessions").exists() || codex_dir.join("archived_sessions").exists();
 
     let claude_dir = db::get_claude_dir();
     let claude_exists = claude_dir.join("projects").exists();
@@ -413,7 +414,7 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
         },
         codex: AssistantSetupStatus {
             dir_path: codex_dir.to_string_lossy().into_owned(),
-            data_path: codex_dir.join("sessions").to_string_lossy().into_owned(),
+            data_path: codex_dir.to_string_lossy().into_owned(),
             exists: codex_exists,
             script_path: "".to_string(),
             source_script_path: "".to_string(),

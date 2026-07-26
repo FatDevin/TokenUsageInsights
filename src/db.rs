@@ -83,13 +83,15 @@ struct ClaudeUsage {
     output_tokens: u64,
 }
 
-// Codex CLI helper structs
+// Codex helper structs shared by the CLI and Desktop session formats.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct CodexTokenUsage {
     #[serde(default)]
     input_tokens: u64,
     #[serde(default)]
     cached_input_tokens: u64,
+    #[serde(default)]
+    cache_write_input_tokens: u64,
     #[serde(default)]
     output_tokens: u64,
     #[serde(default)]
@@ -99,6 +101,11 @@ struct CodexTokenUsage {
 }
 
 const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v6";
+const CODEX_SOURCE_KIND_MIGRATION_KEY: &str = "migration:codex_source_kind_v1";
+const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";
+const CODEX_DESKTOP_SOURCE_KIND: &str = "codex-desktop";
+const CODEX_OTHER_SOURCE_KIND: &str = "codex-other";
+const CODEX_EMPTY_TRANSCRIPT_SYNC_TIME: i64 = -1;
 const COPILOT_SOURCE_KIND_MIGRATION_KEY: &str = "migration:copilot_source_kind_v1";
 const VSCODE_EMPTY_SESSION_MIGRATION_KEY: &str = "migration:vscode_empty_sessions_v1";
 const COPILOT_CACHED_INPUT_MIGRATION_KEY: &str = "migration:copilot_cached_input_v1";
@@ -450,6 +457,18 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("建立助理類型索引 idx_assistant_type 失敗: {}", e))?;
 
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_assistant_transcript_path
+         ON usage_entries(assistant_type, transcript_path)",
+        [],
+    )
+    .map_err(|e| {
+        format!(
+            "建立 transcript 路徑索引 idx_assistant_transcript_path 失敗: {}",
+            e
+        )
+    })?;
+
     let _ = conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_import_source_id ON usage_entries(assistant_type, import_source_id) WHERE import_source_id IS NOT NULL",
         [],
@@ -585,6 +604,8 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
                 OR filename LIKE 'vscode:%'
                 OR filename LIKE 'codex:sessions/%'
                 OR filename LIKE 'codex:sessions\\%'
+                OR filename LIKE 'codex:archived_sessions/%'
+                OR filename LIKE 'codex:archived_sessions\\%'
                 OR filename LIKE 'claude:%'
                 OR filename LIKE 'cursor:%'",
             [],
@@ -1133,8 +1154,32 @@ fn codex_content_to_text(content: &serde_json::Value) -> String {
     parts.join(" ")
 }
 
+fn codex_source_kind_from_metadata(payload: &serde_json::Value) -> &'static str {
+    let originator = payload
+        .get("originator")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if originator.contains("desktop") {
+        return CODEX_DESKTOP_SOURCE_KIND;
+    }
+    if matches!(
+        originator.as_str(),
+        "codex-tui" | "codex_cli_rs" | "codex_exec"
+    ) {
+        return CODEX_CLI_SOURCE_KIND;
+    }
+
+    match payload.get("source").and_then(|value| value.as_str()) {
+        Some("cli" | "exec") => CODEX_CLI_SOURCE_KIND,
+        _ => CODEX_OTHER_SOURCE_KIND,
+    }
+}
+
 fn codex_usage_to_stats(usage: CodexTokenUsage) -> TokenStats {
     let cache_read = usage.cached_input_tokens;
+    let cache_write = usage.cache_write_input_tokens;
     let input = usage.input_tokens.saturating_sub(cache_read);
     let output = usage.output_tokens;
     let total = if usage.total_tokens > 0 {
@@ -1147,7 +1192,7 @@ fn codex_usage_to_stats(usage: CodexTokenUsage) -> TokenStats {
         input,
         output,
         cache_read: Some(cache_read),
-        cache_write: None,
+        cache_write: Some(cache_write),
         reasoning: Some(usage.reasoning_output_tokens),
         total,
     }
@@ -1157,17 +1202,24 @@ fn codex_usage_delta_to_stats(
     previous: Option<&CodexTokenUsage>,
     current: &CodexTokenUsage,
 ) -> TokenStats {
-    let (input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens) = match previous
-    {
+    let (
+        input_tokens,
+        cached_input_tokens,
+        cache_write_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+    ) = match previous {
         Some(previous)
             if current.input_tokens >= previous.input_tokens
                 && current.cached_input_tokens >= previous.cached_input_tokens
+                && current.cache_write_input_tokens >= previous.cache_write_input_tokens
                 && current.output_tokens >= previous.output_tokens
                 && current.reasoning_output_tokens >= previous.reasoning_output_tokens =>
         {
             (
                 current.input_tokens - previous.input_tokens,
                 current.cached_input_tokens - previous.cached_input_tokens,
+                current.cache_write_input_tokens - previous.cache_write_input_tokens,
                 current.output_tokens - previous.output_tokens,
                 current.reasoning_output_tokens - previous.reasoning_output_tokens,
             )
@@ -1175,12 +1227,14 @@ fn codex_usage_delta_to_stats(
         _ => (
             current.input_tokens,
             current.cached_input_tokens,
+            current.cache_write_input_tokens,
             current.output_tokens,
             current.reasoning_output_tokens,
         ),
     };
 
     let cache_read = cached_input_tokens;
+    let cache_write = cache_write_input_tokens;
     let input = input_tokens.saturating_sub(cache_read);
     let output = output_tokens;
     let total = input_tokens.saturating_add(output);
@@ -1189,7 +1243,7 @@ fn codex_usage_delta_to_stats(
         input,
         output,
         cache_read: Some(cache_read),
-        cache_write: None,
+        cache_write: Some(cache_write),
         reasoning: Some(reasoning_output_tokens),
         total,
     }
@@ -1225,6 +1279,7 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
     let mut agent_role: Option<String> = None;
     let mut current_model = "GPT-5.3-Codex".to_string();
     let mut reasoning_effort: Option<String> = None;
+    let mut source_kind = CODEX_OTHER_SOURCE_KIND.to_string();
     let mut session_identity_locked = false;
 
     for event in &events {
@@ -1236,6 +1291,12 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
         let payload_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         if event_type == "session_meta" {
+            let detected_source_kind = codex_source_kind_from_metadata(payload);
+            if source_kind == CODEX_OTHER_SOURCE_KIND
+                || detected_source_kind == CODEX_DESKTOP_SOURCE_KIND
+            {
+                source_kind = detected_source_kind.to_string();
+            }
             if !session_identity_locked {
                 if let Some(id) = payload
                     .get("id")
@@ -1404,7 +1465,7 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
             delta_tokens: Some(delta_tokens),
             context,
             cost: None,
-            source_kind: None,
+            source_kind: Some(source_kind.clone()),
             parent_session_id: parent_session_id.clone(),
             agent_nickname: agent_nickname.clone(),
             agent_role: agent_role.clone(),
@@ -1438,7 +1499,9 @@ fn run_codex_parser_migration(conn: &mut Connection) -> Result<(), String> {
         tx.execute(
             "DELETE FROM sync_state
              WHERE filename LIKE 'codex:sessions/%'
-                OR filename LIKE 'codex:sessions\\%'",
+                OR filename LIKE 'codex:sessions\\%'
+                OR filename LIKE 'codex:archived_sessions/%'
+                OR filename LIKE 'codex:archived_sessions\\%'",
             [],
         )
         .map_err(|e| format!("清除 Codex 同步狀態失敗: {}", e))?;
@@ -1453,6 +1516,41 @@ fn run_codex_parser_migration(conn: &mut Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn run_codex_source_kind_migration(conn: &mut Connection) -> Result<(), String> {
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![CODEX_SOURCE_KIND_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if migration_done {
+        return Ok(());
+    }
+
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("Codex 來源分類遷移 BEGIN 失敗: {error}"))?;
+    tx.execute(
+        "DELETE FROM sync_state
+         WHERE filename LIKE 'codex:sessions/%'
+            OR filename LIKE 'codex:sessions\\%'
+            OR filename LIKE 'codex:archived_sessions/%'
+            OR filename LIKE 'codex:archived_sessions\\%'",
+        [],
+    )
+    .map_err(|error| format!("清除 Codex 來源分類同步狀態失敗: {error}"))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+         VALUES (?, 1, 0)",
+        params![CODEX_SOURCE_KIND_MIGRATION_KEY],
+    )
+    .map_err(|error| format!("記錄 Codex 來源分類遷移失敗: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("Codex 來源分類遷移 COMMIT 失敗: {error}"))
+}
+
 fn portable_relative_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -1462,46 +1560,114 @@ fn portable_relative_path(root: &Path, path: &Path) -> String {
         .join("/")
 }
 
+#[cfg(windows)]
+fn codex_transcript_path_key(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
+}
+
+#[cfg(not(windows))]
+fn codex_transcript_path_key(path: &str) -> String {
+    path.to_string()
+}
+
+fn load_codex_transcript_paths(conn: &Connection) -> Result<HashSet<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT transcript_path
+             FROM usage_entries
+             WHERE assistant_type = 'codex' AND transcript_path IS NOT NULL",
+        )
+        .map_err(|error| format!("準備讀取 Codex transcript 路徑失敗: {error}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("讀取 Codex transcript 路徑失敗: {error}"))?;
+    let mut paths = HashSet::new();
+    for row in rows {
+        let path = row.map_err(|error| format!("解析 Codex transcript 路徑失敗: {error}"))?;
+        paths.insert(codex_transcript_path_key(&path));
+    }
+    Ok(paths)
+}
+
+fn codex_transcript_needs_sync(
+    current_size: u64,
+    last_synced_state: Option<(u64, i64)>,
+    transcript_is_current: bool,
+) -> bool {
+    match last_synced_state {
+        None => true,
+        Some((last_synced_size, _)) if last_synced_size != current_size => true,
+        Some((_, last_synced_time)) => {
+            !transcript_is_current && last_synced_time != CODEX_EMPTY_TRANSCRIPT_SYNC_TIME
+        }
+    }
+}
+
 fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
     let codex_dir = get_codex_dir();
-    let sessions_dir = codex_dir.join("sessions");
 
     run_codex_parser_migration(conn)?;
+    run_codex_source_kind_migration(conn)?;
 
-    if !sessions_dir.exists() {
+    let mut files = Vec::new();
+    for directory in [
+        codex_dir.join("sessions"),
+        codex_dir.join("archived_sessions"),
+    ] {
+        files.extend(find_codex_session_files(&directory));
+    }
+    files.sort();
+
+    if files.is_empty() {
         return Ok(());
     }
 
-    let files = find_codex_session_files(&sessions_dir);
+    let transcript_paths = load_codex_transcript_paths(conn)?;
 
     for filepath in files {
         let state_path = portable_relative_path(&codex_dir, &filepath);
         let state_key = format!("codex:{}", state_path);
 
-        let last_synced_size: u64 = conn
+        let last_synced_state: Option<(u64, i64)> = conn
             .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
+                "SELECT last_synced_size, last_synced_time
+                 FROM sync_state
+                 WHERE filename = ?",
                 params![state_key],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .unwrap_or(0u64);
+            .ok();
 
         let metadata = match fs::metadata(&filepath) {
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
         let current_size = metadata.len();
+        let transcript_path = filepath.to_string_lossy().into_owned();
+        let transcript_is_current =
+            transcript_paths.contains(&codex_transcript_path_key(&transcript_path));
 
-        if current_size != last_synced_size {
+        if codex_transcript_needs_sync(current_size, last_synced_state, transcript_is_current) {
             let parsed_entries = match parse_codex_session_file(&filepath) {
                 Ok(entries) => entries,
                 Err(e) => {
-                    eprintln!("解析 Codex CLI 會話檔案 {:?} 失敗: {}", filepath, e);
+                    eprintln!("解析 Codex 會話檔案 {:?} 失敗: {}", filepath, e);
                     continue;
                 }
             };
 
             if parsed_entries.is_empty() {
+                conn.execute(
+                    "INSERT OR REPLACE INTO sync_state
+                     (filename, last_synced_size, last_synced_time)
+                     VALUES (?, ?, ?)",
+                    params![
+                        state_key,
+                        current_size as i64,
+                        CODEX_EMPTY_TRANSCRIPT_SYNC_TIME
+                    ],
+                )
+                .map_err(|error| format!("記錄空白 Codex transcript 同步狀態失敗: {error}"))?;
                 continue;
             }
 
@@ -1509,7 +1675,6 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 .transaction()
                 .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
 
-            let transcript_path = filepath.to_string_lossy().into_owned();
             #[cfg(windows)]
             let transcript_delete_result = tx.execute(
                 "DELETE FROM usage_entries
@@ -1525,7 +1690,7 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 params![transcript_path],
             );
             transcript_delete_result
-                .map_err(|e| format!("清空舊 Codex CLI transcript 資料失敗: {}", e))?;
+                .map_err(|e| format!("清空舊 Codex transcript 資料失敗: {}", e))?;
 
             let session_ids: HashSet<String> = parsed_entries
                 .iter()
@@ -1536,7 +1701,7 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                     "DELETE FROM usage_entries WHERE assistant_type = 'codex' AND session_id = ?",
                     params![session_id],
                 )
-                .map_err(|e| format!("清空舊 Codex CLI Session 資料失敗: {}", e))?;
+                .map_err(|e| format!("清空舊 Codex Session 資料失敗: {}", e))?;
             }
 
             let mut success = true;
@@ -1547,13 +1712,14 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
 
                 let insert_res = tx.execute(
                     "INSERT INTO usage_entries (
-                        assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                        assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                         tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
                         delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
                         duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         "codex",
+                        entry.source_kind.as_deref().unwrap_or(CODEX_OTHER_SOURCE_KIND),
                         entry.timestamp,
                         entry.timestamp.get(0..10).unwrap_or("unknown"),
                         entry.session_id,
@@ -1586,10 +1752,7 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 );
 
                 if let Err(e) = insert_res {
-                    eprintln!(
-                        "寫入 Codex CLI 資料庫失敗 (turn_no {}): {}",
-                        entry.turn_no, e
-                    );
+                    eprintln!("寫入 Codex 資料庫失敗 (turn_no {}): {}", entry.turn_no, e);
                     success = false;
                     break;
                 }
@@ -2372,9 +2535,9 @@ pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
         eprintln!("❌ 同步 VS Code Copilot 失敗: {}", e);
     }
 
-    // 3. Sync Codex CLI
+    // 3. Sync Codex CLI and Desktop
     if let Err(e) = sync_codex_usage_logs(conn) {
-        eprintln!("❌ 同步 Codex CLI 失敗: {}", e);
+        eprintln!("❌ 同步 Codex 失敗: {}", e);
     }
 
     // 4. Sync Claude Code
@@ -4212,6 +4375,110 @@ mod tests {
     }
 
     #[test]
+    fn parse_codex_desktop_session_preserves_source_and_cache_write_tokens() {
+        let path = temp_jsonl_path("codex-desktop");
+        let content = r#"{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"desktop-session","session_id":"desktop-session","originator":"Codex Desktop","source":"vscode","cwd":"/tmp/project","cli_version":"0.145.0-alpha.30"}}
+{"timestamp":"2026-07-26T10:00:00.500Z","type":"session_meta","payload":{"id":"desktop-session","session_id":"desktop-session","source":"cli","cwd":"/tmp/project","cli_version":"0.145.0-alpha.30"}}
+{"timestamp":"2026-07-26T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"cache_write_input_tokens":5,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+{"timestamp":"2026-07-26T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":30,"cache_write_input_tokens":8,"output_tokens":15,"reasoning_output_tokens":7,"total_tokens":165},"model_context_window":258400}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.source_kind.as_deref() == Some(CODEX_DESKTOP_SOURCE_KIND)));
+
+        let first = entries[0].delta_tokens.as_ref().unwrap();
+        assert_eq!(first.cache_write, Some(5));
+
+        let second = entries[1].delta_tokens.as_ref().unwrap();
+        assert_eq!(second.input, 40);
+        assert_eq!(second.cache_read, Some(10));
+        assert_eq!(second.cache_write, Some(3));
+        assert_eq!(second.output, 5);
+        assert_eq!(second.reasoning, Some(3));
+        assert_eq!(second.total, 55);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_tracks_archived_and_unarchived_desktop_sessions() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-archive-sync-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir.join("sessions/2026/07/26");
+        let archived_dir = codex_dir.join("archived_sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&archived_dir).unwrap();
+        let active_path = sessions_dir.join("rollout-2026-07-26T10-00-00-desktop-session.jsonl");
+        let archived_path = archived_dir.join("rollout-2026-07-26T10-00-00-desktop-session.jsonl");
+        let content = r#"{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"desktop-session","session_id":"desktop-session","originator":"Codex Desktop","source":"vscode","cwd":"/tmp/project","cli_version":"0.145.0-alpha.30"}}
+{"timestamp":"2026-07-26T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"cache_write_input_tokens":5,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+"#;
+
+        fs::write(&active_path, content).unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let first_sync: (String, String, u64) = conn
+            .query_row(
+                "SELECT source_kind, transcript_path, tokens_cache_write
+                 FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'desktop-session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(first_sync.0, CODEX_DESKTOP_SOURCE_KIND);
+        assert_eq!(PathBuf::from(first_sync.1), active_path);
+        assert_eq!(first_sync.2, 5);
+
+        fs::rename(&active_path, &archived_path).unwrap();
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let archived_transcript: String = conn
+            .query_row(
+                "SELECT transcript_path FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'desktop-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(PathBuf::from(archived_transcript), archived_path);
+
+        fs::rename(&archived_path, &active_path).unwrap();
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let restored_transcript: String = conn
+            .query_row(
+                "SELECT transcript_path FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'desktop-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(PathBuf::from(restored_transcript), active_path);
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
     fn sync_codex_usage_logs_writes_recomputed_delta_totals() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_codex_dir = std::env::var("CODEX_DIR").ok();
@@ -4422,6 +4689,7 @@ mod tests {
             "{{\"timestamp\":\"2026-07-10T03:45:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"child-session\"}}}}\n{}",
             " ".repeat(1000)
         );
+        let empty_child_size = empty_child_content.len() as u64;
         fs::write(&child_path, empty_child_content).unwrap();
         assert_ne!(fs::metadata(&child_path).unwrap().len(), synced_child_size);
         sync_codex_usage_logs(&mut conn).unwrap();
@@ -4432,15 +4700,18 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let state_size_after_empty_parse: u64 = conn
+        let state_after_empty_parse: (u64, i64) = conn
             .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
+                "SELECT last_synced_size, last_synced_time
+                 FROM sync_state
+                 WHERE filename = ?",
                 params![child_state_key],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(preserved_child_rows, 1);
-        assert_eq!(state_size_after_empty_parse, synced_child_size);
+        assert_eq!(state_after_empty_parse.0, empty_child_size);
+        assert_eq!(state_after_empty_parse.1, CODEX_EMPTY_TRANSCRIPT_SYNC_TIME);
 
         if let Some(value) = old_codex_dir {
             std::env::set_var("CODEX_DIR", value);
@@ -4606,6 +4877,163 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state_after_second_run, 1);
+    }
+
+    #[test]
+    fn codex_source_kind_migration_resets_active_and_archived_state_once() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for key in [
+            "codex:sessions/2026/07/active.jsonl",
+            r"codex:sessions\2026\07\active.jsonl",
+            "codex:archived_sessions/archived.jsonl",
+            r"codex:archived_sessions\archived.jsonl",
+            "codex:claude:legacy.jsonl",
+        ] {
+            conn.execute(
+                "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+                 VALUES (?, 10, 0)",
+                params![key],
+            )
+            .unwrap();
+        }
+
+        run_codex_source_kind_migration(&mut conn).unwrap();
+
+        let codex_transcript_states: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state
+                 WHERE filename LIKE 'codex:sessions%'
+                    OR filename LIKE 'codex:archived_sessions%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let unrelated_state: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state
+                 WHERE filename = 'codex:claude:legacy.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(codex_transcript_states, 0);
+        assert_eq!(unrelated_state, 1);
+
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('codex:archived_sessions/new.jsonl', 10, 0)",
+            [],
+        )
+        .unwrap();
+        run_codex_source_kind_migration(&mut conn).unwrap();
+        let state_after_second_run: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state
+                 WHERE filename = 'codex:archived_sessions/new.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_after_second_run, 1);
+    }
+
+    #[test]
+    fn init_db_indexes_assistant_transcript_path_lookups() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let mut index_columns = conn
+            .prepare("PRAGMA index_info('idx_assistant_transcript_path')")
+            .unwrap();
+        let columns: Vec<String> = index_columns
+            .query_map([], |row| row.get(2))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(columns, ["assistant_type", "transcript_path"]);
+
+        let mut query_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT EXISTS(
+                    SELECT 1 FROM usage_entries
+                    WHERE assistant_type = 'codex' AND transcript_path = ?
+                 )",
+            )
+            .unwrap();
+        let details: Vec<String> = query_plan
+            .query_map(["/tmp/session.jsonl"], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_assistant_transcript_path")),
+            "查詢計畫未使用 transcript 路徑索引：{details:?}"
+        );
+    }
+
+    #[test]
+    fn codex_sync_skips_unchanged_empty_transcripts() {
+        assert!(codex_transcript_needs_sync(10, None, false));
+        assert!(codex_transcript_needs_sync(10, Some((9, 0)), true));
+        assert!(codex_transcript_needs_sync(10, Some((10, 0)), false));
+        assert!(!codex_transcript_needs_sync(10, Some((10, 0)), true));
+        assert!(!codex_transcript_needs_sync(
+            10,
+            Some((10, CODEX_EMPTY_TRANSCRIPT_SYNC_TIME)),
+            false
+        ));
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_records_empty_transcript_state() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-empty-sync-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir.join("sessions/2026/07/26");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let transcript_path = sessions_dir.join("empty-session.jsonl");
+        let content = r#"{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"empty-session","session_id":"empty-session","originator":"Codex Desktop"}}"#;
+        fs::write(&transcript_path, content).unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let state_key = format!(
+            "codex:{}",
+            portable_relative_path(&codex_dir, &transcript_path)
+        );
+        let state: (u64, i64) = conn
+            .query_row(
+                "SELECT last_synced_size, last_synced_time
+                 FROM sync_state
+                 WHERE filename = ?",
+                params![state_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+
+        assert_eq!(state.0, content.len() as u64);
+        assert_eq!(state.1, CODEX_EMPTY_TRANSCRIPT_SYNC_TIME);
     }
 
     #[test]

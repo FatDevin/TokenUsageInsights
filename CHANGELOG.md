@@ -6,6 +6,32 @@
 
 目前沒有尚未發行的變更。
 
+## [0.6.0] - 2026-07-26
+
+### 新增與改善
+
+- Codex 用量收集擴充至 Codex Desktop，並在每日 Session 清單以 `Desktop` 或 `CLI` 標記來源。
+- 同時掃描 `~/.codex/sessions` 與 `~/.codex/archived_sessions`，納入作用中及已封存的 Codex Session。
+- 保存 Codex transcript 提供的 cache-write Token，讓快取寫入統計更完整。
+
+### 修正
+
+- 修正 Codex Session 封存後因 transcript 移動至 `archived_sessions` 而無法同步或開啟時間軸的問題。
+- 修正 Session 從封存狀態還原後，既有同步狀態可能讓資料庫保留舊 transcript 路徑的問題。
+- 修正大量 Codex transcript 會讓啟動同步阻塞 HTTP 服務的問題；看板現在會先開始監聽，再於背景執行增量同步。
+- 修正背景同步逐檔掃描全部 Codex 資料列，並重複解析沒有 Token 事件之 transcript 的效能問題。
+
+### 資料影響
+
+- 新增一次性 Codex 來源分類遷移；下次同步會重新掃描既有 Codex transcript，將可辨識的記錄分類為 Desktop 或 CLI。
+- 自動建立 `(assistant_type, transcript_path)` 複合索引，加速 transcript 路徑查詢與重建。
+- 沒有 Token 事件的 Codex transcript 會以同步狀態標記為已檢查；後續只有檔案大小改變時才重新解析，不會新增虛構的用量資料。
+
+### 相容性
+
+- `codex` 助理識別碼、既有 API 與 `CODEX_DIR` 環境變數維持相容；Codex Session 的 `source_kind` 會由 `legacy` 更新為可辨識的來源值。
+- 資料庫索引與同步狀態會自動建立，不需要手動遷移或調整安裝設定。
+
 ## [0.5.0] - 2026-07-20
 
 ### 新增與改善
@@ -249,7 +275,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.5.0...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.3.2...v0.4.0

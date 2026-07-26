@@ -1,6 +1,6 @@
 # Token 戰情室
 
-**Token 戰情室是本地優先的 AI CLI 與 VS Code Copilot Token 使用量與會話還原看板。** 它會讀取本機上的 Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot Chat（VS Code）、Codex CLI 與 Claude Code 記錄，集中呈現每日、月度、年度的 Token 消耗、快取使用、推理 Token、估算費用、模型分佈、專案目錄分佈與完整 Session 時間軸。
+**Token 戰情室是本機優先的 AI Coding Agent Token 使用量與會話還原看板。** 它會讀取本機上的 Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI 與 Claude Code 記錄，集中呈現每日、月度、年度的 Token 消耗、快取使用、推理 Token、估算費用、模型分佈、專案目錄分佈與完整 Session 時間軸。
 
 本專案不會替你呼叫 AI 供應商 API 查詢資料；核心資料來源是本機日誌、Status Line 收集檔與本機 SQLite。
 
@@ -32,17 +32,17 @@ irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/
 http://localhost:3003
 ```
 
-### 2. 依你使用的 CLI 決定是否需要設定
+### 2. 依你使用的工具決定是否需要設定
 
-| CLI | 是否需要額外設定 | 預設資料來源 | 說明 |
+| 工具 | 是否需要額外設定 | 預設資料來源 | 說明 |
 | --- | --- | --- | --- |
 | Google Antigravity CLI | 需要 | `~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl` | 透過 `statusline-token.sh` 或 Windows `statusline-token.ps1` 收集 Token 資料 |
 | GitHub Copilot CLI | 需要 | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | 透過 `statusline-token.sh` 或 Windows `statusline-token.ps1` 收集 Token 資料 |
 | GitHub Copilot Chat（VS Code） | 不需要 | VS Code `workspaceStorage/chatSessions` | 看板直接掃描 VS Code Stable 與 Insiders 的本機聊天 Session |
-| Codex CLI | 不需要 | `~/.codex/sessions` | 看板會直接掃描 Codex CLI 本機 Session 記錄 |
+| Codex Desktop / CLI | 不需要 | `~/.codex/sessions`、`~/.codex/archived_sessions` | 看板會直接掃描 Codex 作用中與已封存的本機 Session 記錄 |
 | Claude Code | 不需要 | `~/.claude/projects` | 看板會直接掃描 Claude Code 本機專案 Session 記錄 |
 
-**只使用 VS Code Copilot、Codex CLI 或 Claude Code 時，執行一行安裝指令並開啟看板即可。**
+**只使用 VS Code Copilot、Codex Desktop、Codex CLI 或 Claude Code 時，執行一行安裝指令並開啟看板即可。**
 
 ### Windows 原生使用
 
@@ -230,27 +230,29 @@ $env:VSCODE_USER_DATA_DIR = "C:\path\to\vscode-user-data"; & "$HOME\bin\token-us
 
 * * *
 
-## Codex CLI 設定
+## Codex 設定
 
-**Codex CLI 不需要安裝 Hook、Status Line 或額外收集腳本。**
+**Codex Desktop 與 Codex CLI 都不需要安裝 Hook、Status Line 或額外收集腳本。**
 
 看板會直接掃描：
 
 ```text
 ~/.codex/sessions
+~/.codex/archived_sessions
 ```
 
 使用方式：
 
-1. 先正常使用 Codex CLI 產生至少一個 Session。
+1. 先正常使用 Codex Desktop 或 Codex CLI 產生至少一個 Session。
 2. 啟動本專案。
-3. 在左側選擇 Codex CLI。
+3. 在左側選擇 Codex。
 4. 按右上角同步按鈕，或等待背景同步。
 
 注意事項：
 
-- Codex CLI 的身份憑證仍由 Codex CLI 自身管理。
-- 看板只讀取本地 Session 記錄並做分析。
+- Codex 的身分憑證仍由 Codex 自身管理。
+- 看板只讀取本機 Session 記錄並做分析。
+- 每個 Session 會依 transcript 的 `originator` 顯示 `Desktop` 或 `CLI` 來源標記；無法判定的舊格式會維持未分類。
 - API 額度資訊若有顯示，來源是最後一次本機 Session 日誌，不是即時線上查詢。
 
 * * *
@@ -355,7 +357,7 @@ cargo build --release --bin token-usage-insights-cli
 | `COPILOT_DIR` | `~/.copilot` | Copilot CLI 資料目錄 |
 | `VSCODE_USER_DATA_DIR` | 依平台自動偵測 | VS Code 使用者資料目錄，應包含 `User/workspaceStorage` |
 | `VSCODE_PORTABLE_DATA_DIR` | 未設定 | VS Code Portable Mode 的 `data` 目錄 |
-| `CODEX_DIR` | `~/.codex` | Codex CLI 資料目錄 |
+| `CODEX_DIR` | `~/.codex` | Codex Desktop 與 Codex CLI 共用資料目錄 |
 | `CLAUDE_DIR` | `~/.claude` | Claude Code 資料目錄 |
 | `CURSOR_DIR` | `~/.cursor` | Cursor 資料目錄 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 允許的 CORS 來源，逗號分隔 |
@@ -431,7 +433,7 @@ token-usage-insights
 
 | 變數 | 適用平台 | 說明 |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安裝的 Release tag，例如 `v0.5.0`。預設 `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安裝的 Release tag，例如 `v0.6.0`。預設 `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | 安裝目錄，會轉交給 `install.sh` |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | 執行檔連結目錄，會轉交給 `install.sh` |
 
@@ -536,12 +538,13 @@ systemctl --user reset-failed
 
 ### 看板沒有資料
 
-依 CLI 檢查資料來源是否存在：
+依工具檢查資料來源是否存在：
 
 ```bash
 ls ~/.gemini/antigravity-cli/usage
 ls ~/.copilot/usage
 ls ~/.codex/sessions
+ls ~/.codex/archived_sessions
 ls ~/.claude/projects
 ```
 
@@ -553,6 +556,7 @@ Windows PowerShell 可直接檢查原生資料目錄：
 Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\usage"
 Get-ChildItem "$env:USERPROFILE\.copilot\usage"
 Get-ChildItem "$env:USERPROFILE\.codex\sessions"
+Get-ChildItem "$env:USERPROFILE\.codex\archived_sessions"
 Get-ChildItem "$env:USERPROFILE\.claude\projects"
 ```
 

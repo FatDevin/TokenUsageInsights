@@ -66,46 +66,45 @@ fn build_cors_layer() -> CorsLayer {
         .allow_headers([CONTENT_TYPE])
 }
 
-#[tokio::main]
-async fn main() {
-    // 初始化 SQLite 資料庫並進行第一次增量同步與遷移
-    if let Ok(mut conn) = db::get_db_conn() {
-        if let Err(e) = db::init_db(&conn) {
-            eprintln!("❌ 初始化 SQLite 資料庫失敗: {}", e);
-        } else {
-            // 嘗試從舊的個別資料庫遷移數據 (策略 B)
-            if let Err(e) = db::migrate_old_databases(&mut conn) {
-                eprintln!("⚠️ 數據遷移遭遇錯誤: {}", e);
-            }
-            if let Err(e) = db::sync_usage_logs(&mut conn) {
-                eprintln!("❌ 初次同步日誌檔到 SQLite 失敗: {}", e);
-            } else {
-                println!("✅ SQLite 資料庫已成功載入並完成增量同步！");
-            }
-        }
-    } else {
-        eprintln!("❌ 無法連結到 SQLite 資料庫");
-    }
+fn initialize_database_schema() -> Result<(), String> {
+    let conn = db::get_db_conn()?;
+    db::init_db(&conn)
+}
 
-    // 啟動背景定期日誌同步任務 (每 5 秒執行一次)
+fn spawn_usage_sync_task() {
     tokio::spawn(async {
+        let mut migrate_legacy_databases = true;
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let sync_res = tokio::task::spawn_blocking(|| {
-                if let Ok(mut conn) = db::get_db_conn() {
-                    db::sync_usage_logs(&mut conn)
-                } else {
-                    Err("無法建立背景資料庫連接".to_string())
+            let should_migrate = migrate_legacy_databases;
+            let sync_res = tokio::task::spawn_blocking(move || {
+                let mut conn = db::get_db_conn()?;
+                if should_migrate {
+                    db::migrate_old_databases(&mut conn)?;
                 }
+                db::sync_usage_logs(&mut conn)
             })
             .await;
-            if let Err(e) = sync_res {
-                eprintln!("⚠️ 背景日誌同步任務異常: {:?}", e);
-            } else if let Ok(Err(e)) = sync_res {
-                eprintln!("⚠️ 背景日誌同步失敗: {}", e);
+
+            match sync_res {
+                Ok(Ok(())) if should_migrate => {
+                    println!("✅ SQLite 資料庫已成功載入並完成增量同步！");
+                }
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("⚠️ 背景日誌同步失敗: {error}"),
+                Err(error) => eprintln!("⚠️ 背景日誌同步任務異常: {error:?}"),
             }
+
+            migrate_legacy_databases = false;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     });
+}
+
+#[tokio::main]
+async fn main() {
+    if let Err(error) = initialize_database_schema() {
+        eprintln!("❌ 初始化 SQLite 資料庫失敗: {error}");
+    }
 
     let static_dir = get_static_dir();
     println!("📂 正在服務靜態檔案，目錄來源: {:?}", static_dir);
@@ -151,6 +150,8 @@ async fn main() {
         .unwrap();
     println!("🚀 Token 戰情室 is running on: http://localhost:{}", port);
 
+    // HTTP 先開始監聽；可能耗時的遷移與 transcript 同步在 blocking thread 執行。
+    spawn_usage_sync_task();
     axum::serve(listener, app).await.unwrap();
 }
 

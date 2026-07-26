@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=27';
+import i18n from './i18n.js?v=28';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -92,7 +92,7 @@ const assistantMeta = {
   },
   codex: {
     logo: '/static/codex.webp',
-    label: 'Codex CLI',
+    label: 'Codex',
     shortLabel: 'Codex',
     alt: 'Codex',
     badgeStyle: 'background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.3); display: inline-flex; align-items: center;',
@@ -3278,11 +3278,16 @@ function renderSessionTable(sessions) {
       const meta = getAssistantMeta(s.assistant_type);
       assistantBadge = `<span class="badge" style="${meta.badgeStyle}">${getAssistantLogoHtml(s.assistant_type)} ${meta.shortLabel}</span>`;
     }
-    const sourceBadge = s.source_kind === 'vscode-chat'
-      ? '<span class="badge source-badge" title="GitHub Copilot in VS Code">VS Code</span>'
-      : (s.assistant_type === 'copilot'
-        ? '<span class="badge source-badge" title="GitHub Copilot CLI">CLI</span>'
-        : '');
+    let sourceBadge = '';
+    if (s.source_kind === 'vscode-chat') {
+      sourceBadge = '<span class="badge source-badge" title="GitHub Copilot in VS Code">VS Code</span>';
+    } else if (s.assistant_type === 'copilot') {
+      sourceBadge = '<span class="badge source-badge" title="GitHub Copilot CLI">CLI</span>';
+    } else if (s.source_kind === 'codex-desktop') {
+      sourceBadge = '<span class="badge source-badge" title="Codex Desktop">Desktop</span>';
+    } else if (s.source_kind === 'codex-cli') {
+      sourceBadge = '<span class="badge source-badge" title="Codex CLI">CLI</span>';
+    }
 
     const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td>${assistantBadge}</td>` : '';
 

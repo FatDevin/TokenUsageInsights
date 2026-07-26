@@ -4,9 +4,9 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Token 戰情室</title>
-  <meta name="description" content="Local dashboard for reviewing AI CLI token usage, estimated cost, cache usage, and session timelines.">
+  <meta name="description" content="Local dashboard for reviewing AI coding agent token usage, estimated cost, cache usage, and session timelines.">
   <meta property="og:title" content="Token 戰情室">
-  <meta property="og:description" content="Local dashboard for AI CLI token usage and session analysis.">
+  <meta property="og:description" content="Local dashboard for AI coding agent token usage and session analysis.">
   <meta property="og:type" content="website">
   <!-- Favicon -->
   <link rel="icon" type="image/x-icon" href="/static/favicon-v2.ico">
@@ -56,9 +56,9 @@
             <img class="assistant-logo" src="/static/githubcopilot.webp" alt="Copilot" />
             <span class="agent-name-tooltip">GitHub Copilot</span>
           </button>
-          <button class="assistant-badge-btn" data-value="codex" title="Codex CLI" aria-label="Codex CLI">
+          <button class="assistant-badge-btn" data-value="codex" title="Codex" aria-label="Codex">
             <img class="assistant-logo" src="/static/codex.webp" alt="Codex" />
-            <span class="agent-name-tooltip">Codex CLI</span>
+            <span class="agent-name-tooltip">Codex</span>
           </button>
           <button class="assistant-badge-btn" data-value="claude" title="Claude Code" aria-label="Claude Code">
             <img class="assistant-logo" src="/static/claude-code-logo.svg" alt="Claude Code" />
@@ -201,7 +201,7 @@
         </div>
       </div>
 
-      <!-- Section 1.5: Codex CLI Settings (visible only when Codex is selected and daily tab is active) -->
+      <!-- Section 1.5: Codex Settings (visible only when Codex is selected and daily tab is active) -->
       <div class="sidebar-section hidden" id="codex-control-panel">
         <h3 style="display: flex; align-items: center; gap: 4px; width: 100%;">
           <span data-i18n="codex_control_title">Codex 憑證</span>
@@ -995,17 +995,17 @@
       <!-- Codex Setup Content -->
       <div class="modal-body" id="setup-body-codex" style="display: none;">
         <div class="modal-text">
-          <p data-i18n="codex_setup_modal_intro">本看板主要解析並呈現 Codex CLI 的本地會話事件與 Token 數據。Codex CLI 會自動將會話記錄在 <code>~/.codex/sessions</code> 目錄下，不需要額外設定腳本或狀態列。</p>
+          <p data-i18n="codex_setup_modal_intro">本看板會解析並呈現 Codex Desktop 與 Codex CLI 的本機會話事件及 Token 數據，包含作用中與已封存的會話，不需要額外設定腳本或狀態列。</p>
         </div>
 
         <div class="modal-section">
-          <h3 data-i18n="codex_setup_step_1"><span>01</span> 1. 確認 Codex CLI 已在使用</h3>
-          <p class="modal-text" data-i18n="codex_setup_step_1_desc">只要您在終端機中執行過 Codex CLI 進行對話，會話檔案就會自動生成在此目錄中。</p>
+          <h3 data-i18n="codex_setup_step_1"><span>01</span> 1. 確認 Codex 已在使用</h3>
+          <p class="modal-text" data-i18n="codex_setup_step_1_desc">只要您在 Codex Desktop 或 Codex CLI 進行過對話，會話檔案就會自動產生在 Codex 資料目錄中。</p>
         </div>
 
         <div class="modal-section">
           <h3 data-i18n="codex_setup_step_2"><span>02</span> 2. 偵測路徑狀態</h3>
-          <p class="modal-text" data-i18n="codex_setup_step_2_desc">目前偵測到的 Codex CLI 目錄為：<code id="lbl-detected-home-codex">~/.codex/sessions</code>。本系統會以極高效率對該目錄進行即時掃描與分析。</p>
+          <p class="modal-text" data-i18n="codex_setup_step_2_desc">目前偵測到的 Codex 目錄為：<code id="lbl-detected-home-codex">~/.codex</code>。本系統會掃描其中的 <code>sessions</code> 與 <code>archived_sessions</code> 會話記錄。</p>
         </div>
 
         <div class="modal-section">
@@ -1101,6 +1101,6 @@
   <div class="sidebar-overlay" id="sidebar-overlay"></div>
 
   <!-- Frontend Javascript logic -->
-  <script type="module" src="/static/app.js?v=40"></script>
+  <script type="module" src="/static/app.js?v=41"></script>
 </body>
 </html>
