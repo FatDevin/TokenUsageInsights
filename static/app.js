@@ -8,6 +8,7 @@ import {
   getChartDataPointX,
   parseUsageTimestamp,
 } from './chart-utils.js?v=7';
+import { compareSessionRows } from './session-utils.js?v=1';
 
 // Globals
 let tokenChartInstance = null;
@@ -3101,17 +3102,7 @@ function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
     }
   });
 
-  const compare = (a, b) => {
-    let valA = a[sortCol];
-    let valB = b[sortCol];
-    if (valA === undefined || valA === null) valA = 0;
-    if (valB === undefined || valB === null) valB = 0;
-
-    if (typeof valA === 'string' && typeof valB === 'string') {
-      return sortDir === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
-    }
-    return sortDir === 'asc' ? valA - valB : valB - valA;
-  };
+  const compare = (a, b) => compareSessionRows(a, b, sortCol, sortDir);
 
   // 排序 Root 節點
   roots.sort(compare);
