@@ -14,11 +14,21 @@ use std::{
 
 use super::*;
 use crate::db::{self, TokenStats};
-use crate::pricing::{calculate_usage_cost, load_pricing_rules};
+use crate::pricing::load_pricing_rules;
 use crate::timeline::{
     parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
     parse_copilot_timeline, parse_cursor_timeline, parse_vscode_timeline, TimelineItem,
 };
+
+fn add_usage_to_day_summary(summary: &mut DaySummary, usage: &UsageAggregation) {
+    summary.total_tokens += usage.total_tokens;
+    summary.total_input_tokens += usage.input_tokens;
+    summary.total_output_tokens += usage.output_tokens;
+    summary.total_cache_read_tokens += usage.cache_read_tokens;
+    summary.total_cache_write_tokens += usage.cache_write_tokens;
+    summary.total_reasoning_tokens += usage.reasoning_tokens;
+    summary.total_cost_usd += usage.cost_usd;
+}
 
 fn is_safe_session_id(session_id: &str) -> bool {
     if session_id.is_empty() || session_id.len() > 128 {
@@ -500,24 +510,6 @@ pub async fn get_usage_details(
     let mut session_last_entries: HashMap<String, UsageEntry> = HashMap::new();
 
     for e in &entries {
-        if let Some(ref tokens) = e.delta_tokens {
-            summary.total_tokens += tokens.total;
-            summary.total_input_tokens += tokens.input;
-            summary.total_output_tokens += tokens.output;
-            summary.total_cache_read_tokens += tokens.cache_read.unwrap_or(0);
-            summary.total_cache_write_tokens += tokens.cache_write.unwrap_or(0);
-            summary.total_reasoning_tokens += tokens.reasoning.unwrap_or(0);
-        } else if let Some(ref tokens) = e.tokens {
-            if e.turn_no == 1 {
-                summary.total_tokens += tokens.total;
-                summary.total_input_tokens += tokens.input;
-                summary.total_output_tokens += tokens.output;
-                summary.total_cache_read_tokens += tokens.cache_read.unwrap_or(0);
-                summary.total_cache_write_tokens += tokens.cache_write.unwrap_or(0);
-                summary.total_reasoning_tokens += tokens.reasoning.unwrap_or(0);
-            }
-        }
-
         let sid = e.session_id.clone();
         let last_e = session_last_entries.entry(sid).or_insert_with(|| e.clone());
         if e.turn_no > last_e.turn_no {
@@ -533,46 +525,7 @@ pub async fn get_usage_details(
             .get(session_id)
             .cloned()
             .unwrap_or_else(|| s_entries[0].clone());
-
-        let session_tokens = s_entries
-            .iter()
-            .map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0))
-            .sum::<u64>();
-        let session_input_tokens = s_entries
-            .iter()
-            .map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0))
-            .sum::<u64>();
-        let session_output_tokens = s_entries
-            .iter()
-            .map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0))
-            .sum::<u64>();
-        let session_cache_read = s_entries
-            .iter()
-            .map(|e| {
-                e.delta_tokens
-                    .as_ref()
-                    .and_then(|t| t.cache_read)
-                    .unwrap_or(0)
-            })
-            .sum::<u64>();
-        let session_cache_write = s_entries
-            .iter()
-            .map(|e| {
-                e.delta_tokens
-                    .as_ref()
-                    .and_then(|t| t.cache_write)
-                    .unwrap_or(0)
-            })
-            .sum::<u64>();
-        let session_reasoning = s_entries
-            .iter()
-            .map(|e| {
-                e.delta_tokens
-                    .as_ref()
-                    .and_then(|t| t.reasoning)
-                    .unwrap_or(0)
-            })
-            .sum::<u64>();
+        let session_usage = summarize_session_usage(&pricing_rules, s_entries);
 
         let session_duration = last_entry
             .cost
@@ -588,58 +541,13 @@ pub async fn get_usage_details(
         summary.total_duration_ms += session_duration;
         summary.total_requests += session_requests;
 
-        let total_cache_read_tokens = if session_tokens > 0 {
-            session_cache_read
-        } else {
-            last_entry
-                .tokens
-                .as_ref()
-                .and_then(|t| t.cache_read)
-                .unwrap_or(0)
-        };
-        let total_cache_write_tokens = if session_tokens > 0 {
-            session_cache_write
-        } else {
-            last_entry
-                .tokens
-                .as_ref()
-                .and_then(|t| t.cache_write)
-                .unwrap_or(0)
-        };
-        let total_reasoning_tokens = if session_tokens > 0 {
-            session_reasoning
-        } else {
-            last_entry
-                .tokens
-                .as_ref()
-                .and_then(|t| t.reasoning)
-                .unwrap_or(0)
-        };
-        let total_input_tokens = if session_tokens > 0 {
-            session_input_tokens
-        } else {
-            last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0)
-        };
-        let total_output_tokens = if session_tokens > 0 {
-            session_output_tokens
-        } else {
-            last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0)
-        };
-
-        let cost_usd = match calculate_usage_cost(
-            &pricing_rules,
-            last_entry.model.as_deref(),
-            total_input_tokens,
-            total_output_tokens,
-            total_cache_read_tokens,
-        ) {
-            Ok(v) => v,
-            Err(err) => {
-                eprintln!("⚠️ 計算成本失敗: {}", err);
-                0.0
-            }
-        };
-        summary.total_cost_usd += cost_usd;
+        let total_input_tokens = session_usage.usage.input_tokens;
+        let total_output_tokens = session_usage.usage.output_tokens;
+        let total_cache_read_tokens = session_usage.usage.cache_read_tokens;
+        let total_cache_write_tokens = session_usage.usage.cache_write_tokens;
+        let total_reasoning_tokens = session_usage.usage.reasoning_tokens;
+        let cost_usd = session_usage.usage.cost_usd;
+        add_usage_to_day_summary(&mut summary, &session_usage.usage);
 
         sessions_summary.push(SessionSummary {
             session_id: session_id.clone(),
@@ -652,14 +560,8 @@ pub async fn get_usage_details(
                 .clone()
                 .unwrap_or_else(|| "legacy".to_string()),
             cwd: last_entry.cwd.unwrap_or_default(),
-            model: last_entry
-                .model
-                .unwrap_or_else(|| "Unknown Model".to_string()),
-            total_tokens: if session_tokens > 0 {
-                session_tokens
-            } else {
-                last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0)
-            },
+            model: session_usage.display_model,
+            total_tokens: session_usage.usage.total_tokens,
             total_input_tokens,
             total_output_tokens,
             total_cache_read_tokens,
@@ -1111,6 +1013,30 @@ pub async fn get_session_details(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pricing::PricingRule;
+
+    fn legacy_usage_entry(turn_no: u32, model: &str, tokens: TokenStats) -> UsageEntry {
+        UsageEntry {
+            timestamp: format!("2026-07-10T10:{turn_no:02}:00Z"),
+            session_id: "legacy-session".to_string(),
+            session_name: None,
+            transcript_path: None,
+            cwd: None,
+            version: None,
+            turn_no,
+            model: Some(model.to_string()),
+            model_id: Some(model.to_string()),
+            tokens: Some(tokens),
+            delta_tokens: None,
+            context: None,
+            cost: None,
+            source_kind: None,
+            parent_session_id: None,
+            agent_nickname: None,
+            agent_role: None,
+            reasoning_effort: None,
+        }
+    }
 
     fn user_prompt(prompt: &str, turn_no: u32) -> TimelineItem {
         TimelineItem::UserPrompt {
@@ -1143,5 +1069,63 @@ mod tests {
         ];
 
         assert!(!timeline_matches_user_prompt(&timeline, "secret keyword"));
+    }
+
+    #[test]
+    fn day_summary_uses_last_real_cumulative_legacy_entry() {
+        let rules = [PricingRule {
+            model_name: "test-model".to_string(),
+            input_price: 1.0,
+            cache_input_price: 0.1,
+            output_price: 2.0,
+        }];
+        let entries = vec![
+            legacy_usage_entry(
+                1,
+                "test-model",
+                TokenStats {
+                    input: 100,
+                    output: 20,
+                    cache_read: Some(10),
+                    cache_write: Some(0),
+                    reasoning: Some(5),
+                    total: 135,
+                },
+            ),
+            legacy_usage_entry(
+                2,
+                "test-model",
+                TokenStats {
+                    input: 200,
+                    output: 40,
+                    cache_read: Some(20),
+                    cache_write: Some(0),
+                    reasoning: Some(10),
+                    total: 270,
+                },
+            ),
+            legacy_usage_entry(
+                3,
+                "<synthetic>",
+                TokenStats {
+                    input: 0,
+                    output: 0,
+                    cache_read: Some(0),
+                    cache_write: Some(0),
+                    reasoning: Some(0),
+                    total: 0,
+                },
+            ),
+        ];
+        let session_usage = summarize_session_usage(&rules, &entries);
+        let mut summary = DaySummary::default();
+
+        add_usage_to_day_summary(&mut summary, &session_usage.usage);
+
+        assert_eq!(summary.total_tokens, 270);
+        assert_eq!(summary.total_input_tokens, 200);
+        assert_eq!(summary.total_output_tokens, 40);
+        assert_eq!(summary.total_cache_read_tokens, 20);
+        assert_eq!(summary.total_reasoning_tokens, 10);
     }
 }

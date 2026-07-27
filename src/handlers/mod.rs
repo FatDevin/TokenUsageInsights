@@ -1,4 +1,7 @@
-use crate::db::UsageEntry;
+use crate::{
+    db::{TokenStats, UsageEntry},
+    pricing::{calculate_usage_cost, PricingRule},
+};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -26,6 +29,147 @@ pub fn is_supported_assistant(assistant: &str) -> bool {
         normalize_assistant_name(assistant).as_str(),
         "antigravity" | "copilot" | "codex" | "claude" | "cursor"
     )
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UsageAggregation {
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ModelUsageAggregation {
+    pub model: String,
+    pub usage: UsageAggregation,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionUsageAggregation {
+    pub usage: UsageAggregation,
+    pub models: Vec<ModelUsageAggregation>,
+    pub display_model: String,
+}
+
+fn has_usage(tokens: &TokenStats) -> bool {
+    tokens.total > 0
+        || tokens.input > 0
+        || tokens.output > 0
+        || tokens.cache_read.unwrap_or(0) > 0
+        || tokens.cache_write.unwrap_or(0) > 0
+        || tokens.reasoning.unwrap_or(0) > 0
+}
+
+fn add_tokens(aggregation: &mut UsageAggregation, tokens: &TokenStats) {
+    aggregation.total_tokens += tokens.total;
+    aggregation.input_tokens += tokens.input;
+    aggregation.output_tokens += tokens.output;
+    aggregation.cache_read_tokens += tokens.cache_read.unwrap_or(0);
+    aggregation.cache_write_tokens += tokens.cache_write.unwrap_or(0);
+    aggregation.reasoning_tokens += tokens.reasoning.unwrap_or(0);
+}
+
+fn entry_model(entry: &UsageEntry) -> Option<&str> {
+    entry
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+}
+
+fn record_usage(
+    result: &mut SessionUsageAggregation,
+    pricing_rules: &[PricingRule],
+    entry: &UsageEntry,
+    tokens: &TokenStats,
+) {
+    let model = entry_model(entry);
+    let model_label = model.unwrap_or("Unknown Model");
+    let cost_usd = match calculate_usage_cost(
+        pricing_rules,
+        model,
+        tokens.input,
+        tokens.output,
+        tokens.cache_read.unwrap_or(0),
+    ) {
+        Ok(cost) => cost,
+        Err(error) => {
+            eprintln!(
+                "計算成本失敗: session_id={} turn_no={} model={}: {}",
+                entry.session_id, entry.turn_no, model_label, error
+            );
+            0.0
+        }
+    };
+
+    add_tokens(&mut result.usage, tokens);
+    result.usage.cost_usd += cost_usd;
+
+    let model_usage = if let Some(existing) = result
+        .models
+        .iter_mut()
+        .find(|item| item.model == model_label)
+    {
+        existing
+    } else {
+        result.models.push(ModelUsageAggregation {
+            model: model_label.to_string(),
+            usage: UsageAggregation::default(),
+        });
+        result.models.last_mut().unwrap()
+    };
+    add_tokens(&mut model_usage.usage, tokens);
+    model_usage.usage.cost_usd += cost_usd;
+}
+
+pub(crate) fn summarize_session_usage(
+    pricing_rules: &[PricingRule],
+    entries: &[UsageEntry],
+) -> SessionUsageAggregation {
+    let has_delta_usage = entries
+        .iter()
+        .filter_map(|entry| entry.delta_tokens.as_ref())
+        .any(has_usage);
+    let mut result = SessionUsageAggregation::default();
+    let mut display_entry: Option<&UsageEntry> = None;
+
+    if has_delta_usage {
+        for entry in entries {
+            let Some(tokens) = entry
+                .delta_tokens
+                .as_ref()
+                .filter(|tokens| has_usage(tokens))
+            else {
+                continue;
+            };
+            record_usage(&mut result, pricing_rules, entry, tokens);
+            if display_entry.is_none_or(|current| entry.turn_no >= current.turn_no) {
+                display_entry = Some(entry);
+            }
+        }
+    } else if let Some(entry) = entries
+        .iter()
+        .filter(|entry| entry.tokens.as_ref().is_some_and(has_usage))
+        .max_by_key(|entry| entry.turn_no)
+    {
+        record_usage(
+            &mut result,
+            pricing_rules,
+            entry,
+            entry.tokens.as_ref().unwrap(),
+        );
+        display_entry = Some(entry);
+    }
+
+    result.display_model = display_entry
+        .and_then(entry_model)
+        .unwrap_or("Unknown Model")
+        .to_string();
+    result
 }
 
 #[derive(Serialize)]
@@ -189,6 +333,7 @@ pub struct YearListResponse {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::db;
     use std::env;
     use std::fs;
@@ -199,6 +344,111 @@ mod tests {
 
     async fn lock_test_env() -> MutexGuard<'static, ()> {
         TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await
+    }
+
+    fn token_stats(input: u64, output: u64, cache_read: u64) -> TokenStats {
+        TokenStats {
+            input,
+            output,
+            cache_read: Some(cache_read),
+            cache_write: Some(0),
+            reasoning: None,
+            total: input + output + cache_read,
+        }
+    }
+
+    fn usage_entry(turn_no: u32, model: &str, tokens: TokenStats, has_delta: bool) -> UsageEntry {
+        UsageEntry {
+            timestamp: format!("2026-07-10T10:{turn_no:02}:00Z"),
+            session_id: "mixed-model-session".to_string(),
+            session_name: None,
+            transcript_path: None,
+            cwd: None,
+            version: None,
+            turn_no,
+            model: Some(model.to_string()),
+            model_id: Some(model.to_string()),
+            tokens: Some(tokens.clone()),
+            delta_tokens: has_delta.then_some(tokens),
+            context: None,
+            cost: None,
+            source_kind: None,
+            parent_session_id: None,
+            agent_nickname: None,
+            agent_role: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn session_cost_uses_each_delta_model_and_ignores_synthetic_tail() {
+        let rules = [
+            PricingRule {
+                model_name: "claude-opus-4-8".to_string(),
+                input_price: 10.0,
+                cache_input_price: 0.5,
+                output_price: 50.0,
+            },
+            PricingRule {
+                model_name: "claude-fable-5".to_string(),
+                input_price: 2.0,
+                cache_input_price: 0.2,
+                output_price: 4.0,
+            },
+        ];
+        let entries = vec![
+            usage_entry(
+                1,
+                "claude-opus-4-8",
+                token_stats(100_000, 10_000, 200_000),
+                true,
+            ),
+            usage_entry(
+                2,
+                "claude-fable-5",
+                token_stats(50_000, 5_000, 100_000),
+                true,
+            ),
+            usage_entry(3, "<synthetic>", token_stats(0, 0, 0), true),
+        ];
+
+        let result = summarize_session_usage(&rules, &entries);
+
+        assert!((result.usage.cost_usd - 1.74).abs() < 1e-9);
+        assert_eq!(result.usage.total_tokens, 465_000);
+        assert_eq!(result.display_model, "claude-fable-5");
+        assert_eq!(result.models.len(), 2);
+        assert!(result
+            .models
+            .iter()
+            .all(|usage| usage.model != "<synthetic>"));
+        assert!((result.models[0].usage.cost_usd - 1.6).abs() < 1e-9);
+        assert!((result.models[1].usage.cost_usd - 0.14).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cumulative_session_uses_last_entry_with_real_usage() {
+        let rules = [PricingRule {
+            model_name: "claude-opus-4-8".to_string(),
+            input_price: 10.0,
+            cache_input_price: 0.5,
+            output_price: 50.0,
+        }];
+        let entries = vec![
+            usage_entry(
+                1,
+                "claude-opus-4-8",
+                token_stats(100_000, 10_000, 200_000),
+                false,
+            ),
+            usage_entry(2, "<synthetic>", token_stats(0, 0, 0), false),
+        ];
+
+        let result = summarize_session_usage(&rules, &entries);
+
+        assert!((result.usage.cost_usd - 1.6).abs() < 1e-9);
+        assert_eq!(result.display_model, "claude-opus-4-8");
+        assert_eq!(result.models.len(), 1);
     }
 
     #[tokio::test]
