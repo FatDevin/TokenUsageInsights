@@ -914,7 +914,7 @@ cd TokenUsageInsights</code></pre>
         <!-- 步驟 2：確認 script 有執行權限 -->
         <div class="modal-section">
           <h3 id="setup-step-1" data-i18n="setup_step_1"><span>02</span> 2. 確認 script 有執行權限</h3>
-          <p class="modal-text" id="setup-step-1-desc" data-i18n="setup_step_1_desc">首先建立設定目錄，並將專案中的收集腳本複製至家目錄的 <code>.gemini/antigravity-cli</code> 目錄下，最後賦予執行權限：</p>
+          <p class="modal-text" id="setup-step-1-desc" data-i18n="setup_step_1_desc">首先建立設定目錄，並將專案中的收集腳本複製至家目錄的 <code>.gemini/antigravity-cli</code> 目錄下，最後賦予執行權限。下方指令會使用看板偵測到的腳本實際路徑，不受專案複製位置影響：</p>
           <div class="code-block-container">
             <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製指令">複製指令</button>
             <pre><code id="code-setup-cmd">mkdir -p ~/.gemini/antigravity-cli && cp shell/antigravity/statusline-token.sh ~/.gemini/antigravity-cli/statusline-token.sh && chmod +x ~/.gemini/antigravity-cli/statusline-token.sh</code></pre>
