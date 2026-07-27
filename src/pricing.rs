@@ -235,4 +235,25 @@ mod tests {
 
         assert!((cost - 0.068_139_3).abs() < f64::EPSILON);
     }
+
+    #[test]
+    fn claude_opus_5_variants_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in [
+            "claude-opus-5",
+            "Claude Opus 5",
+            "claude-opus-5-1m · high",
+            "opus-5",
+        ] {
+            let cost =
+                calculate_usage_cost(&rules, Some(model_name), 1_000_000, 1_000_000, 1_000_000)
+                    .unwrap();
+
+            assert!(
+                (cost - 30.5).abs() < 1e-9,
+                "unexpected Opus 5 cost for {model_name}: {cost}"
+            );
+        }
+    }
 }
