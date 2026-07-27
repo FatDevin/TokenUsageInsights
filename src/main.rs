@@ -83,6 +83,14 @@ fn configured_bind_address(port: u16) -> Result<SocketAddr, String> {
     parse_bind_address(&host, port)
 }
 
+fn browser_url_for_bind_address(bind_address: SocketAddr) -> String {
+    if bind_address.ip().is_unspecified() {
+        format!("http://localhost:{}", bind_address.port())
+    } else {
+        format!("http://{bind_address}")
+    }
+}
+
 fn initialize_database_schema() -> Result<(), String> {
     let conn = db::get_db_conn()?;
     db::init_db(&conn)
@@ -172,8 +180,11 @@ async fn main() {
             eprintln!("❌ 無法綁定服務位址 {bind_address}: {error}");
             std::process::exit(1);
         });
-    println!("🌐 服務綁定位址: http://{}", bind_address);
-    println!("🚀 Token 戰情室 is running on: http://localhost:{}", port);
+    println!("🌐 服務綁定位址: {bind_address}");
+    println!(
+        "🚀 Token 戰情室 is running on: {}",
+        browser_url_for_bind_address(bind_address)
+    );
 
     // HTTP 先開始監聽；可能耗時的遷移與 transcript 同步在 blocking thread 執行。
     spawn_usage_sync_task();
@@ -223,6 +234,30 @@ mod tests {
 
         assert!(error.contains("IPv4 或 IPv6"));
         assert!(error.contains("localhost"));
+    }
+
+    #[test]
+    fn browser_url_uses_localhost_for_unspecified_addresses() {
+        assert_eq!(
+            browser_url_for_bind_address("0.0.0.0:3003".parse().unwrap()),
+            "http://localhost:3003"
+        );
+        assert_eq!(
+            browser_url_for_bind_address("[::]:3003".parse().unwrap()),
+            "http://localhost:3003"
+        );
+    }
+
+    #[test]
+    fn browser_url_preserves_specific_ipv4_and_ipv6_addresses() {
+        assert_eq!(
+            browser_url_for_bind_address("127.0.0.1:3003".parse().unwrap()),
+            "http://127.0.0.1:3003"
+        );
+        assert_eq!(
+            browser_url_for_bind_address("[::1]:3003".parse().unwrap()),
+            "http://[::1]:3003"
+        );
     }
 
     #[tokio::test]
