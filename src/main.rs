@@ -4,7 +4,10 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use std::path::PathBuf;
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
@@ -18,6 +21,7 @@ mod vscode;
 use handlers::*;
 
 const MAX_IMPORT_PAYLOAD_BYTES: usize = 200_000_000;
+const DEFAULT_BIND_HOST: &str = "0.0.0.0";
 
 fn import_usage_route() -> axum::routing::MethodRouter {
     post(import_usage_day).layer(DefaultBodyLimit::max(MAX_IMPORT_PAYLOAD_BYTES))
@@ -64,6 +68,27 @@ fn build_cors_layer() -> CorsLayer {
         .allow_origin(allowed_origins)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([CONTENT_TYPE])
+}
+
+fn parse_bind_address(host: &str, port: u16) -> Result<SocketAddr, String> {
+    let host = host.trim();
+    let ip_address = host
+        .parse::<IpAddr>()
+        .map_err(|_| format!("HOST 必須是有效的 IPv4 或 IPv6 位址，目前值為 {host:?}"))?;
+    Ok(SocketAddr::new(ip_address, port))
+}
+
+fn configured_bind_address(port: u16) -> Result<SocketAddr, String> {
+    let host = std::env::var("HOST").unwrap_or_else(|_| DEFAULT_BIND_HOST.to_string());
+    parse_bind_address(&host, port)
+}
+
+fn browser_url_for_bind_address(bind_address: SocketAddr) -> String {
+    if bind_address.ip().is_unspecified() {
+        format!("http://localhost:{}", bind_address.port())
+    } else {
+        format!("http://{bind_address}")
+    }
 }
 
 fn initialize_database_schema() -> Result<(), String> {
@@ -145,10 +170,21 @@ async fn main() {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(3003); // 預設使用 3003 Port
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
+    let bind_address = configured_bind_address(port).unwrap_or_else(|error| {
+        eprintln!("❌ 無法解析服務綁定位址: {error}");
+        std::process::exit(1);
+    });
+    let listener = tokio::net::TcpListener::bind(bind_address)
         .await
-        .unwrap();
-    println!("🚀 Token 戰情室 is running on: http://localhost:{}", port);
+        .unwrap_or_else(|error| {
+            eprintln!("❌ 無法綁定服務位址 {bind_address}: {error}");
+            std::process::exit(1);
+        });
+    println!("🌐 服務綁定位址: {bind_address}");
+    println!(
+        "🚀 Token 戰情室 is running on: {}",
+        browser_url_for_bind_address(bind_address)
+    );
 
     // HTTP 先開始監聽；可能耗時的遷移與 transcript 同步在 blocking thread 執行。
     spawn_usage_sync_task();
@@ -178,6 +214,50 @@ mod tests {
     #[test]
     fn import_payload_limit_is_200_megabytes() {
         assert_eq!(MAX_IMPORT_PAYLOAD_BYTES, 200_000_000);
+    }
+
+    #[test]
+    fn parse_bind_address_accepts_ipv4_and_ipv6() {
+        assert_eq!(
+            parse_bind_address("127.0.0.1", 3003).unwrap(),
+            "127.0.0.1:3003".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_bind_address("::1", 3003).unwrap(),
+            "[::1]:3003".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_bind_address_rejects_non_ip_host() {
+        let error = parse_bind_address("localhost", 3003).unwrap_err();
+
+        assert!(error.contains("IPv4 或 IPv6"));
+        assert!(error.contains("localhost"));
+    }
+
+    #[test]
+    fn browser_url_uses_localhost_for_unspecified_addresses() {
+        assert_eq!(
+            browser_url_for_bind_address("0.0.0.0:3003".parse().unwrap()),
+            "http://localhost:3003"
+        );
+        assert_eq!(
+            browser_url_for_bind_address("[::]:3003".parse().unwrap()),
+            "http://localhost:3003"
+        );
+    }
+
+    #[test]
+    fn browser_url_preserves_specific_ipv4_and_ipv6_addresses() {
+        assert_eq!(
+            browser_url_for_bind_address("127.0.0.1:3003".parse().unwrap()),
+            "http://127.0.0.1:3003"
+        );
+        assert_eq!(
+            browser_url_for_bind_address("[::1]:3003".parse().unwrap()),
+            "http://[::1]:3003"
+        );
     }
 
     #[tokio::test]
