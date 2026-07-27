@@ -351,6 +351,7 @@ cargo build --release --bin token-usage-insights-cli
 
 | 變數 | 預設值 | 用途 |
 | --- | --- | --- |
+| `HOST` | `0.0.0.0` | 看板服務綁定的 IPv4 或 IPv6 位址 |
 | `PORT` | `3003` | 看板服務埠號 |
 | `INSIGHTS_DIR` | Windows: `%LOCALAPPDATA%\TokenUsageInsights`; 其他平台: `~/.token-usage-insights` | SQLite 資料庫目錄 |
 | `ANTIGRAVITY_DIR` | `~/.gemini/antigravity-cli` | Antigravity CLI 資料目錄 |
@@ -362,16 +363,18 @@ cargo build --release --bin token-usage-insights-cli
 | `CURSOR_DIR` | `~/.cursor` | Cursor 資料目錄 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 允許的 CORS 來源，逗號分隔 |
 
+> **預設綁定 `0.0.0.0`，同一區網內的其他裝置可能連線到看板。只需在本機瀏覽時，請將 `HOST` 設為 `127.0.0.1`。**
+
 範例：
 
 ```bash
-INSIGHTS_DIR="/tmp/token-usage-insights" PORT="3010" "$HOME/.local/bin/token-usage-insights"
+HOST="127.0.0.1" INSIGHTS_DIR="/tmp/token-usage-insights" PORT="3010" "$HOME/.local/bin/token-usage-insights"
 ```
 
 Windows PowerShell 範例：
 
 ```powershell
-$env:INSIGHTS_DIR = 'D:\Token Usage Insights\資料庫'; $env:CODEX_DIR = "$env:USERPROFILE\.codex"; $env:PORT = '3010'; & "$HOME\bin\token-usage-insights.cmd"
+$env:HOST = '127.0.0.1'; $env:INSIGHTS_DIR = 'D:\Token Usage Insights\資料庫'; $env:CODEX_DIR = "$env:USERPROFILE\.codex"; $env:PORT = '3010'; & "$HOME\bin\token-usage-insights.cmd"
 ```
 
 * * *
