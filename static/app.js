@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=28';
+import i18n from './i18n.js?v=29';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,

@@ -903,17 +903,18 @@
         <!-- 步驟 1：複製專案到本地 -->
         <div class="modal-section">
           <h3 id="setup-step-clone" data-i18n="setup_step_clone"><span>01</span> 1. 複製專案到本地</h3>
-          <p class="modal-text" id="setup-step-clone-desc" data-i18n="setup_step_clone_desc">請先在終端機中執行以下指令複製專案並進入專案目錄，以取得腳本檔案：</p>
+          <p class="modal-text" id="setup-step-clone-desc" data-i18n="setup_step_clone_desc">請在終端機中依序執行以下兩行指令；此寫法同時相容於 Bash、zsh 與 Windows PowerShell：</p>
           <div class="code-block-container">
             <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製指令">複製指令</button>
-            <pre><code>git clone https://github.com/doggy8088/TokenUsageInsights.git && cd TokenUsageInsights</code></pre>
+            <pre><code>git clone https://github.com/doggy8088/TokenUsageInsights.git
+cd TokenUsageInsights</code></pre>
           </div>
         </div>
 
         <!-- 步驟 2：確認 script 有執行權限 -->
         <div class="modal-section">
           <h3 id="setup-step-1" data-i18n="setup_step_1"><span>02</span> 2. 確認 script 有執行權限</h3>
-          <p class="modal-text" id="setup-step-1-desc" data-i18n="setup_step_1_desc">首先建立設定目錄，並將專案中的收集腳本複製至家目錄的 <code>.gemini/antigravity-cli</code> 目錄下，最後賦予執行權限：</p>
+          <p class="modal-text" id="setup-step-1-desc" data-i18n="setup_step_1_desc">首先建立設定目錄，並將專案中的收集腳本複製至家目錄的 <code>.gemini/antigravity-cli</code> 目錄下，最後賦予執行權限。下方指令會使用看板偵測到的腳本實際路徑，不受專案複製位置影響：</p>
           <div class="code-block-container">
             <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製指令">複製指令</button>
             <pre><code id="code-setup-cmd">mkdir -p ~/.gemini/antigravity-cli && cp shell/antigravity/statusline-token.sh ~/.gemini/antigravity-cli/statusline-token.sh && chmod +x ~/.gemini/antigravity-cli/statusline-token.sh</code></pre>
