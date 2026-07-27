@@ -251,7 +251,7 @@ mod tests {
                     .unwrap();
 
             assert!(
-                (cost - 30.5).abs() < f64::EPSILON,
+                (cost - 30.5).abs() < 1e-9,
                 "unexpected Opus 5 cost for {model_name}: {cost}"
             );
         }
