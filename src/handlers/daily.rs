@@ -14,7 +14,7 @@ use std::{
 
 use super::*;
 use crate::db::{self, TokenStats};
-use crate::pricing::{calculate_usage_cost, load_pricing_rules};
+use crate::pricing::load_pricing_rules;
 use crate::timeline::{
     parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
     parse_copilot_timeline, parse_cursor_timeline, parse_vscode_timeline, TimelineItem,
@@ -533,46 +533,7 @@ pub async fn get_usage_details(
             .get(session_id)
             .cloned()
             .unwrap_or_else(|| s_entries[0].clone());
-
-        let session_tokens = s_entries
-            .iter()
-            .map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0))
-            .sum::<u64>();
-        let session_input_tokens = s_entries
-            .iter()
-            .map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0))
-            .sum::<u64>();
-        let session_output_tokens = s_entries
-            .iter()
-            .map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0))
-            .sum::<u64>();
-        let session_cache_read = s_entries
-            .iter()
-            .map(|e| {
-                e.delta_tokens
-                    .as_ref()
-                    .and_then(|t| t.cache_read)
-                    .unwrap_or(0)
-            })
-            .sum::<u64>();
-        let session_cache_write = s_entries
-            .iter()
-            .map(|e| {
-                e.delta_tokens
-                    .as_ref()
-                    .and_then(|t| t.cache_write)
-                    .unwrap_or(0)
-            })
-            .sum::<u64>();
-        let session_reasoning = s_entries
-            .iter()
-            .map(|e| {
-                e.delta_tokens
-                    .as_ref()
-                    .and_then(|t| t.reasoning)
-                    .unwrap_or(0)
-            })
-            .sum::<u64>();
+        let session_usage = summarize_session_usage(&pricing_rules, s_entries);
 
         let session_duration = last_entry
             .cost
@@ -588,57 +549,12 @@ pub async fn get_usage_details(
         summary.total_duration_ms += session_duration;
         summary.total_requests += session_requests;
 
-        let total_cache_read_tokens = if session_tokens > 0 {
-            session_cache_read
-        } else {
-            last_entry
-                .tokens
-                .as_ref()
-                .and_then(|t| t.cache_read)
-                .unwrap_or(0)
-        };
-        let total_cache_write_tokens = if session_tokens > 0 {
-            session_cache_write
-        } else {
-            last_entry
-                .tokens
-                .as_ref()
-                .and_then(|t| t.cache_write)
-                .unwrap_or(0)
-        };
-        let total_reasoning_tokens = if session_tokens > 0 {
-            session_reasoning
-        } else {
-            last_entry
-                .tokens
-                .as_ref()
-                .and_then(|t| t.reasoning)
-                .unwrap_or(0)
-        };
-        let total_input_tokens = if session_tokens > 0 {
-            session_input_tokens
-        } else {
-            last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0)
-        };
-        let total_output_tokens = if session_tokens > 0 {
-            session_output_tokens
-        } else {
-            last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0)
-        };
-
-        let cost_usd = match calculate_usage_cost(
-            &pricing_rules,
-            last_entry.model.as_deref(),
-            total_input_tokens,
-            total_output_tokens,
-            total_cache_read_tokens,
-        ) {
-            Ok(v) => v,
-            Err(err) => {
-                eprintln!("⚠️ 計算成本失敗: {}", err);
-                0.0
-            }
-        };
+        let total_input_tokens = session_usage.usage.input_tokens;
+        let total_output_tokens = session_usage.usage.output_tokens;
+        let total_cache_read_tokens = session_usage.usage.cache_read_tokens;
+        let total_cache_write_tokens = session_usage.usage.cache_write_tokens;
+        let total_reasoning_tokens = session_usage.usage.reasoning_tokens;
+        let cost_usd = session_usage.usage.cost_usd;
         summary.total_cost_usd += cost_usd;
 
         sessions_summary.push(SessionSummary {
@@ -652,14 +568,8 @@ pub async fn get_usage_details(
                 .clone()
                 .unwrap_or_else(|| "legacy".to_string()),
             cwd: last_entry.cwd.unwrap_or_default(),
-            model: last_entry
-                .model
-                .unwrap_or_else(|| "Unknown Model".to_string()),
-            total_tokens: if session_tokens > 0 {
-                session_tokens
-            } else {
-                last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0)
-            },
+            model: session_usage.display_model,
+            total_tokens: session_usage.usage.total_tokens,
             total_input_tokens,
             total_output_tokens,
             total_cache_read_tokens,
