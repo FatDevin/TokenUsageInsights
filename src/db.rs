@@ -2794,10 +2794,26 @@ fn run_cursor_cache_tokens_unknown_migration(conn: &mut Connection) -> Result<()
         .map_err(|error| format!("提交 Cursor 快取 Token 遷移失敗: {error}"))
 }
 
+fn cursor_state_db_immutable_uri(state_db_path: &Path) -> String {
+    let normalized = state_db_path.to_string_lossy().replace('\\', "/");
+    let mut encoded = String::with_capacity(normalized.len());
+    for byte in normalized.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/' | b':') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("file:{encoded}?mode=ro&immutable=1")
+}
+
 fn open_cursor_state_db(state_db_path: &Path) -> Result<Connection, String> {
+    let immutable_uri = cursor_state_db_immutable_uri(state_db_path);
     let conn = Connection::open_with_flags(
-        state_db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        immutable_uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(|error| format!("無法唯讀開啟 Cursor state.vscdb: {error}"))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
@@ -2850,11 +2866,10 @@ fn sync_cursor_model_signatures(
         let mut statement = source_conn
             .prepare(
                 "SELECT CAST(value AS BLOB)
-                 FROM cursorDiskKV
+                 FROM cursorDiskKV INDEXED BY sqlite_autoindex_cursorDiskKV_1
                  WHERE rowid > ? AND rowid <= ?
                    AND key >= 'agentKv:blob:' AND key < 'agentKv:blob;'
-                   AND instr(CAST(value AS TEXT), '\"modelName\"') > 0
-                 ORDER BY rowid",
+                   AND instr(CAST(value AS TEXT), '\"modelName\"') > 0",
             )
             .map_err(|error| format!("準備 Cursor agentKv 查詢失敗: {error}"))?;
         let mut rows = statement
@@ -3099,10 +3114,9 @@ fn sync_cursor_session_metadata(
         let mut statement = source_conn
             .prepare(
                 "SELECT key, CAST(value AS BLOB)
-                 FROM cursorDiskKV
+                 FROM cursorDiskKV INDEXED BY sqlite_autoindex_cursorDiskKV_1
                  WHERE rowid > ? AND rowid <= ?
-                   AND key >= 'composerData:' AND key < 'composerData;'
-                 ORDER BY rowid",
+                   AND key >= 'composerData:' AND key < 'composerData;'",
             )
             .map_err(|error| format!("準備 Cursor composerData 查詢失敗: {error}"))?;
         let mut rows = statement
@@ -3179,6 +3193,28 @@ fn sync_cursor_session_metadata(
                 params![source_id, source_id],
             )
             .map_err(|error| format!("回填 Cursor 工作路徑失敗: {error}"))?;
+            tx.execute(
+                "DELETE FROM usage_entries
+                 WHERE rowid IN (
+                    SELECT legacy.rowid
+                    FROM usage_entries legacy
+                    JOIN cursor_session_metadata metadata
+                      ON metadata.source_id = ?
+                     AND metadata.session_id = legacy.session_id
+                    JOIN usage_entries classified
+                      ON classified.assistant_type = legacy.assistant_type
+                     AND classified.session_id = legacy.session_id
+                     AND classified.turn_no = legacy.turn_no
+                     AND classified.source_kind = CASE metadata.mode
+                        WHEN 'agent' THEN ?
+                        WHEN 'ide' THEN ?
+                     END
+                    WHERE legacy.assistant_type = 'cursor'
+                      AND legacy.source_kind = 'legacy'
+                 )",
+                params![source_id, CURSOR_AGENT_SOURCE_KIND, CURSOR_IDE_SOURCE_KIND],
+            )
+            .map_err(|error| format!("清除 Cursor legacy 重複記錄失敗: {error}"))?;
             tx.execute(
                 "UPDATE usage_entries
                  SET source_kind = CASE (
@@ -3442,11 +3478,11 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
     let state_db_path = get_cursor_state_db_path();
     let source_id = if state_db_path.exists() {
         let source_id = cursor_model_source_id(&state_db_path);
-        if let Err(error) = sync_cursor_model_signatures(conn, &state_db_path) {
-            eprintln!("同步 Cursor agentKv 模型資訊失敗: {error}");
-        }
         if let Err(error) = sync_cursor_session_metadata(conn, &state_db_path) {
             eprintln!("同步 Cursor composerData Session 中繼資料失敗: {error}");
+        }
+        if let Err(error) = sync_cursor_model_signatures(conn, &state_db_path) {
+            eprintln!("同步 Cursor agentKv 模型資訊失敗: {error}");
         }
         Some(source_id)
     } else {
@@ -3627,37 +3663,38 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
 
 /// Unified sync function triggering sync for all supported assistants
 pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
-    // 1. Sync Google Antigravity CLI
+    // 1. Sync Cursor metadata first so model and mode attribution is available
+    // before the potentially slower transcript collectors finish.
+    let cursor_dir = get_cursor_dir();
+    if let Err(e) = sync_cursor_usage_logs(conn, &cursor_dir) {
+        eprintln!("❌ 同步 Cursor 失敗: {}", e);
+    }
+
+    // 2. Sync Google Antigravity CLI
     let antigravity_dir = get_antigravity_dir();
     if let Err(e) = sync_hook_usage_logs(conn, "antigravity", &antigravity_dir) {
         eprintln!("❌ 同步 Antigravity 失敗: {}", e);
     }
 
-    // 2. Sync GitHub Copilot CLI
+    // 3. Sync GitHub Copilot CLI
     let copilot_dir = get_copilot_dir();
     if let Err(e) = sync_hook_usage_logs(conn, "copilot", &copilot_dir) {
         eprintln!("❌ 同步 Copilot 失敗: {}", e);
     }
 
-    // 2b. Sync GitHub Copilot sessions created in VS Code
+    // 3b. Sync GitHub Copilot sessions created in VS Code
     if let Err(e) = sync_vscode_chat_sessions(conn) {
         eprintln!("❌ 同步 VS Code Copilot 失敗: {}", e);
     }
 
-    // 3. Sync Codex CLI and Desktop
+    // 4. Sync Codex CLI and Desktop
     if let Err(e) = sync_codex_usage_logs(conn) {
         eprintln!("❌ 同步 Codex 失敗: {}", e);
     }
 
-    // 4. Sync Claude Code
+    // 5. Sync Claude Code
     if let Err(e) = sync_claude_usage_logs(conn) {
         eprintln!("❌ 同步 Claude Code 失敗: {}", e);
-    }
-
-    // 5. Sync Cursor
-    let cursor_dir = get_cursor_dir();
-    if let Err(e) = sync_cursor_usage_logs(conn, &cursor_dir) {
-        eprintln!("❌ 同步 Cursor 失敗: {}", e);
     }
 
     Ok(())
