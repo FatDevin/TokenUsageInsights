@@ -298,6 +298,39 @@ pub struct MonthlyModelSummary {
     pub cost_usd: f64,
 }
 
+#[derive(Serialize, Clone)]
+pub struct ModelSessionDetail {
+    pub session_id: String,
+    pub session_name: String,
+    pub assistant_type: String,
+    pub source_kind: String,
+    pub date: Option<String>,
+    pub timestamp: String,
+    pub cwd: String,
+    pub model: String,
+    pub total_tokens: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_cache_write_tokens: u64,
+    pub total_reasoning_tokens: u64,
+    pub max_turn_no: u32,
+    pub duration_ms: u64,
+    pub total_requests: u64,
+    pub cost_usd: f64,
+    pub parent_session_id: Option<String>,
+    pub agent_nickname: Option<String>,
+    pub agent_role: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ModelSessionsResponse {
+    pub period: String,
+    pub model: String,
+    pub sessions: Vec<ModelSessionDetail>,
+}
+
 #[derive(Serialize, Default, Clone)]
 pub struct AgentBreakdown {
     pub total_tokens: u64,
