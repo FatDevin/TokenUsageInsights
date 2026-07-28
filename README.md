@@ -1,6 +1,6 @@
 # Token 戰情室
 
-**Token 戰情室是本機優先的 AI Coding Agent Token 使用量與會話還原看板。** 它會讀取本機上的 Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI 與 Claude Code 記錄，集中呈現每日、月度、年度的 Token 消耗、快取使用、推理 Token、估算費用、模型分佈、專案目錄分佈與完整 Session 時間軸。
+**Token 戰情室是本機優先的 AI Coding Agent Token 使用量與會話還原看板。** 它會讀取本機上的 Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code 與 Grok Build 記錄，集中呈現每日、月度、年度的 Token 消耗、快取使用、推理 Token、估算費用、模型分佈、專案目錄分佈與完整 Session 時間軸。
 
 本專案不會替你呼叫 AI 供應商 API 查詢資料；核心資料來源是本機日誌、Status Line 收集檔與本機 SQLite。
 
@@ -41,8 +41,9 @@ http://localhost:3003
 | GitHub Copilot Chat（VS Code） | 不需要 | VS Code `workspaceStorage/chatSessions` | 看板直接掃描 VS Code Stable 與 Insiders 的本機聊天 Session |
 | Codex Desktop / CLI | 不需要 | `~/.codex/sessions`、`~/.codex/archived_sessions` | 看板會直接掃描 Codex 作用中與已封存的本機 Session 記錄 |
 | Claude Code | 不需要 | `~/.claude/projects` | 看板會直接掃描 Claude Code 本機專案 Session 記錄 |
+| Grok Build | 不需要 | `~/.grok/sessions` | 看板會直接掃描 Grok Build 自動保存的 `updates.jsonl` Session stream |
 
-**只使用 VS Code Copilot、Codex Desktop、Codex CLI 或 Claude Code 時，執行一行安裝指令並開啟看板即可。**
+**只使用 VS Code Copilot、Codex Desktop、Codex CLI、Claude Code 或 Grok Build 時，執行一行安裝指令並開啟看板即可。**
 
 ### Windows 原生使用
 
@@ -58,6 +59,7 @@ Windows 預設使用下列原生路徑：
 | Codex | `%USERPROFILE%\.codex` |
 | Claude Code | `%USERPROFILE%\.claude` |
 | Cursor | `%USERPROFILE%\.cursor` |
+| Grok Build | `%USERPROFILE%\.grok` |
 
 看板內的設定指南會在 Windows 顯示 PowerShell 複製、設定與診斷命令。PowerShell collector 使用 .NET JSON 與檔案 API，不依賴 Bash、`jq`、`sed` 或 `awk`。
 
@@ -88,7 +90,7 @@ Windows 預設使用下列原生路徑：
 
 ### 介面操作
 
-- 四種 CLI 徽章切換
+- 五種 CLI 徽章切換
 - 每日、月度、年度視圖
 - 日期、月份、年份快速切換
 - 5 秒、10 秒、30 秒即時自動刷新
@@ -283,6 +285,25 @@ $env:VSCODE_USER_DATA_DIR = "C:\path\to\vscode-user-data"; & "$HOME\bin\token-us
 
 * * *
 
+## Grok Build 設定
+
+**Grok Build 不需要安裝 Hook、Status Line 或額外收集腳本。** 看板會直接掃描：
+
+```text
+~/.grok/sessions
+```
+
+使用方式：
+
+1. 先正常使用 Grok Build 產生至少一個 Session。
+2. 啟動本專案。
+3. 在左側選擇 Grok Build。
+4. 按右上角同步按鈕，或等待背景同步。
+
+Grok Build Session 可能只提供 context token snapshot，也可能包含 provider usage 與成本。看板會優先使用 provider usage/cost；只有 context snapshot 時，費用會依 `pricing.csv` 的 xAI API 價格估算，並在 Session 清單標示 `Context`，不代表 SuperGrok 或其他訂閱方案的週配額。
+
+* * *
+
 ## 本地資料同步方式
 
 啟動服務時，後端會初始化本機 SQLite 並立即同步一次資料。服務啟動後，也會每 5 秒背景同步一次。
@@ -307,7 +328,7 @@ GET /api/:assistant/sync
 
 CLI 工具僅提供給從原始碼建置的進階使用者；Release 安裝包目前不包含 CLI 執行檔。
 
-`--agent` 會指定助理（`antigravity` / `copilot` / `codex` / `claude` / `cursor`）
+`--agent` 會指定助理（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok`）
 
 ### 從原始碼使用 CLI
 
@@ -363,6 +384,7 @@ cargo build --release --bin token-usage-insights-cli
 | `CLAUDE_DIR` | `~/.claude` | Claude Code 資料目錄 |
 | `CURSOR_DIR` | `~/.cursor` | Cursor 資料目錄 |
 | `CURSOR_STATE_DB` | 依平台自動偵測 | Cursor `User/globalStorage/state.vscdb` 路徑，用於唯讀取得 `agentKv` 模型資訊 |
+| `GROK_DIR` | `~/.grok` | Grok Build 資料目錄 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 允許的 CORS 來源，逗號分隔 |
 
 > **預設綁定 `0.0.0.0`，同一區網內的其他裝置可能連線到看板。只需在本機瀏覽時，請將 `HOST` 設為 `127.0.0.1`。**

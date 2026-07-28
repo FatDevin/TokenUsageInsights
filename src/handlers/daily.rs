@@ -17,7 +17,8 @@ use crate::db::{self, TokenStats};
 use crate::pricing::load_pricing_rules;
 use crate::timeline::{
     parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
-    parse_copilot_timeline, parse_cursor_timeline, parse_vscode_timeline, TimelineItem,
+    parse_copilot_timeline, parse_cursor_timeline, parse_grok_timeline, parse_vscode_timeline,
+    TimelineItem,
 };
 
 fn add_usage_to_day_summary(summary: &mut DaySummary, usage: &UsageAggregation) {
@@ -143,6 +144,45 @@ fn resolve_cursor_transcript_path(
     Ok(canonical_path)
 }
 
+fn resolve_grok_transcript_path(
+    grok_dir: &StdPath,
+    session_id: &str,
+    transcript_path_db: &str,
+) -> Result<PathBuf, String> {
+    let mut path = PathBuf::from(transcript_path_db);
+    if path.is_relative() {
+        path = grok_dir.join(path);
+    }
+
+    if !path.exists() {
+        return Err("找不到該 Grok Build session 的本地日誌檔案。".to_string());
+    }
+
+    let grok_root = grok_dir
+        .canonicalize()
+        .map_err(|_| "無法存取 Grok Build 根目錄。".to_string())?;
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|_| "無法解析 Grok Build session 日誌路徑。".to_string())?;
+
+    if !canonical_path.starts_with(&grok_root) {
+        return Err("Grok Build session 日誌路徑不在預期目錄內。".to_string());
+    }
+    if canonical_path.file_name().and_then(|name| name.to_str()) != Some("updates.jsonl") {
+        return Err("Grok Build session 日誌格式不受支援。".to_string());
+    }
+    if canonical_path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        != Some(session_id)
+    {
+        return Err("Grok Build session 日誌路徑與 session id 不一致。".to_string());
+    }
+
+    Ok(canonical_path)
+}
+
 fn resolve_vscode_transcript_path(transcript_path_db: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(transcript_path_db);
     if !path.exists() {
@@ -240,6 +280,16 @@ fn resolve_session_file_path(
             resolve_cursor_transcript_path(&db::get_cursor_dir(), session_id, path)
                 .map_err(|error| (StatusCode::BAD_REQUEST, error))
         }
+        "grok" => {
+            let path = transcript_path_db.ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "找不到 Grok Build session 日誌檔案路徑。".to_string(),
+                )
+            })?;
+            resolve_grok_transcript_path(&db::get_grok_dir(), session_id, path)
+                .map_err(|error| (StatusCode::BAD_REQUEST, error))
+        }
         _ => Err((StatusCode::BAD_REQUEST, "不支援的助理類型".to_string())),
     }
 }
@@ -275,6 +325,7 @@ fn parse_session_timeline_file(
         "codex" => parse_codex_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "claude" => parse_claude_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "cursor" => parse_cursor_timeline(reader, db_entries, &mut timeline, &mut metadata),
+        "grok" => parse_grok_timeline(reader, db_entries, &mut timeline, &mut metadata),
         _ => return Err((StatusCode::BAD_REQUEST, "不支援的助理類型".to_string())),
     }
 
@@ -396,6 +447,9 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
     let cursor_dir = db::get_cursor_dir();
     let cursor_exists = cursor_dir.join("projects").exists();
 
+    let grok_dir = db::get_grok_dir();
+    let grok_exists = grok_dir.join("sessions").exists();
+
     Json(SetupInfoResponse {
         platform: std::env::consts::OS.to_string(),
         workspace_dir,
@@ -442,6 +496,14 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
             dir_path: cursor_dir.to_string_lossy().into_owned(),
             data_path: cursor_dir.join("projects").to_string_lossy().into_owned(),
             exists: cursor_exists,
+            script_path: "".to_string(),
+            source_script_path: "".to_string(),
+            settings_path: "".to_string(),
+        },
+        grok: AssistantSetupStatus {
+            dir_path: grok_dir.to_string_lossy().into_owned(),
+            data_path: grok_dir.join("sessions").to_string_lossy().into_owned(),
+            exists: grok_exists,
             script_path: "".to_string(),
             source_script_path: "".to_string(),
             settings_path: "".to_string(),

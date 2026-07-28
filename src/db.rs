@@ -33,6 +33,8 @@ pub struct CostStats {
     pub total_api_duration_ms: Option<f64>,
     pub total_duration_ms: Option<f64>,
     pub total_premium_requests: Option<f64>,
+    #[serde(default)]
+    pub reported_cost_usd: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -159,6 +161,13 @@ const CURSOR_MODEL_ATTRIBUTION_MIGRATION_KEY: &str = "migration:cursor_model_att
 const CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY: &str = "migration:cursor_cache_tokens_unknown_v1";
 const CURSOR_AGENT_SOURCE_KIND: &str = "cursor-agent";
 const CURSOR_IDE_SOURCE_KIND: &str = "cursor-ide";
+const GROK_PARSER_MIGRATION_KEY: &str = "migration:grok_parser_v1";
+const LEGACY_GROK_PARSER_MIGRATION_KEYS: &[&str] = &[
+    "migration:grok_model_normalization_v2",
+    "migration:grok_parser_v3",
+    "migration:grok_parser_v4",
+    "migration:grok_parser_v5",
+];
 
 #[derive(Default)]
 enum InitialUserPromptState {
@@ -393,6 +402,15 @@ pub fn get_cursor_state_db_path() -> PathBuf {
         .unwrap_or_else(|| get_cursor_dir().join("state.vscdb"))
 }
 
+pub fn get_grok_dir() -> PathBuf {
+    if let Some(path) = crate::paths::env_path("GROK_DIR") {
+        return path;
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".grok"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn move_file_with_copy_fallback(source: &Path, destination: &Path) -> Result<(), String> {
     if let Err(rename_error) = fs::rename(source, destination) {
         let copied = fs::copy(source, destination).map_err(|copy_error| {
@@ -466,7 +484,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS usage_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            assistant_type TEXT NOT NULL, -- 'antigravity', 'copilot', 'codex', 'claude', 'cursor'
+            assistant_type TEXT NOT NULL, -- 'antigravity', 'copilot', 'codex', 'claude', 'cursor', 'grok'
             timestamp TEXT NOT NULL,
             date TEXT NOT NULL,
             session_id TEXT NOT NULL,
@@ -502,6 +520,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             -- Duration and Request Count
             duration_ms INTEGER,
             premium_requests INTEGER,
+            reported_cost_usd REAL,
             source_kind TEXT NOT NULL DEFAULT 'legacy',
 
             -- Codex-specific fields
@@ -557,6 +576,10 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     );
     let _ = conn.execute(
         "ALTER TABLE usage_entries ADD COLUMN model_signature TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN reported_cost_usd REAL",
         [],
     );
 
@@ -867,6 +890,35 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             params![SESSION_NAME_SELECTION_MIGRATION_KEY],
         )
         .map_err(|error| format!("記錄會話名稱遷移失敗: {error}"))?;
+    }
+
+    let grok_parser_migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![GROK_PARSER_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !grok_parser_migration_done {
+        // Reparse Grok sessions so model aliases, cached reads, context deltas,
+        // and provider-reported costs use the current parser semantics.
+        conn.execute("DELETE FROM sync_state WHERE filename LIKE 'grok:%'", [])
+            .map_err(|error| format!("清除 Grok Build 同步狀態失敗: {error}"))?;
+        for legacy_key in LEGACY_GROK_PARSER_MIGRATION_KEYS {
+            conn.execute(
+                "DELETE FROM sync_state WHERE filename = ?",
+                params![legacy_key],
+            )
+            .map_err(|error| {
+                format!("清理舊 Grok Build migration 狀態失敗 ({legacy_key}): {error}")
+            })?;
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![GROK_PARSER_MIGRATION_KEY],
+        )
+        .map_err(|error| format!("記錄 Grok Build parser migration 失敗: {error}"))?;
     }
 
     Ok(())
@@ -3532,6 +3584,149 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
     Ok(())
 }
 
+fn sync_grok_usage_logs(conn: &mut Connection, grok_dir: &Path) -> Result<(), String> {
+    for filepath in crate::grok::find_session_update_files(grok_dir) {
+        let metadata = match fs::metadata(&filepath) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                eprintln!(
+                    "讀取 Grok Build session 檔案 {:?} 失敗: {}",
+                    filepath, error
+                );
+                continue;
+            }
+        };
+        let current_size = metadata.len();
+        let state_name = portable_relative_path(grok_dir, &filepath);
+        let state_key = format!("grok:{state_name}");
+        let last_synced_size: u64 = conn
+            .query_row(
+                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
+                params![state_key],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if current_size == last_synced_size {
+            continue;
+        }
+
+        // Grok appends JSONL records. Wait for the current record to be
+        // complete before advancing sync_state, otherwise a partial final
+        // line could be skipped permanently on the next incremental pass.
+        if current_size > 0 {
+            let mut file = match File::open(&filepath) {
+                Ok(file) => file,
+                Err(error) => {
+                    eprintln!(
+                        "開啟 Grok Build session 檔案 {:?} 失敗: {}",
+                        filepath, error
+                    );
+                    continue;
+                }
+            };
+            if file.seek(SeekFrom::End(-1)).is_err() {
+                continue;
+            }
+            let mut last_byte = [0u8; 1];
+            if file.read_exact(&mut last_byte).is_err() || last_byte[0] != b'\n' {
+                continue;
+            }
+        }
+
+        let parsed_entries = match crate::grok::parse_session_usage_file(&filepath) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!(
+                    "解析 Grok Build session 檔案 {:?} 失敗: {}",
+                    filepath, error
+                );
+                continue;
+            }
+        };
+
+        let transcript_path = filepath.to_string_lossy().into_owned();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Grok Build transaction BEGIN 失敗: {error}"))?;
+        tx.execute(
+            "DELETE FROM usage_entries
+             WHERE assistant_type = 'grok' AND transcript_path = ?",
+            params![transcript_path],
+        )
+        .map_err(|error| format!("清除舊 Grok Build session 資料失敗: {error}"))?;
+
+        for entry in &parsed_entries {
+            let tokens = entry.tokens.as_ref();
+            let delta = entry.delta_tokens.as_ref();
+            let cost = entry.cost.as_ref();
+            let source_kind = entry
+                .source_kind
+                .as_deref()
+                .unwrap_or(crate::grok::CONTEXT_SOURCE_KIND);
+            tx.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                    tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
+                    delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                    duration_ms, premium_requests, reported_cost_usd, reasoning_effort
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?
+                )",
+                params![
+                    "grok",
+                    source_kind,
+                    entry.timestamp,
+                    entry.timestamp.get(0..10).unwrap_or("unknown"),
+                    entry.session_id,
+                    entry.session_name.as_deref(),
+                    entry.transcript_path.as_deref(),
+                    entry.cwd.as_deref(),
+                    entry.version.as_deref(),
+                    entry.turn_no as i64,
+                    entry.model.as_deref(),
+                    entry.model_id.as_deref(),
+                    tokens.map(|value| value.input as i64),
+                    tokens.map(|value| value.output as i64),
+                    tokens.and_then(|value| value.cache_read.map(|v| v as i64)),
+                    tokens.and_then(|value| value.cache_write.map(|v| v as i64)),
+                    tokens.and_then(|value| value.reasoning.map(|v| v as i64)),
+                    tokens.map(|value| value.total as i64),
+                    delta.map(|value| value.input as i64),
+                    delta.map(|value| value.output as i64),
+                    delta.and_then(|value| value.cache_read.map(|v| v as i64)),
+                    delta.and_then(|value| value.cache_write.map(|v| v as i64)),
+                    delta.and_then(|value| value.reasoning.map(|v| v as i64)),
+                    delta.map(|value| value.total as i64),
+                    cost.and_then(|value| value.total_api_duration_ms.map(|v| v as i64)),
+                    cost.and_then(|value| value.total_premium_requests.map(|v| v as i64)),
+                    cost.and_then(|value| value.reported_cost_usd),
+                    entry.reasoning_effort.as_deref(),
+                ],
+            )
+            .map_err(|error| format!("寫入 Grok Build 資料庫失敗: {error}"))?;
+        }
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, ?)",
+            params![state_key, current_size as i64, now],
+        )
+        .map_err(|error| format!("更新 Grok Build sync state 失敗: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("提交 Grok Build transaction 失敗: {error}"))?;
+    }
+
+    Ok(())
+}
+
 /// Unified sync function triggering sync for all supported assistants
 pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // 1. Sync Google Antigravity CLI
@@ -3565,6 +3760,12 @@ pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
     let cursor_dir = get_cursor_dir();
     if let Err(e) = sync_cursor_usage_logs(conn, &cursor_dir) {
         eprintln!("❌ 同步 Cursor 失敗: {}", e);
+    }
+
+    // 6. Sync Grok Build sessions
+    let grok_dir = get_grok_dir();
+    if let Err(e) = sync_grok_usage_logs(conn, &grok_dir) {
+        eprintln!("❌ 同步 Grok Build 失敗: {}", e);
     }
 
     Ok(())
@@ -3863,7 +4064,7 @@ pub fn get_usage_entries_by_date(
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
-            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort, import_source_id, source_kind
+            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort, import_source_id, source_kind, reported_cost_usd
          FROM usage_entries WHERE date = ?".to_string();
     let mut params_vec = Vec::new();
     params_vec.push(rusqlite::types::Value::Text(date.to_string()));
@@ -3999,15 +4200,19 @@ pub fn get_usage_entries_by_date(
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
 
-        let cost = if duration_ms.is_some() || premium_requests.is_some() {
-            Some(CostStats {
-                total_api_duration_ms: duration_ms,
-                total_duration_ms: None,
-                total_premium_requests: premium_requests,
-            })
-        } else {
-            None
-        };
+        let reported_cost_usd: Option<f64> =
+            row.get::<_, Option<f64>>(34).map_err(|e| e.to_string())?;
+        let cost =
+            if duration_ms.is_some() || premium_requests.is_some() || reported_cost_usd.is_some() {
+                Some(CostStats {
+                    total_api_duration_ms: duration_ms,
+                    total_duration_ms: None,
+                    total_premium_requests: premium_requests,
+                    reported_cost_usd,
+                })
+            } else {
+                None
+            };
         let import_source_id = normalize_import_source_id(
             row.get::<_, Option<String>>(32)
                 .map_err(|e| e.to_string())?
@@ -4149,14 +4354,14 @@ pub fn import_usage_day_entries(
                     assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no,
                     model, model_id, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
                     delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
-                    duration_ms, premium_requests,
+                    duration_ms, premium_requests, reported_cost_usd,
                     parent_session_id, agent_nickname, agent_role, reasoning_effort,
                     import_source_id, import_batch_id
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )",
                 rusqlite::params![
                     assistant,
@@ -4189,6 +4394,7 @@ pub fn import_usage_day_entries(
                     entry.delta_tokens.as_ref().map(|t| t.total as i64),
                     entry.cost.as_ref().and_then(|c| c.total_api_duration_ms).map(|v| v as i64),
                     entry.cost.as_ref().and_then(|c| c.total_premium_requests).map(|v| v as i64),
+                    entry.cost.as_ref().and_then(|c| c.reported_cost_usd),
                     entry.parent_session_id,
                     entry.agent_nickname,
                     entry.agent_role,
@@ -4480,7 +4686,7 @@ pub fn get_usage_entries_by_month(
             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
-            date, source_kind
+            date, source_kind, reported_cost_usd
          FROM usage_entries WHERE date LIKE ?".to_string();
     let mut params_vec = Vec::new();
     params_vec.push(rusqlite::types::Value::Text(query_month));
@@ -4616,15 +4822,19 @@ pub fn get_usage_entries_by_month(
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
 
-        let cost = if duration_ms.is_some() || premium_requests.is_some() {
-            Some(CostStats {
-                total_api_duration_ms: duration_ms,
-                total_duration_ms: None,
-                total_premium_requests: premium_requests,
-            })
-        } else {
-            None
-        };
+        let reported_cost_usd: Option<f64> =
+            row.get::<_, Option<f64>>(34).map_err(|e| e.to_string())?;
+        let cost =
+            if duration_ms.is_some() || premium_requests.is_some() || reported_cost_usd.is_some() {
+                Some(CostStats {
+                    total_api_duration_ms: duration_ms,
+                    total_duration_ms: None,
+                    total_premium_requests: premium_requests,
+                    reported_cost_usd,
+                })
+            } else {
+                None
+            };
 
         let entry_date = row.get::<_, String>(32).map_err(|e| e.to_string())?;
 
@@ -4707,7 +4917,7 @@ pub fn get_usage_entries_by_year(
             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
-            date, source_kind
+            date, source_kind, reported_cost_usd
          FROM usage_entries WHERE date LIKE ?".to_string();
     let mut params_vec = Vec::new();
     params_vec.push(rusqlite::types::Value::Text(query_year));
@@ -4843,15 +5053,19 @@ pub fn get_usage_entries_by_year(
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
 
-        let cost = if duration_ms.is_some() || premium_requests.is_some() {
-            Some(CostStats {
-                total_api_duration_ms: duration_ms,
-                total_duration_ms: None,
-                total_premium_requests: premium_requests,
-            })
-        } else {
-            None
-        };
+        let reported_cost_usd: Option<f64> =
+            row.get::<_, Option<f64>>(34).map_err(|e| e.to_string())?;
+        let cost =
+            if duration_ms.is_some() || premium_requests.is_some() || reported_cost_usd.is_some() {
+                Some(CostStats {
+                    total_api_duration_ms: duration_ms,
+                    total_duration_ms: None,
+                    total_premium_requests: premium_requests,
+                    reported_cost_usd,
+                })
+            } else {
+                None
+            };
 
         let entry_date = row.get::<_, String>(32).map_err(|e| e.to_string())?;
 
@@ -4948,6 +5162,7 @@ mod tests {
                     total_api_duration_ms: Some(125.0),
                     total_duration_ms: None,
                     total_premium_requests: Some(1.0),
+                    reported_cost_usd: None,
                 }),
                 source_kind: None,
                 parent_session_id: Some("parent-session".to_string()),
@@ -7337,5 +7552,179 @@ mod tests {
             )
             .unwrap();
         assert_eq!(migrated, 2);
+    }
+
+    #[test]
+    fn grok_parser_migration_resets_existing_sync_state() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![GROK_PARSER_MIGRATION_KEY],
+        )
+        .unwrap();
+        for legacy_key in LEGACY_GROK_PARSER_MIGRATION_KEYS {
+            conn.execute(
+                "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+                 VALUES (?, 1, 0)",
+                params![legacy_key],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('grok:sessions/work/updates.jsonl', 123, 456)",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let stale_state_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'grok:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_state_count, 0);
+
+        let migration_done: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+                params![GROK_PARSER_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(migration_done);
+
+        for legacy_key in LEGACY_GROK_PARSER_MIGRATION_KEYS {
+            let legacy_marker_count: u64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
+                    params![legacy_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                legacy_marker_count, 0,
+                "legacy marker should be removed: {legacy_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_grok_usage_logs_rebuilds_session_and_keeps_reported_cost() {
+        let root = temp_jsonl_path("grok-sync");
+        let session_dir = root.join("sessions/work/grok-session");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("summary.json"),
+            r#"{"info":{"cwd":"/tmp/grok-project"},"current_model_id":"grok-4.5","reasoning_effort":"high","generated_title":"Grok sync test"}"#,
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("updates.jsonl"),
+            concat!(
+                r#"{"timestamp":1710000000,"params":{"update":{"sessionUpdate":"turn_started","turn_number":0}}}"#, "\n",
+                r#"{"timestamp":1710000001,"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"sync"}}}}"#, "\n",
+                r#"{"timestamp":1710000002,"params":{"update":{"sessionUpdate":"turn_completed","usage":{"input_tokens":100,"cachedReadTokens":20,"output_tokens":20,"total_tokens":120},"total_cost_usd":0.00024}}}"#, "\n"
+            ),
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_grok_usage_logs(&mut conn, &root).unwrap();
+
+        let (
+            count,
+            source_kind,
+            delta_input,
+            delta_cache_read,
+            delta_total,
+            reported_cost,
+            reasoning_effort,
+        ): (u64, String, u64, u64, u64, f64, Option<String>) = conn
+            .query_row(
+                "SELECT COUNT(*), source_kind, delta_input, delta_cache_read,
+                        delta_total, reported_cost_usd, reasoning_effort
+                 FROM usage_entries WHERE assistant_type = 'grok'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(source_kind, crate::grok::USAGE_SOURCE_KIND);
+        assert_eq!(delta_input, 80);
+        assert_eq!(delta_cache_read, 20);
+        assert_eq!(delta_total, 120);
+        assert!((reported_cost - 0.00024).abs() < f64::EPSILON);
+        assert_eq!(reasoning_effort.as_deref(), Some("High"));
+
+        let date_rows = get_usage_entries_by_date(&conn, "2024-03-09", "grok").unwrap();
+        assert_eq!(date_rows.len(), 1);
+        assert_eq!(
+            date_rows[0]
+                .0
+                .entry
+                .cost
+                .as_ref()
+                .and_then(|cost| cost.reported_cost_usd),
+            Some(0.00024)
+        );
+
+        let month_rows = get_usage_entries_by_month(&conn, "2024-03", "grok").unwrap();
+        assert_eq!(
+            month_rows[0]
+                .0
+                .cost
+                .as_ref()
+                .and_then(|cost| cost.reported_cost_usd),
+            Some(0.00024)
+        );
+
+        let year_rows = get_usage_entries_by_year(&conn, "2024", "grok").unwrap();
+        assert_eq!(
+            year_rows[0]
+                .0
+                .cost
+                .as_ref()
+                .and_then(|cost| cost.reported_cost_usd),
+            Some(0.00024)
+        );
+
+        let exported = export_usage_day_entries(&conn, "grok", "2024-03-09").unwrap();
+        assert_eq!(exported.len(), 1);
+        let mut imported_conn = Connection::open_in_memory().unwrap();
+        init_db(&imported_conn).unwrap();
+        import_usage_day_entries(
+            &mut imported_conn,
+            "grok",
+            "2024-03-09",
+            exported,
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        let imported_cost: f64 = imported_conn
+            .query_row(
+                "SELECT reported_cost_usd FROM usage_entries WHERE assistant_type = 'grok'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!((imported_cost - 0.00024).abs() < f64::EPSILON);
+
+        let _ = fs::remove_dir_all(root);
     }
 }

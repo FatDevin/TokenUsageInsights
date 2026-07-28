@@ -4,7 +4,22 @@
 
 ## [未發行]
 
-目前沒有尚未發行的變更。
+### 新增與改善
+
+- 新增 Grok Build 助理支援，掃描 `~/.grok/sessions` 的 `updates.jsonl`，提供每日、月度、年度統計、Session 清單與時間軸還原。
+- 支援 Grok Build 的 provider usage、model alias、reasoning effort、快取讀取與 context-only snapshot，並在 Session 清單標示 `Usage` 或 `Context` 來源。
+
+### 變更
+
+- Grok Build Session 若包含 provider 回報成本，統計頁面會優先使用該成本；只有 context snapshot 時才依 xAI API pricing 估算。
+
+### 資料影響
+
+- SQLite `usage_entries` 新增 `reported_cost_usd` 欄位，並以一次性 migration 重新解析既有 Grok Build Session；不會刪除其他助理的資料。
+
+### 相容性
+
+- 新增 `GROK_DIR` 環境變數；既有助理識別碼、API 與資料目錄維持相容。
 
 ## [0.6.1] - 2026-07-26
 

@@ -45,6 +45,43 @@
 - Added shared native path/resource handling, Windows-safe database migration, PowerShell collectors, installer hardening, native setup commands, and Windows release smoke coverage.
 - Verification evidence is the remaining checkpoint and will be reported command-by-command after execution.
 
+# 2026-07-29 Issue #28 Grok Build 支援
+
+## Goal and acceptance criteria
+
+- [x] 支援 Grok Build session logs 的 metadata、usage/context delta、model 與 reasoning effort 解析。
+- [x] 將 Grok Build 同步至既有 SQLite、每日/月度/年度統計與成本估算流程，不破壞主線既有 assistant。
+- [x] 新增 Grok setup-info、CLI 說明/匯入支援、狀態切換、logo、翻譯與設定教學。
+- [x] 保留 Grok provider reported cost，並正確處理 context snapshot 的增量計價。
+- [x] 新增 parser/handler 回歸測試，通過前端語法、格式、測試、build、Clippy 與 diff 檢查，且無 compiler warnings。
+
+## Plan
+
+- [x] 從 `origin/main` 與舊綜合 commit 拆出 Grok 相關檔案與依賴邊界。
+- [x] 移植 Grok parser、timeline 與 SQLite sync，適配主線現有 schema/migration。
+- [x] 接上 handler、CLI、靜態前端與安裝文件，避免修改 #27 的計價門檻邏輯。
+- [x] 執行完整驗證與 deterministic fixture smoke check。
+
+## Risk and rollback
+
+- Risk: medium；新增本機資料來源、SQLite rows、API assistant type 與前端選項。
+- Rollback: 還原 Grok-specific source/parser、schema additions、routes、static assets、scripts/docs 與本節任務紀錄；既有 assistant 資料不應被刪除或重寫。
+
+## Working notes
+
+- Grok logs are read-only source data; derived rows use `assistant_type = 'grok'` and source kinds for usage/context records.
+- `origin/main` already contains the current cache-write and model-attribution pricing behavior; this branch must preserve it.
+- Provider costs are stored in `usage_entries.reported_cost_usd`; context-only rows use incremental deltas before estimated pricing.
+- Transcript access is constrained to `GROK_DIR/sessions/<session_id>/updates.jsonl`; parser migration resets only `grok:` sync state.
+- `pricing.csv` only adds Grok rows in this branch; dynamic non-Codex pricing thresholds belong to issue #27.
+
+## Results
+
+- 新增 `src/grok.rs` parser、Grok timeline reconstruction、SQLite sync、parser migration、`reported_cost_usd` round-trip 與來源標記。
+- 接上 daily handler transcript path validation、setup-info、CLI aliases/help、frontend assistant selector/setup modal、雙語翻譯、Grok logo、README 與 CHANGELOG。
+- `pricing.csv` 僅新增 Grok 4.5 API pricing rows；未修改 #27 的既有 threshold rows。
+- 驗證：`cargo fmt --all -- --check`、`cargo test --locked`（主 binary 83、CLI binary 60）、`cargo build --release --locked --all-targets`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`node --check static/app.js`、`node --check static/i18n.js`、`git diff --check` 全部通過，無 compiler warnings。
+
 # 2026-07-10 codex_session_count_mismatch
 
 ## Goal and acceptance criteria

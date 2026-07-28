@@ -20,6 +20,7 @@ pub fn normalize_assistant_name(assistant: &str) -> String {
     match normalized.as_str() {
         "claude-code" | "claude_code" | "claudecode" => "claude".to_string(),
         "cursor" => "cursor".to_string(),
+        "grok-build" | "grok_build" | "grokbuild" | "grok" => "grok".to_string(),
         _ => normalized,
     }
 }
@@ -27,7 +28,7 @@ pub fn normalize_assistant_name(assistant: &str) -> String {
 pub fn is_supported_assistant(assistant: &str) -> bool {
     matches!(
         normalize_assistant_name(assistant).as_str(),
-        "antigravity" | "copilot" | "codex" | "claude" | "cursor"
+        "antigravity" | "copilot" | "codex" | "claude" | "cursor" | "grok"
     )
 }
 
@@ -102,24 +103,29 @@ fn record_usage(
     let model = entry_model(entry);
     let model_label = model.unwrap_or("Unknown Model");
     let (cache_write_5m, cache_write_1h) = cache_write_breakdown(tokens);
-    let cost_usd = match calculate_usage_cost(
-        pricing_rules,
-        model,
-        tokens.input,
-        tokens.output,
-        tokens.cache_read.unwrap_or(0),
-        cache_write_5m,
-        cache_write_1h,
-    ) {
-        Ok(cost) => cost,
-        Err(error) => {
-            eprintln!(
-                "計算成本失敗: session_id={} turn_no={} model={}: {}",
-                entry.session_id, entry.turn_no, model_label, error
-            );
-            0.0
-        }
-    };
+    let cost_usd =
+        if let Some(reported_cost) = entry.cost.as_ref().and_then(|cost| cost.reported_cost_usd) {
+            reported_cost
+        } else {
+            match calculate_usage_cost(
+                pricing_rules,
+                model,
+                tokens.input,
+                tokens.output,
+                tokens.cache_read.unwrap_or(0),
+                cache_write_5m,
+                cache_write_1h,
+            ) {
+                Ok(cost) => cost,
+                Err(error) => {
+                    eprintln!(
+                        "計算成本失敗: session_id={} turn_no={} model={}: {}",
+                        entry.session_id, entry.turn_no, model_label, error
+                    );
+                    0.0
+                }
+            }
+        };
 
     add_tokens(&mut result.usage, tokens);
     result.usage.cost_usd += cost_usd;
@@ -207,6 +213,7 @@ pub struct SetupInfoResponse {
     pub codex: AssistantSetupStatus,
     pub claude: AssistantSetupStatus,
     pub cursor: AssistantSetupStatus,
+    pub grok: AssistantSetupStatus,
 }
 
 #[derive(Serialize)]
@@ -498,6 +505,33 @@ mod tests {
         assert_eq!(result.usage.cache_write_5m_tokens, 1_500_000);
         assert_eq!(result.usage.cache_write_1h_tokens, 1_000_000);
         assert!((result.usage.cost_usd - 99.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn session_cost_prefers_provider_reported_cost() {
+        let rules = [PricingRule {
+            model_name: "grok-4.5".to_string(),
+            input_price: 100.0,
+            cache_input_price: 100.0,
+            output_price: 100.0,
+        }];
+        let mut entry = usage_entry(
+            1,
+            "Grok 4.5",
+            token_stats(1_000_000, 1_000_000, 1_000_000),
+            true,
+        );
+        entry.cost = Some(db::CostStats {
+            total_api_duration_ms: None,
+            total_duration_ms: None,
+            total_premium_requests: None,
+            reported_cost_usd: Some(0.0123),
+        });
+
+        let result = summarize_session_usage(&rules, &[entry]);
+
+        assert!((result.usage.cost_usd - 0.0123).abs() < 1e-9);
+        assert!((result.models[0].usage.cost_usd - 0.0123).abs() < 1e-9);
     }
 
     #[test]
