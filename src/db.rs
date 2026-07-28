@@ -670,11 +670,16 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             session_id TEXT NOT NULL,
             cwd TEXT,
             mode TEXT,
+            model TEXT,
             PRIMARY KEY (source_id, session_id)
         )",
         [],
     )
     .map_err(|error| format!("建立 Cursor Session 中繼資料表失敗: {error}"))?;
+    let _ = conn.execute(
+        "ALTER TABLE cursor_session_metadata ADD COLUMN model TEXT",
+        [],
+    );
 
     // Before source_kind existed, every Copilot record came from the CLI
     // collector. Classify those historical rows once so the new source-scoped
@@ -2990,10 +2995,32 @@ fn load_cursor_model_signatures(
     Ok(mappings)
 }
 
+fn load_cursor_ambiguous_model_signatures(
+    conn: &Connection,
+    source_id: &str,
+) -> Result<HashSet<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT signature
+             FROM cursor_model_signatures
+             WHERE source_id = ? AND is_ambiguous = 1",
+        )
+        .map_err(|error| format!("準備讀取 Cursor 歧義模型簽章失敗: {error}"))?;
+    let rows = statement
+        .query_map(params![source_id], |row| row.get(0))
+        .map_err(|error| format!("讀取 Cursor 歧義模型簽章失敗: {error}"))?;
+    let mut signatures = HashSet::new();
+    for row in rows {
+        signatures.insert(row.map_err(|error| format!("解析 Cursor 歧義模型簽章失敗: {error}"))?);
+    }
+    Ok(signatures)
+}
+
 #[derive(Clone, Debug, Default)]
 struct CursorSessionMetadata {
     cwd: Option<String>,
     mode: Option<String>,
+    model: Option<String>,
 }
 
 fn parse_cursor_session_metadata(key: &str, raw: &[u8]) -> Option<(String, CursorSessionMetadata)> {
@@ -3030,11 +3057,23 @@ fn parse_cursor_session_metadata(key: &str, raw: &[u8]) -> Option<(String, Curso
     } else {
         None
     };
+    let model = value
+        .pointer("/modelConfig/modelName")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| {
+            !item.is_empty()
+                && item.len() <= 200
+                && !item.eq_ignore_ascii_case("default")
+                && !item.eq_ignore_ascii_case("auto")
+                && !item.eq_ignore_ascii_case("unknown model")
+        })
+        .map(str::to_string);
 
-    if cwd.is_none() && mode.is_none() {
+    if cwd.is_none() && mode.is_none() && model.is_none() {
         return None;
     }
-    Some((session_id, CursorSessionMetadata { cwd, mode }))
+    Some((session_id, CursorSessionMetadata { cwd, mode, model }))
 }
 
 fn sync_cursor_session_metadata(
@@ -3042,7 +3081,7 @@ fn sync_cursor_session_metadata(
     state_db_path: &Path,
 ) -> Result<String, String> {
     let source_id = cursor_model_source_id(state_db_path);
-    let state_key = format!("cursor-composer-data:v2:{source_id}");
+    let state_key = format!("cursor-composer-data:v3:{source_id}");
     let source_conn = open_cursor_state_db(state_db_path)?;
     let max_rowid = cursor_state_max_rowid(&source_conn)?;
     let stored_rowid: i64 = conn
@@ -3105,12 +3144,19 @@ fn sync_cursor_session_metadata(
         for (session_id, metadata) in metadata_rows {
             tx.execute(
                 "INSERT INTO cursor_session_metadata (
-                    source_id, session_id, cwd, mode
-                 ) VALUES (?, ?, ?, ?)
+                    source_id, session_id, cwd, mode, model
+                 ) VALUES (?, ?, ?, ?, ?)
                  ON CONFLICT(source_id, session_id) DO UPDATE SET
                     cwd = COALESCE(excluded.cwd, cursor_session_metadata.cwd),
-                    mode = COALESCE(excluded.mode, cursor_session_metadata.mode)",
-                params![source_id, session_id, metadata.cwd, metadata.mode],
+                    mode = COALESCE(excluded.mode, cursor_session_metadata.mode),
+                    model = COALESCE(excluded.model, cursor_session_metadata.model)",
+                params![
+                    source_id,
+                    session_id,
+                    metadata.cwd,
+                    metadata.mode,
+                    metadata.model
+                ],
             )
             .map_err(|error| format!("寫入 Cursor Session 中繼資料快取失敗: {error}"))?;
         }
@@ -3159,6 +3205,34 @@ fn sync_cursor_session_metadata(
                 ],
             )
             .map_err(|error| format!("回填 Cursor Session 模式失敗: {error}"))?;
+            tx.execute(
+                "UPDATE usage_entries
+                 SET model = (
+                        SELECT metadata.model FROM cursor_session_metadata metadata
+                        WHERE metadata.source_id = ?
+                          AND metadata.session_id = usage_entries.session_id
+                     ),
+                     model_id = (
+                        SELECT metadata.model FROM cursor_session_metadata metadata
+                        WHERE metadata.source_id = ?
+                          AND metadata.session_id = usage_entries.session_id
+                     )
+                 WHERE assistant_type = 'cursor'
+                   AND EXISTS (
+                        SELECT 1 FROM cursor_session_metadata metadata
+                        WHERE metadata.source_id = ?
+                          AND metadata.session_id = usage_entries.session_id
+                          AND metadata.model IS NOT NULL
+                          AND metadata.model != ''
+                   )
+                   AND NOT EXISTS (
+                        SELECT 1 FROM cursor_model_signatures signatures
+                        WHERE signatures.source_id = ?
+                          AND signatures.signature = usage_entries.model_signature
+                   )",
+                params![source_id, source_id, source_id, source_id],
+            )
+            .map_err(|error| format!("回填 Cursor Session 模型 fallback 失敗: {error}"))?;
         }
 
         let now = SystemTime::now()
@@ -3185,7 +3259,7 @@ fn load_cursor_session_metadata(
 ) -> Result<HashMap<String, CursorSessionMetadata>, String> {
     let mut statement = conn
         .prepare(
-            "SELECT session_id, cwd, mode
+            "SELECT session_id, cwd, mode, model
              FROM cursor_session_metadata
              WHERE source_id = ?",
         )
@@ -3197,6 +3271,7 @@ fn load_cursor_session_metadata(
                 CursorSessionMetadata {
                     cwd: row.get(1)?,
                     mode: row.get(2)?,
+                    model: row.get(3)?,
                 },
             ))
         })
@@ -3218,6 +3293,7 @@ struct CursorParsedEntry {
 fn parse_cursor_session_file(
     filepath: &Path,
     model_mappings: &HashMap<String, String>,
+    ambiguous_model_signatures: &HashSet<String>,
     session_metadata: &HashMap<String, CursorSessionMetadata>,
 ) -> Result<Vec<CursorParsedEntry>, String> {
     let file = File::open(filepath).map_err(|e| format!("無法開啟檔案: {}", e))?;
@@ -3285,11 +3361,19 @@ fn parse_cursor_session_file(
                 cursor_content_to_text(content_val.unwrap_or(&serde_json::Value::Null));
             let current_model_signature =
                 cursor_response_signature(content_val.unwrap_or(&serde_json::Value::Null));
-            let current_model = current_model_signature
-                .as_ref()
-                .and_then(|signature| model_mappings.get(signature))
-                .cloned()
-                .unwrap_or_else(|| "Unknown Model".to_string());
+            let current_model = match current_model_signature.as_ref() {
+                Some(signature) if ambiguous_model_signatures.contains(signature) => {
+                    "Unknown Model".to_string()
+                }
+                Some(signature) => model_mappings
+                    .get(signature)
+                    .cloned()
+                    .or_else(|| metadata.and_then(|value| value.model.clone()))
+                    .unwrap_or_else(|| "Unknown Model".to_string()),
+                None => metadata
+                    .and_then(|value| value.model.clone())
+                    .unwrap_or_else(|| "Unknown Model".to_string()),
+            };
 
             if current_timestamp.is_empty() {
                 if let Ok(metadata) = filepath.metadata() {
@@ -3373,6 +3457,11 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
     } else {
         HashMap::new()
     };
+    let ambiguous_model_signatures = if let Some(source_id) = source_id.as_deref() {
+        load_cursor_ambiguous_model_signatures(conn, source_id)?
+    } else {
+        HashSet::new()
+    };
     let session_metadata = if let Some(source_id) = source_id.as_deref() {
         load_cursor_session_metadata(conn, source_id)?
     } else {
@@ -3409,14 +3498,18 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
         let current_size = metadata.len();
 
         if current_size != last_synced_size {
-            let parsed_entries =
-                match parse_cursor_session_file(&filepath, &model_mappings, &session_metadata) {
-                    Ok(entries) => entries,
-                    Err(e) => {
-                        eprintln!("解析 Cursor 會話檔案 {:?} 失敗: {}", filepath, e);
-                        continue;
-                    }
-                };
+            let parsed_entries = match parse_cursor_session_file(
+                &filepath,
+                &model_mappings,
+                &ambiguous_model_signatures,
+                &session_metadata,
+            ) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    eprintln!("解析 Cursor 會話檔案 {:?} 失敗: {}", filepath, e);
+                    continue;
+                }
+            };
 
             let tx = conn
                 .transaction()
@@ -6477,7 +6570,9 @@ mod tests {
 "#;
 
         fs::write(&path, content).unwrap();
-        let entries = parse_cursor_session_file(&path, &HashMap::new(), &HashMap::new()).unwrap();
+        let entries =
+            parse_cursor_session_file(&path, &HashMap::new(), &HashSet::new(), &HashMap::new())
+                .unwrap();
         let _ = fs::remove_file(&path);
 
         assert_eq!(entries.len(), 2);
@@ -6574,7 +6669,9 @@ mod tests {
         .unwrap();
         let model_mappings = HashMap::from([(signature, "composer-2.5".to_string())]);
 
-        let entries = parse_cursor_session_file(&path, &model_mappings, &HashMap::new()).unwrap();
+        let entries =
+            parse_cursor_session_file(&path, &model_mappings, &HashSet::new(), &HashMap::new())
+                .unwrap();
         let _ = fs::remove_file(&path);
 
         assert_eq!(entries.len(), 2);
@@ -6617,6 +6714,31 @@ mod tests {
         assert_eq!(false_overrides_agent_mode.mode.as_deref(), Some("ide"));
         assert_eq!(non_agent_mode_overrides_true.mode.as_deref(), Some("ide"));
         assert_eq!(agent_mode.mode.as_deref(), Some("agent"));
+    }
+
+    #[test]
+    fn cursor_session_metadata_uses_only_concrete_model_configs() {
+        let (_, concrete_model) = parse_cursor_session_metadata(
+            "composerData:concrete-model",
+            br#"{
+                "composerId": "concrete-model",
+                "unifiedMode": "agent",
+                "modelConfig": { "modelName": "composer-2.5" }
+            }"#,
+        )
+        .unwrap();
+        let (_, default_model) = parse_cursor_session_metadata(
+            "composerData:default-model",
+            br#"{
+                "composerId": "default-model",
+                "unifiedMode": "agent",
+                "modelConfig": { "modelName": "default" }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(concrete_model.model.as_deref(), Some("composer-2.5"));
+        assert!(default_model.model.is_none());
     }
 
     #[test]
@@ -6770,7 +6892,10 @@ mod tests {
                             }
                         },
                         "unifiedMode": "agent",
-                        "isAgentic": false
+                        "isAgentic": false,
+                        "modelConfig": {
+                            "modelName": "composer-2"
+                        }
                     }"#
                 ],
             )
@@ -6982,7 +7107,7 @@ mod tests {
         }
         let _ = fs::remove_dir_all(&root);
 
-        assert_eq!(initial.0, "Unknown Model");
+        assert_eq!(initial.0, "composer-2");
         assert_eq!(initial.1, "/tmp/project");
         assert_eq!(initial.2, CURSOR_IDE_SOURCE_KIND);
         assert_eq!(initial.3, "2026-07-24");

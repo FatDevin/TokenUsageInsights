@@ -3516,10 +3516,20 @@ function getSessionSourceBadge(session) {
     return '<span class="badge source-badge" title="Codex CLI">CLI</span>';
   }
   if (session.source_kind === 'cursor-agent') {
-    return `<span class="badge source-badge" title="${escapeHtml(t('source_cursor_agent_title'))}">${escapeHtml(t('source_cursor_agent'))}</span>`;
+    return `<span class="badge source-badge cursor-mode-badge cursor-mode-agent" title="${escapeHtml(t('source_cursor_agent_title'))}">${escapeHtml(t('source_cursor_agent'))}</span>`;
   }
   if (session.source_kind === 'cursor-ide') {
-    return `<span class="badge source-badge" title="${escapeHtml(t('source_cursor_ide_title'))}">${escapeHtml(t('source_cursor_ide'))}</span>`;
+    return `<span class="badge source-badge cursor-mode-badge cursor-mode-ide" title="${escapeHtml(t('source_cursor_ide_title'))}">${escapeHtml(t('source_cursor_ide'))}</span>`;
+  }
+  return '';
+}
+
+function getCursorModeBadge(mode) {
+  if (mode === 'agent') {
+    return getSessionSourceBadge({ source_kind: 'cursor-agent' });
+  }
+  if (mode === 'ide') {
+    return getSessionSourceBadge({ source_kind: 'cursor-ide' });
   }
   return '';
 }
@@ -3622,6 +3632,8 @@ function renderSessionTable(sessions) {
       assistantBadge = `<span class="badge" style="${meta.badgeStyle}">${getAssistantLogoHtml(s.assistant_type)} ${meta.shortLabel}</span>`;
     }
     const sourceBadge = getSessionSourceBadge(s);
+    const nameSourceBadge = s.assistant_type === 'cursor' ? '' : sourceBadge;
+    const modelSourceBadge = s.assistant_type === 'cursor' ? sourceBadge : '';
 
     const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td>${assistantBadge}</td>` : '';
 
@@ -3637,12 +3649,11 @@ function renderSessionTable(sessions) {
           <span class="tree-connector" style="left: ${connectorLeft}px;">└─</span>
           <div style="display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 3px;">
             <span class="badge subagent-badge" title="Subagent of: ${escapeHtml(s.parentName || '')}">Subagent</span>
-            ${sourceBadge}
+            ${nameSourceBadge}
             ${nickname ? `<span class="badge agent-nickname-badge" title="Agent Nickname: ${escapeHtml(nickname)}">${escapeHtml(nickname)}</span>` : ''}
             ${role ? `<span class="badge agent-role-badge" title="Agent Role: ${escapeHtml(role)}">${escapeHtml(role)}</span>` : ''}
           </div>
           <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
-          ${sourceBadge}
           <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
         </div>
       `;
@@ -3650,7 +3661,7 @@ function renderSessionTable(sessions) {
       nameCellContent = `
         <div class="session-name-wrapper">
           <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
-          ${sourceBadge}
+          ${nameSourceBadge}
           <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
         </div>
       `;
@@ -3664,6 +3675,7 @@ function renderSessionTable(sessions) {
       <td class="model-column">
         <div class="model-cell-content">
           <span class="badge highlight">${escapeHtml(s.model)}</span>
+          ${modelSourceBadge}
           ${s.reasoning_effort ? `<span class="badge" style="background: rgba(127, 142, 163, 0.15); color: #aeb9c8; font-size: 11px; font-weight: 600;">${escapeHtml(s.reasoning_effort)}</span>` : ''}
         </div>
       </td>
@@ -4819,17 +4831,22 @@ function renderYearlyProjectsTable(projects) {
 // =========================================================================
 // 渲染年度模型佔比列表 Table
 // =========================================================================
-function modelSessionCacheKey(period, model) {
-  return [currentAssistant, period, model].join('\u0000');
+function normalizedModelMode(mode) {
+  return mode === 'agent' || mode === 'ide' ? mode : 'unclassified';
 }
 
-async function fetchModelSessions(period, model) {
-  const cacheKey = modelSessionCacheKey(period, model);
+function modelSessionCacheKey(period, model, mode) {
+  return [currentAssistant, period, model, normalizedModelMode(mode)].join('\u0000');
+}
+
+async function fetchModelSessions(period, model, mode) {
+  const normalizedMode = normalizedModelMode(mode);
+  const cacheKey = modelSessionCacheKey(period, model, normalizedMode);
   if (modelSessionDetailsCache.has(cacheKey)) {
     return modelSessionDetailsCache.get(cacheKey);
   }
 
-  const params = new URLSearchParams({ period, model });
+  const params = new URLSearchParams({ period, model, mode: normalizedMode });
   const response = await fetch(
     `/api/${encodeURIComponent(currentAssistant)}/model-sessions?${params.toString()}`
   );
@@ -4926,7 +4943,7 @@ function renderModelSessionDrilldown(sessions) {
   `;
 }
 
-async function populateModelSessionDetails(detailsRow, period, model) {
+async function populateModelSessionDetails(detailsRow, period, model, mode) {
   detailsRow.dataset.state = 'loading';
   detailsRow.innerHTML = `
     <td colspan="5">
@@ -4935,7 +4952,7 @@ async function populateModelSessionDetails(detailsRow, period, model) {
   `;
 
   try {
-    const sessions = await fetchModelSessions(period, model);
+    const sessions = await fetchModelSessions(period, model, mode);
     if (!detailsRow.isConnected) return;
     detailsRow.modelSessions = sessions;
     detailsRow.dataset.state = 'loaded';
@@ -4962,6 +4979,7 @@ function appendModelSummaryRows(tbody, models, period) {
   }
 
   models.forEach((model, index) => {
+    const modelMode = model.mode || null;
     const summaryRow = document.createElement('tr');
     summaryRow.className = 'model-summary-row';
     const detailsId = `${tbody.id}-details-${index}`;
@@ -4971,6 +4989,7 @@ function appendModelSummaryRows(tbody, models, period) {
         <button type="button" class="model-drilldown-toggle" aria-expanded="false" aria-controls="${detailsId}" title="${escapeHtml(t('model_drilldown_hint'))}">
           <span class="model-drilldown-chevron" aria-hidden="true">›</span>
           <span class="badge highlight model-badge">${escapeHtml(model.model)}</span>
+          ${getCursorModeBadge(modelMode)}
         </button>
       </td>
       <td><span class="badge">${model.sessions_count} Sessions</span></td>
@@ -4998,9 +5017,9 @@ function appendModelSummaryRows(tbody, models, period) {
       summaryRow.classList.add('is-expanded');
       toggle.setAttribute('aria-expanded', 'true');
       detailsRow.hidden = false;
-      expandedModelDrilldowns.set(tbody.id, { period, model: model.model });
+      expandedModelDrilldowns.set(tbody.id, { period, model: model.model, mode: modelMode });
       if (!detailsRow.dataset.state) {
-        await populateModelSessionDetails(detailsRow, period, model.model);
+        await populateModelSessionDetails(detailsRow, period, model.model, modelMode);
       }
     };
 
@@ -5019,7 +5038,7 @@ function appendModelSummaryRows(tbody, models, period) {
     detailsRow.addEventListener('click', async event => {
       const retryButton = event.target.closest('.model-session-retry');
       if (retryButton) {
-        await populateModelSessionDetails(detailsRow, period, model.model);
+        await populateModelSessionDetails(detailsRow, period, model.model, modelMode);
         return;
       }
 
@@ -5043,13 +5062,22 @@ function appendModelSummaryRows(tbody, models, period) {
     tbody.appendChild(detailsRow);
 
     const restore = expandedModelDrilldowns.get(tbody.id);
-    if (restore?.period === period && restore.model === model.model) {
+    if (
+      restore?.period === period
+      && restore.model === model.model
+      && (restore.mode || null) === modelMode
+    ) {
       void openDetails();
     }
   });
 
   const active = expandedModelDrilldowns.get(tbody.id);
-  if (active && !models.some(model => model.model === active.model)) {
+  if (
+    active
+    && !models.some(
+      model => model.model === active.model && (model.mode || null) === (active.mode || null)
+    )
+  ) {
     expandedModelDrilldowns.delete(tbody.id);
   }
 }

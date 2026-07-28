@@ -14,12 +14,47 @@ use crate::pricing::{load_pricing_rules, PricingRule};
 pub struct ModelSessionsQuery {
     period: String,
     model: String,
+    mode: Option<String>,
 }
 
 #[derive(Clone, Copy)]
 enum ModelSessionPeriod {
     Month,
     Year,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelSessionMode {
+    Agent,
+    Ide,
+    Unclassified,
+}
+
+impl ModelSessionMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "agent" => Some(Self::Agent),
+            "ide" => Some(Self::Ide),
+            "unclassified" => Some(Self::Unclassified),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> Option<&'static str> {
+        match self {
+            Self::Agent => Some("agent"),
+            Self::Ide => Some("ide"),
+            Self::Unclassified => None,
+        }
+    }
+
+    fn matches(self, mode: Option<&str>) -> bool {
+        match self {
+            Self::Agent => mode == Some("agent"),
+            Self::Ide => mode == Some("ide"),
+            Self::Unclassified => mode.is_none(),
+        }
+    }
 }
 
 fn parse_model_session_period(value: &str) -> Option<ModelSessionPeriod> {
@@ -46,6 +81,7 @@ fn valid_model_session_date(value: &str) -> Option<String> {
 fn collect_model_session_details(
     entries_with_type: &[(UsageEntry, String, String)],
     requested_model: &str,
+    requested_mode: Option<ModelSessionMode>,
     pricing_rules: &[PricingRule],
 ) -> Vec<ModelSessionDetail> {
     let mut sessions_map: HashMap<String, (Vec<UsageEntry>, String)> = HashMap::new();
@@ -70,6 +106,10 @@ fn collect_model_session_details(
 
     let mut details = Vec::new();
     for (session_id, (entries, assistant_type)) in sessions_map {
+        let mode = cursor_session_mode(&assistant_type, &entries);
+        if requested_mode.is_some_and(|requested| !requested.matches(mode)) {
+            continue;
+        }
         let session_usage = summarize_session_usage(pricing_rules, &entries);
         let Some(model_usage) = session_usage
             .models
@@ -156,6 +196,18 @@ pub async fn get_model_sessions(
 
     let period = query.period.trim().to_string();
     let model = query.model.trim().to_string();
+    let mode =
+        match query.mode.as_deref().map(str::trim) {
+            Some(value) => match ModelSessionMode::parse(value) {
+                Some(mode) => Some(mode),
+                None => return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "Mode 必須是 agent、ide 或 unclassified" })),
+                )
+                    .into_response(),
+            },
+            None => None,
+        };
     let Some(period_kind) = parse_model_session_period(&period) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -174,6 +226,7 @@ pub async fn get_model_sessions(
     let assistant_for_query = assistant.clone();
     let period_for_query = period.clone();
     let model_for_query = model.clone();
+    let mode_for_query = mode;
     let result = tokio::task::spawn_blocking(move || {
         let conn = db::get_db_conn()?;
         let entries = match period_kind {
@@ -187,6 +240,7 @@ pub async fn get_model_sessions(
         Ok::<_, String>(collect_model_session_details(
             &entries,
             &model_for_query,
+            mode_for_query,
             &load_pricing_rules(),
         ))
     })
@@ -197,6 +251,7 @@ pub async fn get_model_sessions(
         Ok(sessions) => Json(ModelSessionsResponse {
             period,
             model,
+            mode: mode.and_then(ModelSessionMode::label).map(str::to_string),
             sessions,
         })
         .into_response(),
@@ -366,8 +421,6 @@ pub async fn get_monthly_details(
 
     // 按專案統計 (CWD)
     let mut project_map_stats: HashMap<String, (usize, u64, f64)> = HashMap::new();
-    // 按模型統計 (Model)
-    let mut model_map_stats: HashMap<String, (usize, u64, u64, u64, u64, f64)> = HashMap::new();
     // 按 Agent 類型統計
     let mut agent_map_stats: HashMap<String, AgentBreakdown> = HashMap::new();
 
@@ -383,18 +436,6 @@ pub async fn get_monthly_details(
         project_stat.0 += 1;
         project_stat.1 += session_usage.usage.total_tokens;
         project_stat.2 += session_usage.usage.cost_usd;
-
-        for model_usage in &session_usage.models {
-            let model_stat = model_map_stats
-                .entry(model_usage.model.clone())
-                .or_insert((0, 0, 0, 0, 0, 0.0));
-            model_stat.0 += 1;
-            model_stat.1 += model_usage.usage.total_tokens;
-            model_stat.2 += model_usage.usage.input_tokens;
-            model_stat.3 += model_usage.usage.output_tokens;
-            model_stat.4 += model_usage.usage.cache_read_tokens;
-            model_stat.5 += model_usage.usage.cost_usd;
-        }
 
         let agent_stat = agent_map_stats.entry(ast_type.clone()).or_default();
         agent_stat.total_tokens += session_usage.usage.total_tokens;
@@ -417,30 +458,7 @@ pub async fn get_monthly_details(
     }
     project_summaries.sort_by_key(|item| std::cmp::Reverse(item.total_tokens));
 
-    let mut model_summaries = Vec::new();
-    for (
-        model,
-        (
-            sessions_count,
-            total_tokens,
-            total_input_tokens,
-            total_output_tokens,
-            total_cache_read_tokens,
-            cost_usd,
-        ),
-    ) in model_map_stats
-    {
-        model_summaries.push(MonthlyModelSummary {
-            model,
-            sessions_count,
-            total_tokens,
-            total_input_tokens,
-            total_output_tokens,
-            total_cache_read_tokens,
-            cost_usd,
-        });
-    }
-    model_summaries.sort_by_key(|item| std::cmp::Reverse(item.total_tokens));
+    let model_summaries = summarize_models_by_mode(&sessions_map, &pricing_rules);
 
     Json(MonthlyDetailsResponse {
         year_month,
@@ -463,6 +481,7 @@ mod tests {
         turn_no: u32,
         timestamp: &str,
         model: &str,
+        source_kind: &str,
         input: u64,
         output: u64,
     ) -> UsageEntry {
@@ -490,7 +509,7 @@ mod tests {
             delta_tokens: Some(tokens),
             context: None,
             cost: None,
-            source_kind: Some("cursor-agent".to_string()),
+            source_kind: Some(source_kind.to_string()),
             parent_session_id: None,
             agent_nickname: None,
             agent_role: None,
@@ -517,7 +536,15 @@ mod tests {
     fn model_session_details_are_model_specific_and_keep_invalid_dates_null() {
         let entries = vec![
             (
-                model_entry("mixed", 1, "2026-07-10T10:00:00Z", "composer-2.5", 100, 50),
+                model_entry(
+                    "mixed",
+                    1,
+                    "2026-07-10T10:00:00Z",
+                    "composer-2.5",
+                    "cursor-agent",
+                    100,
+                    50,
+                ),
                 "cursor".to_string(),
                 "2026-07-10".to_string(),
             ),
@@ -527,6 +554,7 @@ mod tests {
                     2,
                     "2026-07-10T10:05:00Z",
                     "cursor-grok-4.5",
+                    "cursor-agent",
                     200,
                     100,
                 ),
@@ -539,6 +567,7 @@ mod tests {
                     1,
                     "2026-07-11T09:00:00Z",
                     "composer-2.5",
+                    "cursor-agent",
                     20,
                     10,
                 ),
@@ -553,7 +582,12 @@ mod tests {
             output_price: 0.0,
         }];
 
-        let details = collect_model_session_details(&entries, "composer-2.5", &rules);
+        let details = collect_model_session_details(
+            &entries,
+            "composer-2.5",
+            Some(ModelSessionMode::Agent),
+            &rules,
+        );
 
         assert_eq!(details.len(), 2);
         let mixed = details
@@ -572,5 +606,98 @@ mod tests {
             .find(|detail| detail.session_id == "invalid-date")
             .unwrap();
         assert!(invalid_date.date.is_none());
+    }
+
+    #[test]
+    fn model_summaries_separate_cursor_agent_and_ide_modes() {
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "agent".to_string(),
+            (
+                vec![model_entry(
+                    "agent",
+                    1,
+                    "2026-07-10T10:00:00Z",
+                    "composer-2.5",
+                    "cursor-agent",
+                    100,
+                    50,
+                )],
+                "cursor".to_string(),
+            ),
+        );
+        sessions.insert(
+            "ide".to_string(),
+            (
+                vec![model_entry(
+                    "ide",
+                    1,
+                    "2026-07-10T11:00:00Z",
+                    "composer-2.5",
+                    "cursor-ide",
+                    80,
+                    20,
+                )],
+                "cursor".to_string(),
+            ),
+        );
+
+        let summaries = summarize_models_by_mode(&sessions, &[]);
+
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries.iter().any(|summary| {
+            summary.model == "composer-2.5"
+                && summary.mode.as_deref() == Some("agent")
+                && summary.sessions_count == 1
+                && summary.total_tokens == 150
+        }));
+        assert!(summaries.iter().any(|summary| {
+            summary.model == "composer-2.5"
+                && summary.mode.as_deref() == Some("ide")
+                && summary.sessions_count == 1
+                && summary.total_tokens == 100
+        }));
+    }
+
+    #[test]
+    fn model_session_details_filter_cursor_mode() {
+        let entries = vec![
+            (
+                model_entry(
+                    "agent",
+                    1,
+                    "2026-07-10T10:00:00Z",
+                    "composer-2.5",
+                    "cursor-agent",
+                    100,
+                    50,
+                ),
+                "cursor".to_string(),
+                "2026-07-10".to_string(),
+            ),
+            (
+                model_entry(
+                    "ide",
+                    1,
+                    "2026-07-10T11:00:00Z",
+                    "composer-2.5",
+                    "cursor-ide",
+                    80,
+                    20,
+                ),
+                "cursor".to_string(),
+                "2026-07-10".to_string(),
+            ),
+        ];
+
+        let details = collect_model_session_details(
+            &entries,
+            "composer-2.5",
+            Some(ModelSessionMode::Ide),
+            &[],
+        );
+
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].session_id, "ide");
     }
 }

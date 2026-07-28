@@ -168,8 +168,6 @@ pub async fn get_yearly_details(
 
     // 按專案統計 (CWD)
     let mut project_map_stats: HashMap<String, (usize, u64, f64)> = HashMap::new();
-    // 按模型統計 (Model)
-    let mut model_map_stats: HashMap<String, (usize, u64, u64, u64, u64, f64)> = HashMap::new();
     // 按 Agent 類型統計
     let mut agent_map_stats: HashMap<String, AgentBreakdown> = HashMap::new();
 
@@ -185,18 +183,6 @@ pub async fn get_yearly_details(
         project_stat.0 += 1;
         project_stat.1 += session_usage.usage.total_tokens;
         project_stat.2 += session_usage.usage.cost_usd;
-
-        for model_usage in &session_usage.models {
-            let model_stat = model_map_stats
-                .entry(model_usage.model.clone())
-                .or_insert((0, 0, 0, 0, 0, 0.0));
-            model_stat.0 += 1;
-            model_stat.1 += model_usage.usage.total_tokens;
-            model_stat.2 += model_usage.usage.input_tokens;
-            model_stat.3 += model_usage.usage.output_tokens;
-            model_stat.4 += model_usage.usage.cache_read_tokens;
-            model_stat.5 += model_usage.usage.cost_usd;
-        }
 
         let agent_stat = agent_map_stats.entry(ast_type.clone()).or_default();
         agent_stat.total_tokens += session_usage.usage.total_tokens;
@@ -219,30 +205,7 @@ pub async fn get_yearly_details(
     }
     project_summaries.sort_by_key(|item| std::cmp::Reverse(item.total_tokens));
 
-    let mut model_summaries = Vec::new();
-    for (
-        model,
-        (
-            sessions_count,
-            total_tokens,
-            total_input_tokens,
-            total_output_tokens,
-            total_cache_read_tokens,
-            cost_usd,
-        ),
-    ) in model_map_stats
-    {
-        model_summaries.push(MonthlyModelSummary {
-            model,
-            sessions_count,
-            total_tokens,
-            total_input_tokens,
-            total_output_tokens,
-            total_cache_read_tokens,
-            cost_usd,
-        });
-    }
-    model_summaries.sort_by_key(|item| std::cmp::Reverse(item.total_tokens));
+    let model_summaries = summarize_models_by_mode(&sessions_map, &pricing_rules);
 
     Json(YearlyDetailsResponse {
         year,

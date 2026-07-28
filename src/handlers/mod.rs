@@ -187,6 +187,80 @@ pub(crate) fn summarize_session_usage(
     result
 }
 
+pub(crate) fn cursor_session_mode(
+    assistant_type: &str,
+    entries: &[UsageEntry],
+) -> Option<&'static str> {
+    if assistant_type != "cursor" {
+        return None;
+    }
+
+    entries
+        .iter()
+        .max_by(|left, right| {
+            left.turn_no
+                .cmp(&right.turn_no)
+                .then_with(|| left.timestamp.cmp(&right.timestamp))
+        })
+        .and_then(|entry| match entry.source_kind.as_deref() {
+            Some("cursor-agent") => Some("agent"),
+            Some("cursor-ide") => Some("ide"),
+            _ => None,
+        })
+}
+
+pub(crate) fn summarize_models_by_mode(
+    sessions: &HashMap<String, (Vec<UsageEntry>, String)>,
+    pricing_rules: &[PricingRule],
+) -> Vec<MonthlyModelSummary> {
+    type ModelStats = (usize, u64, u64, u64, u64, f64);
+
+    let mut stats: HashMap<(String, Option<String>), ModelStats> = HashMap::new();
+    for (entries, assistant_type) in sessions.values() {
+        let session_usage = summarize_session_usage(pricing_rules, entries);
+        let mode = cursor_session_mode(assistant_type, entries).map(str::to_string);
+        for model_usage in session_usage.models {
+            let model_stat = stats
+                .entry((model_usage.model, mode.clone()))
+                .or_insert((0, 0, 0, 0, 0, 0.0));
+            model_stat.0 += 1;
+            model_stat.1 += model_usage.usage.total_tokens;
+            model_stat.2 += model_usage.usage.input_tokens;
+            model_stat.3 += model_usage.usage.output_tokens;
+            model_stat.4 += model_usage.usage.cache_read_tokens;
+            model_stat.5 += model_usage.usage.cost_usd;
+        }
+    }
+
+    let mut summaries = stats
+        .into_iter()
+        .map(
+            |(
+                (model, mode),
+                (
+                    sessions_count,
+                    total_tokens,
+                    total_input_tokens,
+                    total_output_tokens,
+                    total_cache_read_tokens,
+                    cost_usd,
+                ),
+            )| MonthlyModelSummary {
+                model,
+                mode,
+                sessions_count,
+                total_tokens,
+                total_input_tokens,
+                total_output_tokens,
+                total_cache_read_tokens,
+                cost_usd,
+            },
+        )
+        .collect::<Vec<_>>();
+    summaries.sort_by_key(|item| std::cmp::Reverse(item.total_tokens));
+    summaries
+}
+
 #[derive(Serialize)]
 pub struct DateListResponse {
     pub dates: Vec<String>,
@@ -290,6 +364,7 @@ pub struct MonthlyProjectSummary {
 #[derive(Serialize)]
 pub struct MonthlyModelSummary {
     pub model: String,
+    pub mode: Option<String>,
     pub sessions_count: usize,
     pub total_tokens: u64,
     pub total_input_tokens: u64,
@@ -328,6 +403,7 @@ pub struct ModelSessionDetail {
 pub struct ModelSessionsResponse {
     pub period: String,
     pub model: String,
+    pub mode: Option<String>,
     pub sessions: Vec<ModelSessionDetail>,
 }
 

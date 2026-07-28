@@ -711,6 +711,41 @@ input {
   white-space: nowrap;
 }
 
+.cursor-mode-badge {
+  flex: 0 0 auto;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.cursor-mode-agent,
+.premium-table .cursor-mode-agent {
+  border-color: rgba(192, 132, 252, 0.38);
+  background: rgba(168, 85, 247, 0.14);
+  color: #d8b4fe;
+}
+
+.cursor-mode-ide,
+.premium-table .cursor-mode-ide {
+  border-color: rgba(94, 234, 212, 0.34);
+  background: rgba(45, 212, 191, 0.12);
+  color: #5eead4;
+}
+
+[data-theme="light"] .cursor-mode-agent,
+[data-theme="light"] .premium-table .cursor-mode-agent {
+  border-color: rgba(126, 34, 206, 0.28);
+  background: rgba(147, 51, 234, 0.1);
+  color: #7e22ce;
+}
+
+[data-theme="light"] .cursor-mode-ide,
+[data-theme="light"] .premium-table .cursor-mode-ide {
+  border-color: rgba(13, 148, 136, 0.28);
+  background: rgba(20, 184, 166, 0.1);
+  color: #0f766e;
+}
+
 .model-drilldown-toggle {
   display: inline-flex;
   align-items: center;
