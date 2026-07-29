@@ -285,7 +285,7 @@
 - [x] PR #29 的 Gemini 3.1 Pro 快取價格與封裝 `pricing.csv` 回歸測試一致，且 contains fallback 會選最具體模型 base。
 - [x] PR #30 的 Grok 4.5 動態門檻、官方 `costUsdTicks`、`modelUsage`、多模型歸因、Unknown Model、時間戳與 EOF timeline 行為均有回歸覆蓋。
 - [x] PR #30 不將已下架的 Grok Build 0.1 誤判為 Grok 4.5 或估算其現行費率，且 README 路徑說明不再造成支援範圍誤解。
-- [ ] 新 commit 已推送至兩個 PR 的原有 head branch，並完成遠端 mergeability 驗證。
+- [x] 新 commit 已推送至兩個 PR 的原有 head branch，並完成遠端 mergeability 驗證。
 
 ## Plan
 
@@ -293,7 +293,7 @@
 - [x] Checkpoint B：在 PR #29 分支完成定價資料、模型匹配與測試修正。
 - [x] Checkpoint C：在 PR #30 分支完成 Grok 解析、模型歸因、時間軸、定價與文件修正。
 - [x] Checkpoint D：執行 Rust/JavaScript 驗證、比較兩分支共同檔案並確認 merge base。
-- [ ] Checkpoint E：建立 Conventional Commit、推送兩個 head branch，記錄遠端驗證結果。
+- [x] Checkpoint E：建立 Conventional Commit、推送兩個 head branch，記錄遠端驗證結果。
 
 ## Risk and rollback
 
@@ -317,4 +317,7 @@
 
 - `cargo test --locked` 通過：主 binary 96 tests、CLI binary 64 tests。
 - `cargo fmt -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`cargo build --release --locked --all-targets`、`node --check static/app.js`、`node --check static/i18n.js` 與 `git diff --check` 全部通過，零 compiler warnings。
-- 後續補充：依 PR #30 的 maintainer 回覆移除已下架 Grok Build 0.1 定價，只保留歷史識別碼不誤套 Grok 4.5 的安全判斷；待重新驗證並建立修正 commit。
+- Commit：PR #29 `3ddc533`；PR #30 `ff08424`、`d0b6052`。
+- Remote：PR #29 head `3ddc533ccf8ebe99d5bbdb21a334fdd675fe386c`；PR #30 head `d0b6052de11a4cf15e39fd43c0f5c45abe95f4aa`。
+- PR #29 與 PR #30 目前皆為 open、GitHub `mergeable=true`；`git merge-tree --write-tree` 以 PR #29 head 與 PR #30 head 模擬合併成功，且 PR #29 head 是 PR #30 的 ancestor。
+- 依 maintainer 回覆移除已下架 Grok Build 0.1 定價，只保留歷史識別碼不誤套 Grok 4.5 的安全判斷。
