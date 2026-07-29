@@ -1,9 +1,10 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -12,6 +13,10 @@ pub struct TokenStats {
     pub output: u64,
     pub cache_read: Option<u64>,
     pub cache_write: Option<u64>,
+    #[serde(default)]
+    pub cache_write_5m: Option<u64>,
+    #[serde(default)]
+    pub cache_write_1h: Option<u64>,
     pub reasoning: Option<u64>,
     pub total: u64,
 }
@@ -73,6 +78,34 @@ pub struct UsageDayImportSummary {
     pub total: usize,
     pub imported: usize,
     pub skipped_duplicates: usize,
+    pub batch_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UsageImportMetadata {
+    pub source_assistant: Option<String>,
+    pub source_file_name: Option<String>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct UsageImportBatch {
+    pub id: String,
+    pub assistant: String,
+    pub source_assistant: Option<String>,
+    pub source_file_name: Option<String>,
+    pub date: String,
+    pub total: usize,
+    pub imported: usize,
+    pub skipped_duplicates: usize,
+    pub created_at: i64,
+    pub rolled_back_at: Option<i64>,
+    pub removed_records: usize,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct UsageImportRollbackSummary {
+    pub batch_id: String,
+    pub removed_records: usize,
 }
 
 // Claude Code helper structs
@@ -86,15 +119,27 @@ struct ClaudeUsage {
     cache_read_input_tokens: u64,
     #[serde(default)]
     output_tokens: u64,
+    #[serde(default)]
+    cache_creation: ClaudeCacheCreation,
 }
 
-// Codex CLI helper structs
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ClaudeCacheCreation {
+    #[serde(default)]
+    ephemeral_5m_input_tokens: u64,
+    #[serde(default)]
+    ephemeral_1h_input_tokens: u64,
+}
+
+// Codex helper structs shared by the CLI and Desktop session formats.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct CodexTokenUsage {
     #[serde(default)]
     input_tokens: u64,
     #[serde(default)]
     cached_input_tokens: u64,
+    #[serde(default)]
+    cache_write_input_tokens: u64,
     #[serde(default)]
     output_tokens: u64,
     #[serde(default)]
@@ -104,6 +149,11 @@ struct CodexTokenUsage {
 }
 
 const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v6";
+const CODEX_SOURCE_KIND_MIGRATION_KEY: &str = "migration:codex_source_kind_v1";
+const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";
+const CODEX_DESKTOP_SOURCE_KIND: &str = "codex-desktop";
+const CODEX_OTHER_SOURCE_KIND: &str = "codex-other";
+const CODEX_EMPTY_TRANSCRIPT_SYNC_TIME: i64 = -1;
 const COPILOT_SOURCE_KIND_MIGRATION_KEY: &str = "migration:copilot_source_kind_v1";
 
 /// Source kind written for usage entries originating from the Copilot App
@@ -120,7 +170,13 @@ const COPILOT_APP_SOURCE_KIND: &str = "copilot-app";
 const COPILOT_APP_CURSOR_PREFIX: &str = "sync:copilot_app:cursor:";
 const VSCODE_EMPTY_SESSION_MIGRATION_KEY: &str = "migration:vscode_empty_sessions_v1";
 const COPILOT_CACHED_INPUT_MIGRATION_KEY: &str = "migration:copilot_cached_input_v1";
+const CLAUDE_CACHE_WRITE_PRICING_MIGRATION_KEY: &str = "migration:claude_cache_write_pricing_v1";
 const SESSION_NAME_SELECTION_MIGRATION_KEY: &str = "migration:session_name_selection_v1";
+static IMPORT_BATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+const CURSOR_MODEL_ATTRIBUTION_MIGRATION_KEY: &str = "migration:cursor_model_attribution_v2";
+const CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY: &str = "migration:cursor_cache_tokens_unknown_v1";
+const CURSOR_AGENT_SOURCE_KIND: &str = "cursor-agent";
+const CURSOR_IDE_SOURCE_KIND: &str = "cursor-ide";
 
 /// Source kind written for usage entries originating from the Copilot CLI
 /// status-line hook (`~/.copilot/usage/usage-YYYY-MM-DD.jsonl`). The hook
@@ -220,6 +276,31 @@ fn hash_fnv1a_64(input: &str) -> u64 {
     hash
 }
 
+fn unix_timestamp_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn new_import_batch_id() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = IMPORT_BATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("import-{timestamp:x}-{counter:x}")
+}
+
+fn normalize_import_metadata_value(raw: Option<String>, max_chars: usize) -> Option<String> {
+    let value = raw?.trim().chars().take(max_chars).collect::<String>();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 fn normalize_import_source_id(raw: Option<&str>) -> Option<String> {
     let value = raw?.trim();
     if value.is_empty() {
@@ -230,15 +311,29 @@ fn normalize_import_source_id(raw: Option<&str>) -> Option<String> {
 
 fn build_import_token_signature(tokens: &Option<TokenStats>) -> String {
     if let Some(t) = tokens {
-        format!(
-            "{}|{}|{}|{}|{}|{}",
-            t.input,
-            t.output,
-            t.cache_read.unwrap_or(0),
-            t.cache_write.unwrap_or(0),
-            t.reasoning.unwrap_or(0),
-            t.total
-        )
+        if t.cache_write_5m.is_none() && t.cache_write_1h.is_none() {
+            format!(
+                "{}|{}|{}|{}|{}|{}",
+                t.input,
+                t.output,
+                t.cache_read.unwrap_or(0),
+                t.cache_write.unwrap_or(0),
+                t.reasoning.unwrap_or(0),
+                t.total
+            )
+        } else {
+            format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}",
+                t.input,
+                t.output,
+                t.cache_read.unwrap_or(0),
+                t.cache_write.unwrap_or(0),
+                t.cache_write_5m.unwrap_or(0),
+                t.cache_write_1h.unwrap_or(0),
+                t.reasoning.unwrap_or(0),
+                t.total
+            )
+        }
     } else {
         "null".to_string()
     }
@@ -328,6 +423,20 @@ pub fn get_cursor_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+pub fn get_cursor_state_db_path() -> PathBuf {
+    if let Some(path) = crate::paths::env_path("CURSOR_STATE_DB") {
+        return path;
+    }
+    dirs::config_dir()
+        .map(|dir| {
+            dir.join("Cursor")
+                .join("User")
+                .join("globalStorage")
+                .join("state.vscdb")
+        })
+        .unwrap_or_else(|| get_cursor_dir().join("state.vscdb"))
+}
+
 fn move_file_with_copy_fallback(source: &Path, destination: &Path) -> Result<(), String> {
     if let Err(rename_error) = fs::rename(source, destination) {
         let copied = fs::copy(source, destination).map_err(|copy_error| {
@@ -412,12 +521,15 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             turn_no INTEGER NOT NULL,
             model TEXT,
             model_id TEXT,
+            model_signature TEXT,
             
             -- Token Statistics
             tokens_input INTEGER,
             tokens_output INTEGER,
             tokens_cache_read INTEGER,
             tokens_cache_write INTEGER,
+            tokens_cache_write_5m INTEGER,
+            tokens_cache_write_1h INTEGER,
             tokens_reasoning INTEGER,
             tokens_total INTEGER,
             
@@ -426,6 +538,8 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             delta_output INTEGER,
             delta_cache_read INTEGER,
             delta_cache_write INTEGER,
+            delta_cache_write_5m INTEGER,
+            delta_cache_write_1h INTEGER,
             delta_reasoning INTEGER,
             delta_total INTEGER,
             
@@ -458,7 +572,27 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         [],
     );
     let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN tokens_cache_write_5m INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN tokens_cache_write_1h INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN delta_cache_write_5m INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN delta_cache_write_1h INTEGER",
+        [],
+    );
+    let _ = conn.execute(
         "ALTER TABLE usage_entries ADD COLUMN import_source_id TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN import_batch_id TEXT",
         [],
     );
     let _ = conn.execute(
@@ -471,6 +605,10 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     // collectors.
     let _ = conn.execute(
         "ALTER TABLE usage_entries ADD COLUMN source_dir_key TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN model_signature TEXT",
         [],
     );
 
@@ -563,10 +701,60 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("建立助理類型索引 idx_assistant_type 失敗: {}", e))?;
 
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_assistant_transcript_path
+         ON usage_entries(assistant_type, transcript_path)",
+        [],
+    )
+    .map_err(|e| {
+        format!(
+            "建立 transcript 路徑索引 idx_assistant_transcript_path 失敗: {}",
+            e
+        )
+    })?;
+
     let _ = conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_import_source_id ON usage_entries(assistant_type, import_source_id) WHERE import_source_id IS NOT NULL",
         [],
     );
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_usage_import_batch
+         ON usage_entries(assistant_type, import_batch_id)
+         WHERE import_batch_id IS NOT NULL",
+        [],
+    )
+    .map_err(|e| format!("建立匯入批次索引 idx_usage_import_batch 失敗: {e}"))?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS import_batches (
+            id TEXT PRIMARY KEY,
+            assistant_type TEXT NOT NULL,
+            source_assistant TEXT,
+            source_file_name TEXT,
+            import_date TEXT NOT NULL,
+            total_records INTEGER NOT NULL,
+            imported_records INTEGER NOT NULL,
+            skipped_duplicates INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            rolled_back_at INTEGER,
+            removed_records INTEGER NOT NULL DEFAULT 0
+        )",
+        [],
+    )
+    .map_err(|e| format!("建立 import_batches 表失敗: {e}"))?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_import_batches_assistant_created
+         ON import_batches(assistant_type, created_at DESC)",
+        [],
+    )
+    .map_err(|e| format!("建立匯入批次查詢索引失敗: {e}"))?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cursor_model_signature
+         ON usage_entries(model_signature)
+         WHERE assistant_type = 'cursor' AND model_signature IS NOT NULL",
+        [],
+    )
+    .map_err(|error| format!("建立 Cursor 模型簽章索引失敗: {error}"))?;
 
     // Sync state tracking table
     conn.execute(
@@ -578,6 +766,28 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| format!("建立 sync_state 表失敗: {}", e))?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cursor_model_signatures (
+            source_id TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            model TEXT NOT NULL,
+            is_ambiguous INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (source_id, signature)
+        )",
+        [],
+    )
+    .map_err(|error| format!("建立 Cursor 模型簽章表失敗: {error}"))?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cursor_session_metadata (
+            source_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            cwd TEXT,
+            mode TEXT,
+            PRIMARY KEY (source_id, session_id)
+        )",
+        [],
+    )
+    .map_err(|error| format!("建立 Cursor Session 中繼資料表失敗: {error}"))?;
 
     // Before source_kind existed, every Copilot record came from the CLI
     // collector. Classify those historical rows once so the new source-scoped
@@ -683,6 +893,65 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         .map_err(|error| format!("記錄 Copilot CLI 快取輸入遷移失敗: {error}"))?;
     }
 
+    let claude_cache_write_migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![CLAUDE_CACHE_WRITE_PRICING_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !claude_cache_write_migration_done {
+        conn.execute(
+            "UPDATE usage_entries
+             SET tokens_input = CASE
+                    WHEN tokens_input IS NULL THEN NULL
+                    WHEN tokens_input >= COALESCE(tokens_cache_write, 0)
+                    THEN tokens_input - COALESCE(tokens_cache_write, 0)
+                    ELSE 0
+                 END,
+                 tokens_cache_write_5m = COALESCE(tokens_cache_write, 0),
+                 tokens_cache_write_1h = 0,
+                 delta_input = CASE
+                    WHEN delta_input IS NULL THEN NULL
+                    WHEN delta_input >= COALESCE(delta_cache_write, 0)
+                    THEN delta_input - COALESCE(delta_cache_write, 0)
+                    ELSE 0
+                 END,
+                 delta_cache_write_5m = COALESCE(delta_cache_write, 0),
+                 delta_cache_write_1h = 0
+             WHERE (
+                    assistant_type = 'claude'
+                    OR (
+                        assistant_type = 'codex'
+                        AND transcript_path IS NOT NULL
+                        AND (
+                               transcript_path LIKE '%.claude/%'
+                            OR transcript_path LIKE '%/claude/%'
+                            OR transcript_path LIKE '%.claude\\%'
+                            OR transcript_path LIKE '%\\claude\\%'
+                        )
+                    )
+               )
+               AND tokens_cache_write_5m IS NULL
+               AND tokens_cache_write_1h IS NULL",
+            [],
+        )
+        .map_err(|error| format!("遷移 Claude 快取寫入費用欄位失敗: {error}"))?;
+        conn.execute(
+            "DELETE FROM sync_state
+             WHERE filename LIKE 'claude:%'
+                OR filename LIKE 'codex:claude:%'",
+            [],
+        )
+        .map_err(|error| format!("重設 Claude 同步狀態失敗: {error}"))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![CLAUDE_CACHE_WRITE_PRICING_MIGRATION_KEY],
+        )
+        .map_err(|error| format!("記錄 Claude 快取寫入費用遷移失敗: {error}"))?;
+    }
+
     let session_name_migration_done: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
@@ -698,6 +967,8 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
                 OR filename LIKE 'vscode:%'
                 OR filename LIKE 'codex:sessions/%'
                 OR filename LIKE 'codex:sessions\\%'
+                OR filename LIKE 'codex:archived_sessions/%'
+                OR filename LIKE 'codex:archived_sessions\\%'
                 OR filename LIKE 'claude:%'
                 OR filename LIKE 'cursor:%'",
             [],
@@ -740,6 +1011,25 @@ fn normalize_copilot_cli_token_stats(tokens: &mut Option<TokenStats>) {
 fn normalize_copilot_cli_usage_entry(entry: &mut UsageEntry) {
     normalize_copilot_cli_token_stats(&mut entry.tokens);
     normalize_copilot_cli_token_stats(&mut entry.delta_tokens);
+}
+
+fn normalize_legacy_claude_token_stats(tokens: &mut Option<TokenStats>) {
+    let Some(tokens) = tokens else {
+        return;
+    };
+    if tokens.cache_write_5m.is_some() || tokens.cache_write_1h.is_some() {
+        return;
+    }
+
+    let cache_write = tokens.cache_write.unwrap_or(0);
+    tokens.input = tokens.input.saturating_sub(cache_write);
+    tokens.cache_write_5m = Some(cache_write);
+    tokens.cache_write_1h = Some(0);
+}
+
+fn normalize_legacy_claude_usage_entry(entry: &mut UsageEntry) {
+    normalize_legacy_claude_token_stats(&mut entry.tokens);
+    normalize_legacy_claude_token_stats(&mut entry.delta_tokens);
 }
 
 fn get_antigravity_session_name(session_id: &str) -> Option<String> {
@@ -985,10 +1275,10 @@ fn sync_hook_usage_logs(
                     let insert_res = tx.execute(
                         "INSERT OR IGNORE INTO usage_entries (
                             assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-                            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-                            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+                            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
                             duration_ms, premium_requests
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         params![
                             assistant_type,
                             source_kind,
@@ -1006,12 +1296,16 @@ fn sync_hook_usage_logs(
                             tokens.map(|t| t.output as i64),
                             tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
                             tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
+                            tokens.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                            tokens.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                             tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
                             tokens.map(|t| t.total as i64),
                             delta.map(|t| t.input as i64),
                             delta.map(|t| t.output as i64),
                             delta.and_then(|t| t.cache_read.map(|v| v as i64)),
                             delta.and_then(|t| t.cache_write.map(|v| v as i64)),
+                            delta.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                            delta.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                             delta.and_then(|t| t.reasoning.map(|v| v as i64)),
                             delta.map(|t| t.total as i64),
                             cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
@@ -1075,13 +1369,13 @@ fn insert_vscode_usage_entry(
     tx.execute(
         "INSERT OR REPLACE INTO usage_entries (
             assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?, ?
         )",
         params![
@@ -1101,12 +1395,16 @@ fn insert_vscode_usage_entry(
             tokens.map(|value| value.output as i64),
             tokens.and_then(|value| value.cache_read.map(|v| v as i64)),
             tokens.and_then(|value| value.cache_write.map(|v| v as i64)),
+            tokens.and_then(|value| value.cache_write_5m.map(|v| v as i64)),
+            tokens.and_then(|value| value.cache_write_1h.map(|v| v as i64)),
             tokens.and_then(|value| value.reasoning.map(|v| v as i64)),
             tokens.map(|value| value.total as i64),
             delta.map(|value| value.input as i64),
             delta.map(|value| value.output as i64),
             delta.and_then(|value| value.cache_read.map(|v| v as i64)),
             delta.and_then(|value| value.cache_write.map(|v| v as i64)),
+            delta.and_then(|value| value.cache_write_5m.map(|v| v as i64)),
+            delta.and_then(|value| value.cache_write_1h.map(|v| v as i64)),
             delta.and_then(|value| value.reasoning.map(|v| v as i64)),
             delta.map(|value| value.total as i64),
             cost.and_then(|value| value.total_duration_ms.or(value.total_api_duration_ms))
@@ -1246,8 +1544,32 @@ fn codex_content_to_text(content: &serde_json::Value) -> String {
     parts.join(" ")
 }
 
+fn codex_source_kind_from_metadata(payload: &serde_json::Value) -> &'static str {
+    let originator = payload
+        .get("originator")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if originator.contains("desktop") {
+        return CODEX_DESKTOP_SOURCE_KIND;
+    }
+    if matches!(
+        originator.as_str(),
+        "codex-tui" | "codex_cli_rs" | "codex_exec"
+    ) {
+        return CODEX_CLI_SOURCE_KIND;
+    }
+
+    match payload.get("source").and_then(|value| value.as_str()) {
+        Some("cli" | "exec") => CODEX_CLI_SOURCE_KIND,
+        _ => CODEX_OTHER_SOURCE_KIND,
+    }
+}
+
 fn codex_usage_to_stats(usage: CodexTokenUsage) -> TokenStats {
     let cache_read = usage.cached_input_tokens;
+    let cache_write = usage.cache_write_input_tokens;
     let input = usage.input_tokens.saturating_sub(cache_read);
     let output = usage.output_tokens;
     let total = if usage.total_tokens > 0 {
@@ -1260,7 +1582,9 @@ fn codex_usage_to_stats(usage: CodexTokenUsage) -> TokenStats {
         input,
         output,
         cache_read: Some(cache_read),
-        cache_write: None,
+        cache_write: Some(cache_write),
+        cache_write_5m: None,
+        cache_write_1h: None,
         reasoning: Some(usage.reasoning_output_tokens),
         total,
     }
@@ -1270,17 +1594,24 @@ fn codex_usage_delta_to_stats(
     previous: Option<&CodexTokenUsage>,
     current: &CodexTokenUsage,
 ) -> TokenStats {
-    let (input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens) = match previous
-    {
+    let (
+        input_tokens,
+        cached_input_tokens,
+        cache_write_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+    ) = match previous {
         Some(previous)
             if current.input_tokens >= previous.input_tokens
                 && current.cached_input_tokens >= previous.cached_input_tokens
+                && current.cache_write_input_tokens >= previous.cache_write_input_tokens
                 && current.output_tokens >= previous.output_tokens
                 && current.reasoning_output_tokens >= previous.reasoning_output_tokens =>
         {
             (
                 current.input_tokens - previous.input_tokens,
                 current.cached_input_tokens - previous.cached_input_tokens,
+                current.cache_write_input_tokens - previous.cache_write_input_tokens,
                 current.output_tokens - previous.output_tokens,
                 current.reasoning_output_tokens - previous.reasoning_output_tokens,
             )
@@ -1288,12 +1619,14 @@ fn codex_usage_delta_to_stats(
         _ => (
             current.input_tokens,
             current.cached_input_tokens,
+            current.cache_write_input_tokens,
             current.output_tokens,
             current.reasoning_output_tokens,
         ),
     };
 
     let cache_read = cached_input_tokens;
+    let cache_write = cache_write_input_tokens;
     let input = input_tokens.saturating_sub(cache_read);
     let output = output_tokens;
     let total = input_tokens.saturating_add(output);
@@ -1302,7 +1635,9 @@ fn codex_usage_delta_to_stats(
         input,
         output,
         cache_read: Some(cache_read),
-        cache_write: None,
+        cache_write: Some(cache_write),
+        cache_write_5m: None,
+        cache_write_1h: None,
         reasoning: Some(reasoning_output_tokens),
         total,
     }
@@ -1338,6 +1673,7 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
     let mut agent_role: Option<String> = None;
     let mut current_model = "GPT-5.3-Codex".to_string();
     let mut reasoning_effort: Option<String> = None;
+    let mut source_kind = CODEX_OTHER_SOURCE_KIND.to_string();
     let mut session_identity_locked = false;
 
     for event in &events {
@@ -1349,6 +1685,12 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
         let payload_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         if event_type == "session_meta" {
+            let detected_source_kind = codex_source_kind_from_metadata(payload);
+            if source_kind == CODEX_OTHER_SOURCE_KIND
+                || detected_source_kind == CODEX_DESKTOP_SOURCE_KIND
+            {
+                source_kind = detected_source_kind.to_string();
+            }
             if !session_identity_locked {
                 if let Some(id) = payload
                     .get("id")
@@ -1517,7 +1859,7 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
             delta_tokens: Some(delta_tokens),
             context,
             cost: None,
-            source_kind: None,
+            source_kind: Some(source_kind.clone()),
             source_dir_key: None,
             parent_session_id: parent_session_id.clone(),
             agent_nickname: agent_nickname.clone(),
@@ -1552,7 +1894,9 @@ fn run_codex_parser_migration(conn: &mut Connection) -> Result<(), String> {
         tx.execute(
             "DELETE FROM sync_state
              WHERE filename LIKE 'codex:sessions/%'
-                OR filename LIKE 'codex:sessions\\%'",
+                OR filename LIKE 'codex:sessions\\%'
+                OR filename LIKE 'codex:archived_sessions/%'
+                OR filename LIKE 'codex:archived_sessions\\%'",
             [],
         )
         .map_err(|e| format!("清除 Codex 同步狀態失敗: {}", e))?;
@@ -1565,6 +1909,41 @@ fn run_codex_parser_migration(conn: &mut Connection) -> Result<(), String> {
             .map_err(|e| format!("Codex parser migration COMMIT 失敗: {}", e))?;
     }
     Ok(())
+}
+
+fn run_codex_source_kind_migration(conn: &mut Connection) -> Result<(), String> {
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![CODEX_SOURCE_KIND_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if migration_done {
+        return Ok(());
+    }
+
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("Codex 來源分類遷移 BEGIN 失敗: {error}"))?;
+    tx.execute(
+        "DELETE FROM sync_state
+         WHERE filename LIKE 'codex:sessions/%'
+            OR filename LIKE 'codex:sessions\\%'
+            OR filename LIKE 'codex:archived_sessions/%'
+            OR filename LIKE 'codex:archived_sessions\\%'",
+        [],
+    )
+    .map_err(|error| format!("清除 Codex 來源分類同步狀態失敗: {error}"))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+         VALUES (?, 1, 0)",
+        params![CODEX_SOURCE_KIND_MIGRATION_KEY],
+    )
+    .map_err(|error| format!("記錄 Codex 來源分類遷移失敗: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("Codex 來源分類遷移 COMMIT 失敗: {error}"))
 }
 
 fn portable_relative_path(root: &Path, path: &Path) -> String {
@@ -3008,46 +3387,131 @@ fn write_copilot_cli_agent_cursor(
     Ok(())
 }
 
+fn codex_transcript_path_key_for_platform(path: &str, is_windows: bool) -> String {
+    if is_windows {
+        path.replace('\\', "/").to_ascii_lowercase()
+    } else {
+        path.to_string()
+    }
+}
+
+fn codex_transcript_path_key(path: &str) -> String {
+    codex_transcript_path_key_for_platform(path, cfg!(windows))
+}
+
+fn group_codex_transcript_paths(
+    paths: impl IntoIterator<Item = String>,
+    is_windows: bool,
+) -> HashMap<String, Vec<String>> {
+    let mut grouped_paths: HashMap<String, Vec<String>> = HashMap::new();
+    for path in paths {
+        grouped_paths
+            .entry(codex_transcript_path_key_for_platform(&path, is_windows))
+            .or_default()
+            .push(path);
+    }
+    grouped_paths
+}
+
+fn load_codex_transcript_paths(conn: &Connection) -> Result<HashMap<String, Vec<String>>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT transcript_path
+             FROM usage_entries
+             WHERE assistant_type = 'codex' AND transcript_path IS NOT NULL",
+        )
+        .map_err(|error| format!("準備讀取 Codex transcript 路徑失敗: {error}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("讀取 Codex transcript 路徑失敗: {error}"))?;
+    let mut paths = Vec::new();
+    for row in rows {
+        let path = row.map_err(|error| format!("解析 Codex transcript 路徑失敗: {error}"))?;
+        paths.push(path);
+    }
+    Ok(group_codex_transcript_paths(paths, cfg!(windows)))
+}
+
+fn codex_transcript_needs_sync(
+    current_size: u64,
+    last_synced_state: Option<(u64, i64)>,
+    transcript_is_current: bool,
+) -> bool {
+    match last_synced_state {
+        None => true,
+        Some((last_synced_size, _)) if last_synced_size != current_size => true,
+        Some((_, last_synced_time)) => {
+            !transcript_is_current && last_synced_time != CODEX_EMPTY_TRANSCRIPT_SYNC_TIME
+        }
+    }
+}
+
 fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
     let codex_dir = get_codex_dir();
-    let sessions_dir = codex_dir.join("sessions");
 
     run_codex_parser_migration(conn)?;
+    run_codex_source_kind_migration(conn)?;
 
-    if !sessions_dir.exists() {
+    let mut files = Vec::new();
+    for directory in [
+        codex_dir.join("sessions"),
+        codex_dir.join("archived_sessions"),
+    ] {
+        files.extend(find_codex_session_files(&directory));
+    }
+    files.sort();
+
+    if files.is_empty() {
         return Ok(());
     }
 
-    let files = find_codex_session_files(&sessions_dir);
+    let transcript_paths = load_codex_transcript_paths(conn)?;
 
     for filepath in files {
         let state_path = portable_relative_path(&codex_dir, &filepath);
         let state_key = format!("codex:{}", state_path);
 
-        let last_synced_size: u64 = conn
+        let last_synced_state: Option<(u64, i64)> = conn
             .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
+                "SELECT last_synced_size, last_synced_time
+                 FROM sync_state
+                 WHERE filename = ?",
                 params![state_key],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .unwrap_or(0u64);
+            .ok();
 
         let metadata = match fs::metadata(&filepath) {
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
         let current_size = metadata.len();
+        let transcript_path = filepath.to_string_lossy().into_owned();
+        let transcript_path_key = codex_transcript_path_key(&transcript_path);
+        let known_transcript_paths = transcript_paths.get(&transcript_path_key);
+        let transcript_is_current = known_transcript_paths.is_some();
 
-        if current_size != last_synced_size {
+        if codex_transcript_needs_sync(current_size, last_synced_state, transcript_is_current) {
             let parsed_entries = match parse_codex_session_file(&filepath) {
                 Ok(entries) => entries,
                 Err(e) => {
-                    eprintln!("解析 Codex CLI 會話檔案 {:?} 失敗: {}", filepath, e);
+                    eprintln!("解析 Codex 會話檔案 {:?} 失敗: {}", filepath, e);
                     continue;
                 }
             };
 
             if parsed_entries.is_empty() {
+                conn.execute(
+                    "INSERT OR REPLACE INTO sync_state
+                     (filename, last_synced_size, last_synced_time)
+                     VALUES (?, ?, ?)",
+                    params![
+                        state_key,
+                        current_size as i64,
+                        CODEX_EMPTY_TRANSCRIPT_SYNC_TIME
+                    ],
+                )
+                .map_err(|error| format!("記錄空白 Codex transcript 同步狀態失敗: {error}"))?;
                 continue;
             }
 
@@ -3055,23 +3519,23 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 .transaction()
                 .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
 
-            let transcript_path = filepath.to_string_lossy().into_owned();
-            #[cfg(windows)]
-            let transcript_delete_result = tx.execute(
-                "DELETE FROM usage_entries
-                 WHERE assistant_type = 'codex'
-                   AND (transcript_path = ? COLLATE NOCASE
-                        OR transcript_path = ? COLLATE NOCASE)",
-                params![transcript_path, transcript_path.replace('\\', "/")],
-            );
-            #[cfg(not(windows))]
-            let transcript_delete_result = tx.execute(
-                "DELETE FROM usage_entries
-                 WHERE assistant_type = 'codex' AND transcript_path = ?",
-                params![transcript_path],
-            );
-            transcript_delete_result
-                .map_err(|e| format!("清空舊 Codex CLI transcript 資料失敗: {}", e))?;
+            if let Some(existing_paths) = known_transcript_paths {
+                for existing_path in existing_paths {
+                    tx.execute(
+                        "DELETE FROM usage_entries
+                         WHERE assistant_type = 'codex' AND transcript_path = ?",
+                        params![existing_path],
+                    )
+                    .map_err(|e| format!("清空舊 Codex transcript 資料失敗: {}", e))?;
+                }
+            } else {
+                tx.execute(
+                    "DELETE FROM usage_entries
+                     WHERE assistant_type = 'codex' AND transcript_path = ?",
+                    params![transcript_path],
+                )
+                .map_err(|e| format!("清空舊 Codex transcript 資料失敗: {}", e))?;
+            }
 
             let session_ids: HashSet<String> = parsed_entries
                 .iter()
@@ -3082,7 +3546,7 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                     "DELETE FROM usage_entries WHERE assistant_type = 'codex' AND session_id = ?",
                     params![session_id],
                 )
-                .map_err(|e| format!("清空舊 Codex CLI Session 資料失敗: {}", e))?;
+                .map_err(|e| format!("清空舊 Codex Session 資料失敗: {}", e))?;
             }
 
             let mut success = true;
@@ -3093,13 +3557,14 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
 
                 let insert_res = tx.execute(
                     "INSERT INTO usage_entries (
-                        assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                        assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
                         duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         "codex",
+                        entry.source_kind.as_deref().unwrap_or(CODEX_OTHER_SOURCE_KIND),
                         entry.timestamp,
                         entry.timestamp.get(0..10).unwrap_or("unknown"),
                         entry.session_id,
@@ -3114,12 +3579,16 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                         tokens.map(|t| t.output as i64),
                         tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
                         tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
+                        tokens.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                        tokens.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                         tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
                         tokens.map(|t| t.total as i64),
                         delta.map(|t| t.input as i64),
                         delta.map(|t| t.output as i64),
                         delta.and_then(|t| t.cache_read.map(|v| v as i64)),
                         delta.and_then(|t| t.cache_write.map(|v| v as i64)),
+                        delta.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                        delta.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                         delta.and_then(|t| t.reasoning.map(|v| v as i64)),
                         delta.map(|t| t.total as i64),
                         cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
@@ -3132,10 +3601,7 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 );
 
                 if let Err(e) = insert_res {
-                    eprintln!(
-                        "寫入 Codex CLI 資料庫失敗 (turn_no {}): {}",
-                        entry.turn_no, e
-                    );
+                    eprintln!("寫入 Codex 資料庫失敗 (turn_no {}): {}", entry.turn_no, e);
                     success = false;
                     break;
                 }
@@ -3323,17 +3789,27 @@ fn parse_claude_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
             .and_then(|model| model.as_str())
             .map(|model| model.to_string());
 
-        let input = usage
-            .input_tokens
-            .saturating_add(usage.cache_creation_input_tokens);
+        let input = usage.input_tokens;
         let cache_read = usage.cache_read_input_tokens;
+        let reported_cache_write = usage.cache_creation_input_tokens;
+        let explicit_cache_write_5m = usage.cache_creation.ephemeral_5m_input_tokens;
+        let cache_write_1h = usage.cache_creation.ephemeral_1h_input_tokens;
+        let explicit_cache_write = explicit_cache_write_5m.saturating_add(cache_write_1h);
+        let cache_write = reported_cache_write.max(explicit_cache_write);
+        let cache_write_5m = explicit_cache_write_5m
+            .saturating_add(reported_cache_write.saturating_sub(explicit_cache_write));
         let output = usage.output_tokens;
-        let total = input.saturating_add(cache_read).saturating_add(output);
+        let total = input
+            .saturating_add(cache_read)
+            .saturating_add(cache_write)
+            .saturating_add(output);
         let tokens = TokenStats {
             input,
             output,
             cache_read: Some(cache_read),
-            cache_write: Some(usage.cache_creation_input_tokens),
+            cache_write: Some(cache_write),
+            cache_write_5m: Some(cache_write_5m),
+            cache_write_1h: Some(cache_write_1h),
             reasoning: None,
             total,
         };
@@ -3498,10 +3974,10 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 let insert_res = tx.execute(
                     "INSERT INTO usage_entries (
                         assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
                         duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         "claude",
                         entry.timestamp,
@@ -3518,12 +3994,16 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
                         tokens.map(|t| t.output as i64),
                         tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
                         tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
+                        tokens.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                        tokens.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                         tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
                         tokens.map(|t| t.total as i64),
                         delta.map(|t| t.input as i64),
                         delta.map(|t| t.output as i64),
                         delta.and_then(|t| t.cache_read.map(|v| v as i64)),
                         delta.and_then(|t| t.cache_write.map(|v| v as i64)),
+                        delta.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                        delta.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                         delta.and_then(|t| t.reasoning.map(|v| v as i64)),
                         delta.map(|t| t.total as i64),
                         cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
@@ -3652,7 +4132,641 @@ fn cursor_content_to_text(content: &serde_json::Value) -> String {
     parts.join(" ")
 }
 
-fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> {
+fn cursor_response_signature(content: &serde_json::Value) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(text) = content.as_str() {
+        if !text.is_empty() {
+            parts.push(serde_json::json!(["text", text]));
+        }
+    } else {
+        for item in content.as_array()? {
+            match item.get("type").and_then(|value| value.as_str()) {
+                Some("text") => {
+                    if let Some(text) = item
+                        .get("text")
+                        .or_else(|| item.get("data"))
+                        .and_then(|value| value.as_str())
+                        .filter(|value| !value.is_empty())
+                    {
+                        parts.push(serde_json::json!(["text", text]));
+                    }
+                }
+                Some("tool_use") => {
+                    let Some(name) = item.get("name").and_then(|value| value.as_str()) else {
+                        continue;
+                    };
+                    parts.push(serde_json::json!([
+                        "tool",
+                        name,
+                        item.get("input")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null)
+                    ]));
+                }
+                Some("tool-call") => {
+                    let Some(name) = item.get("toolName").and_then(|value| value.as_str()) else {
+                        continue;
+                    };
+                    parts.push(serde_json::json!([
+                        "tool",
+                        name,
+                        item.get("args").cloned().unwrap_or(serde_json::Value::Null)
+                    ]));
+                }
+                _ => {}
+            }
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let serialized = serde_json::to_string(&parts).ok()?;
+    Some(format!(
+        "{:016x}",
+        hash_fnv1a_64(&format!("cursor-response-v2:{serialized}"))
+    ))
+}
+
+fn cursor_model_from_provider_options(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("providerOptions")
+        .and_then(|provider_options| provider_options.get("cursor"))
+        .and_then(|cursor| cursor.get("modelName"))
+        .and_then(|model| model.as_str())
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && model.len() <= 200)
+        .map(str::to_string)
+}
+
+fn parse_cursor_agent_kv_model_signature(raw: &[u8]) -> Option<(String, String)> {
+    let event: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    if event.get("role").and_then(|value| value.as_str()) != Some("assistant") {
+        return None;
+    }
+    let content = event
+        .get("content")
+        .or_else(|| event.pointer("/message/content"))?;
+    let mut models = HashSet::new();
+    if let Some(model) = cursor_model_from_provider_options(&event) {
+        models.insert(model);
+    }
+    if let Some(items) = content.as_array() {
+        for item in items {
+            if let Some(model) = cursor_model_from_provider_options(item) {
+                models.insert(model);
+            }
+        }
+    }
+    if models.len() != 1 {
+        return None;
+    }
+    Some((
+        cursor_response_signature(content)?,
+        models.into_iter().next()?,
+    ))
+}
+
+fn cursor_model_source_id(path: &Path) -> String {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let normalized = resolved.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+    format!("{:016x}", hash_fnv1a_64(&normalized))
+}
+
+fn cursor_mode_source_kind(mode: Option<&str>) -> Option<String> {
+    match mode {
+        Some("agent") => Some(CURSOR_AGENT_SOURCE_KIND.to_string()),
+        Some("ide") => Some(CURSOR_IDE_SOURCE_KIND.to_string()),
+        _ => None,
+    }
+}
+
+fn cursor_date_from_timestamp(timestamp: &str) -> Option<&str> {
+    let date = timestamp.get(..10)?;
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    Some(date)
+}
+
+fn run_cursor_model_attribution_migration(conn: &mut Connection) -> Result<(), String> {
+    let already_applied: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![CURSOR_MODEL_ATTRIBUTION_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if already_applied {
+        return Ok(());
+    }
+
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("啟動 Cursor 模型歸因遷移失敗: {error}"))?;
+    tx.execute(
+        "UPDATE usage_entries
+         SET model = 'Unknown Model', model_id = 'Unknown Model'
+         WHERE assistant_type = 'cursor'
+           AND (model IS NULL OR model = '' OR model = 'Cursor Agent')",
+        [],
+    )
+    .map_err(|error| format!("重設 Cursor 籠統模型名稱失敗: {error}"))?;
+    tx.execute(
+        "DELETE FROM sync_state
+         WHERE filename LIKE 'cursor:%'
+            OR filename LIKE 'cursor-agent-kv:%'
+            OR filename LIKE 'cursor-composer-data:%'",
+        [],
+    )
+    .map_err(|error| format!("重設 Cursor 同步狀態失敗: {error}"))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+         VALUES (?, 1, 0)",
+        params![CURSOR_MODEL_ATTRIBUTION_MIGRATION_KEY],
+    )
+    .map_err(|error| format!("記錄 Cursor 模型歸因遷移失敗: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("提交 Cursor 模型歸因遷移失敗: {error}"))
+}
+
+fn run_cursor_cache_tokens_unknown_migration(conn: &mut Connection) -> Result<(), String> {
+    let already_applied: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if already_applied {
+        return Ok(());
+    }
+
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("啟動 Cursor 快取 Token 遷移失敗: {error}"))?;
+    tx.execute(
+        "UPDATE usage_entries
+         SET tokens_cache_read = NULL,
+             tokens_cache_write = NULL,
+             tokens_cache_write_5m = NULL,
+             tokens_cache_write_1h = NULL,
+             delta_cache_read = NULL,
+             delta_cache_write = NULL,
+             delta_cache_write_5m = NULL,
+             delta_cache_write_1h = NULL
+         WHERE assistant_type = 'cursor'
+           AND COALESCE(tokens_cache_read, 0) = 0
+           AND COALESCE(tokens_cache_write, 0) = 0
+           AND COALESCE(tokens_cache_write_5m, 0) = 0
+           AND COALESCE(tokens_cache_write_1h, 0) = 0
+           AND COALESCE(delta_cache_read, 0) = 0
+           AND COALESCE(delta_cache_write, 0) = 0
+           AND COALESCE(delta_cache_write_5m, 0) = 0
+           AND COALESCE(delta_cache_write_1h, 0) = 0",
+        [],
+    )
+    .map_err(|error| format!("將 Cursor 快取 Token 標記為未知失敗: {error}"))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+         VALUES (?, 1, 0)",
+        params![CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY],
+    )
+    .map_err(|error| format!("記錄 Cursor 快取 Token 遷移失敗: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("提交 Cursor 快取 Token 遷移失敗: {error}"))
+}
+
+fn open_cursor_state_db(state_db_path: &Path) -> Result<Connection, String> {
+    let conn = Connection::open_with_flags(
+        state_db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("無法唯讀開啟 Cursor state.vscdb: {error}"))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| format!("設定 Cursor state.vscdb busy timeout 失敗: {error}"))?;
+    let has_cursor_disk_kv: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'cursorDiskKV'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("檢查 Cursor cursorDiskKV 表失敗: {error}"))?;
+    if !has_cursor_disk_kv {
+        return Err("Cursor state.vscdb 缺少 cursorDiskKV 表".to_string());
+    }
+    Ok(conn)
+}
+
+fn cursor_state_max_rowid(conn: &Connection) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(rowid), 0) FROM cursorDiskKV",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|error| format!("讀取 Cursor cursorDiskKV 最大 rowid 失敗: {error}"))
+}
+
+fn sync_cursor_model_signatures(
+    conn: &mut Connection,
+    state_db_path: &Path,
+) -> Result<String, String> {
+    let source_id = cursor_model_source_id(state_db_path);
+    let state_key = format!("cursor-agent-kv:v2:{source_id}");
+    let source_conn = open_cursor_state_db(state_db_path)?;
+    let max_rowid = cursor_state_max_rowid(&source_conn)?;
+    let stored_rowid: i64 = conn
+        .query_row(
+            "SELECT last_synced_size FROM sync_state WHERE filename = ?",
+            params![state_key],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let reset_cache = max_rowid < stored_rowid;
+    let start_rowid = if reset_cache { 0 } else { stored_rowid };
+
+    let mut mappings = Vec::new();
+    if max_rowid > start_rowid {
+        let mut statement = source_conn
+            .prepare(
+                "SELECT CAST(value AS BLOB)
+                 FROM cursorDiskKV
+                 WHERE rowid > ? AND rowid <= ?
+                   AND key >= 'agentKv:blob:' AND key < 'agentKv:blob;'
+                   AND instr(CAST(value AS TEXT), '\"modelName\"') > 0
+                 ORDER BY rowid",
+            )
+            .map_err(|error| format!("準備 Cursor agentKv 查詢失敗: {error}"))?;
+        let mut rows = statement
+            .query(params![start_rowid, max_rowid])
+            .map_err(|error| format!("查詢 Cursor agentKv 失敗: {error}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("讀取 Cursor agentKv 記錄失敗: {error}"))?
+        {
+            let raw: Vec<u8> = match row.get(0) {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            if let Some(mapping) = parse_cursor_agent_kv_model_signature(&raw) {
+                mappings.push(mapping);
+            }
+        }
+    }
+    drop(source_conn);
+
+    if reset_cache || max_rowid > start_rowid {
+        let has_mapping_changes = !mappings.is_empty();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("啟動 Cursor 模型簽章同步失敗: {error}"))?;
+        if reset_cache {
+            tx.execute(
+                "DELETE FROM cursor_model_signatures WHERE source_id = ?",
+                params![source_id],
+            )
+            .map_err(|error| format!("重設 Cursor 模型簽章快取失敗: {error}"))?;
+            tx.execute(
+                "UPDATE usage_entries
+                 SET model = 'Unknown Model', model_id = 'Unknown Model'
+                 WHERE assistant_type = 'cursor'
+                   AND model_signature IS NOT NULL",
+                [],
+            )
+            .map_err(|error| format!("清除過期 Cursor 模型歸因失敗: {error}"))?;
+            tx.execute("DELETE FROM sync_state WHERE filename LIKE 'cursor:%'", [])
+                .map_err(|error| format!("重設 Cursor 逐字稿同步狀態失敗: {error}"))?;
+        }
+        for (signature, model) in mappings {
+            tx.execute(
+                "INSERT INTO cursor_model_signatures (
+                    source_id, signature, model, is_ambiguous
+                 ) VALUES (?, ?, ?, 0)
+                 ON CONFLICT(source_id, signature) DO UPDATE SET
+                    is_ambiguous = CASE
+                        WHEN cursor_model_signatures.model = excluded.model
+                        THEN cursor_model_signatures.is_ambiguous
+                        ELSE 1
+                    END",
+                params![source_id, signature, model],
+            )
+            .map_err(|error| format!("寫入 Cursor 模型簽章快取失敗: {error}"))?;
+        }
+        if reset_cache || has_mapping_changes {
+            tx.execute(
+                "UPDATE usage_entries
+                 SET model = 'Unknown Model', model_id = 'Unknown Model'
+                 WHERE assistant_type = 'cursor'
+                   AND model_signature IS NOT NULL
+                   AND EXISTS (
+                        SELECT 1 FROM cursor_model_signatures signatures
+                        WHERE signatures.source_id = ?
+                          AND signatures.signature = usage_entries.model_signature
+                          AND signatures.is_ambiguous = 1
+                   )",
+                params![source_id],
+            )
+            .map_err(|error| format!("清除歧義 Cursor 模型歸因失敗: {error}"))?;
+            tx.execute(
+                "UPDATE usage_entries
+                 SET model = (
+                        SELECT signatures.model FROM cursor_model_signatures signatures
+                        WHERE signatures.source_id = ?
+                          AND signatures.signature = usage_entries.model_signature
+                          AND signatures.is_ambiguous = 0
+                     ),
+                     model_id = (
+                        SELECT signatures.model FROM cursor_model_signatures signatures
+                        WHERE signatures.source_id = ?
+                          AND signatures.signature = usage_entries.model_signature
+                          AND signatures.is_ambiguous = 0
+                     )
+                 WHERE assistant_type = 'cursor'
+                   AND model_signature IS NOT NULL
+                   AND EXISTS (
+                        SELECT 1 FROM cursor_model_signatures signatures
+                        WHERE signatures.source_id = ?
+                          AND signatures.signature = usage_entries.model_signature
+                          AND signatures.is_ambiguous = 0
+                   )",
+                params![source_id, source_id, source_id],
+            )
+            .map_err(|error| format!("回填 Cursor 模型歸因失敗: {error}"))?;
+        }
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state (
+                filename, last_synced_size, last_synced_time
+             ) VALUES (?, ?, ?)",
+            params![state_key, max_rowid, now],
+        )
+        .map_err(|error| format!("更新 Cursor agentKv 同步狀態失敗: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("提交 Cursor 模型簽章同步失敗: {error}"))?;
+    }
+
+    Ok(source_id)
+}
+
+fn load_cursor_model_signatures(
+    conn: &Connection,
+    source_id: &str,
+) -> Result<HashMap<String, String>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT signature, model
+             FROM cursor_model_signatures
+             WHERE source_id = ? AND is_ambiguous = 0",
+        )
+        .map_err(|error| format!("準備讀取 Cursor 模型簽章快取失敗: {error}"))?;
+    let rows = statement
+        .query_map(params![source_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| format!("讀取 Cursor 模型簽章快取失敗: {error}"))?;
+    let mut mappings = HashMap::new();
+    for row in rows {
+        let (signature, model) =
+            row.map_err(|error| format!("解析 Cursor 模型簽章快取失敗: {error}"))?;
+        mappings.insert(signature, model);
+    }
+    Ok(mappings)
+}
+
+#[derive(Clone, Debug, Default)]
+struct CursorSessionMetadata {
+    cwd: Option<String>,
+    mode: Option<String>,
+}
+
+fn parse_cursor_session_metadata(key: &str, raw: &[u8]) -> Option<(String, CursorSessionMetadata)> {
+    let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let session_id = value
+        .get("composerId")
+        .and_then(|item| item.as_str())
+        .or_else(|| key.strip_prefix("composerData:"))
+        .map(str::trim)
+        .filter(|item| !item.is_empty() && item.len() <= 200)?
+        .to_string();
+    let cwd = value
+        .pointer("/workspaceIdentifier/uri/fsPath")
+        .or_else(|| value.pointer("/workspaceIdentifier/fsPath"))
+        .or_else(|| value.pointer("/workspaceIdentifier/uri/path"))
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty() && item.len() <= 4096)
+        .map(str::to_string);
+    let unified_mode = value
+        .get("unifiedMode")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty());
+    let is_agentic = value.get("isAgentic").and_then(|item| item.as_bool());
+    let mode = if is_agentic == Some(false)
+        || unified_mode.is_some_and(|item| !item.eq_ignore_ascii_case("agent"))
+    {
+        Some("ide".to_string())
+    } else if is_agentic == Some(true)
+        || unified_mode.is_some_and(|item| item.eq_ignore_ascii_case("agent"))
+    {
+        Some("agent".to_string())
+    } else {
+        None
+    };
+
+    if cwd.is_none() && mode.is_none() {
+        return None;
+    }
+    Some((session_id, CursorSessionMetadata { cwd, mode }))
+}
+
+fn sync_cursor_session_metadata(
+    conn: &mut Connection,
+    state_db_path: &Path,
+) -> Result<String, String> {
+    let source_id = cursor_model_source_id(state_db_path);
+    let state_key = format!("cursor-composer-data:v2:{source_id}");
+    let source_conn = open_cursor_state_db(state_db_path)?;
+    let max_rowid = cursor_state_max_rowid(&source_conn)?;
+    let stored_rowid: i64 = conn
+        .query_row(
+            "SELECT last_synced_size FROM sync_state WHERE filename = ?",
+            params![state_key],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let reset_cache = max_rowid < stored_rowid;
+    let start_rowid = if reset_cache { 0 } else { stored_rowid };
+
+    let mut metadata_rows = Vec::new();
+    if max_rowid > start_rowid {
+        let mut statement = source_conn
+            .prepare(
+                "SELECT key, CAST(value AS BLOB)
+                 FROM cursorDiskKV
+                 WHERE rowid > ? AND rowid <= ?
+                   AND key >= 'composerData:' AND key < 'composerData;'
+                 ORDER BY rowid",
+            )
+            .map_err(|error| format!("準備 Cursor composerData 查詢失敗: {error}"))?;
+        let mut rows = statement
+            .query(params![start_rowid, max_rowid])
+            .map_err(|error| format!("查詢 Cursor composerData 失敗: {error}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("讀取 Cursor composerData 記錄失敗: {error}"))?
+        {
+            let key: String = match row.get(0) {
+                Ok(key) => key,
+                Err(_) => continue,
+            };
+            let raw: Vec<u8> = match row.get(1) {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            if let Some(metadata) = parse_cursor_session_metadata(&key, &raw) {
+                metadata_rows.push(metadata);
+            }
+        }
+    }
+    drop(source_conn);
+
+    if reset_cache || max_rowid > start_rowid {
+        let has_metadata_changes = !metadata_rows.is_empty();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("啟動 Cursor Session 中繼資料同步失敗: {error}"))?;
+        if reset_cache {
+            tx.execute(
+                "DELETE FROM cursor_session_metadata WHERE source_id = ?",
+                params![source_id],
+            )
+            .map_err(|error| format!("重設 Cursor Session 中繼資料快取失敗: {error}"))?;
+            tx.execute("DELETE FROM sync_state WHERE filename LIKE 'cursor:%'", [])
+                .map_err(|error| format!("重設 Cursor 逐字稿同步狀態失敗: {error}"))?;
+        }
+        for (session_id, metadata) in metadata_rows {
+            tx.execute(
+                "INSERT INTO cursor_session_metadata (
+                    source_id, session_id, cwd, mode
+                 ) VALUES (?, ?, ?, ?)
+                 ON CONFLICT(source_id, session_id) DO UPDATE SET
+                    cwd = COALESCE(excluded.cwd, cursor_session_metadata.cwd),
+                    mode = COALESCE(excluded.mode, cursor_session_metadata.mode)",
+                params![source_id, session_id, metadata.cwd, metadata.mode],
+            )
+            .map_err(|error| format!("寫入 Cursor Session 中繼資料快取失敗: {error}"))?;
+        }
+        if reset_cache || has_metadata_changes {
+            tx.execute(
+                "UPDATE usage_entries
+                 SET cwd = (
+                        SELECT metadata.cwd FROM cursor_session_metadata metadata
+                        WHERE metadata.source_id = ?
+                          AND metadata.session_id = usage_entries.session_id
+                     )
+                 WHERE assistant_type = 'cursor'
+                   AND EXISTS (
+                        SELECT 1 FROM cursor_session_metadata metadata
+                        WHERE metadata.source_id = ?
+                          AND metadata.session_id = usage_entries.session_id
+                          AND metadata.cwd IS NOT NULL
+                          AND metadata.cwd != ''
+                   )",
+                params![source_id, source_id],
+            )
+            .map_err(|error| format!("回填 Cursor 工作路徑失敗: {error}"))?;
+            tx.execute(
+                "UPDATE usage_entries
+                 SET source_kind = CASE (
+                        SELECT metadata.mode FROM cursor_session_metadata metadata
+                        WHERE metadata.source_id = ?
+                          AND metadata.session_id = usage_entries.session_id
+                     )
+                        WHEN 'agent' THEN ?
+                        WHEN 'ide' THEN ?
+                        ELSE source_kind
+                     END
+                 WHERE assistant_type = 'cursor'
+                   AND EXISTS (
+                        SELECT 1 FROM cursor_session_metadata metadata
+                        WHERE metadata.source_id = ?
+                          AND metadata.session_id = usage_entries.session_id
+                          AND metadata.mode IN ('agent', 'ide')
+                   )",
+                params![
+                    source_id,
+                    CURSOR_AGENT_SOURCE_KIND,
+                    CURSOR_IDE_SOURCE_KIND,
+                    source_id
+                ],
+            )
+            .map_err(|error| format!("回填 Cursor Session 模式失敗: {error}"))?;
+        }
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state (
+                filename, last_synced_size, last_synced_time
+             ) VALUES (?, ?, ?)",
+            params![state_key, max_rowid, now],
+        )
+        .map_err(|error| format!("更新 Cursor composerData 同步狀態失敗: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("提交 Cursor Session 中繼資料同步失敗: {error}"))?;
+    }
+
+    Ok(source_id)
+}
+
+fn load_cursor_session_metadata(
+    conn: &Connection,
+    source_id: &str,
+) -> Result<HashMap<String, CursorSessionMetadata>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT session_id, cwd, mode
+             FROM cursor_session_metadata
+             WHERE source_id = ?",
+        )
+        .map_err(|error| format!("準備讀取 Cursor Session 中繼資料失敗: {error}"))?;
+    let rows = statement
+        .query_map(params![source_id], |row| {
+            Ok((
+                row.get(0)?,
+                CursorSessionMetadata {
+                    cwd: row.get(1)?,
+                    mode: row.get(2)?,
+                },
+            ))
+        })
+        .map_err(|error| format!("讀取 Cursor Session 中繼資料失敗: {error}"))?;
+    let mut mappings = HashMap::new();
+    for row in rows {
+        let (session_id, metadata) =
+            row.map_err(|error| format!("解析 Cursor Session 中繼資料失敗: {error}"))?;
+        mappings.insert(session_id, metadata);
+    }
+    Ok(mappings)
+}
+
+struct CursorParsedEntry {
+    entry: UsageEntry,
+    model_signature: Option<String>,
+}
+
+fn parse_cursor_session_file(
+    filepath: &Path,
+    model_mappings: &HashMap<String, String>,
+    session_metadata: &HashMap<String, CursorSessionMetadata>,
+) -> Result<Vec<CursorParsedEntry>, String> {
     let file = File::open(filepath).map_err(|e| format!("無法開啟檔案: {}", e))?;
     let reader = BufReader::new(file);
     let fallback_session_id = filepath
@@ -3660,6 +4774,9 @@ fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
         .and_then(|stem| stem.to_str())
         .unwrap_or("unknown-session")
         .to_string();
+    let metadata = session_metadata.get(&fallback_session_id);
+    let session_cwd = metadata.and_then(|value| value.cwd.clone());
+    let source_kind = cursor_mode_source_kind(metadata.and_then(|value| value.mode.as_deref()));
 
     let mut session_name_selector = InitialUserPromptSelector::default();
     let mut results = Vec::new();
@@ -3692,7 +4809,10 @@ fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
             }
 
             if !extracted_ts.is_empty() {
-                current_timestamp = parse_cursor_timestamp(&extracted_ts);
+                let parsed_timestamp = parse_cursor_timestamp(&extracted_ts);
+                if cursor_date_from_timestamp(&parsed_timestamp).is_some() {
+                    current_timestamp = parsed_timestamp;
+                }
             }
 
             let mut clean_prompt = text.clone();
@@ -3710,6 +4830,13 @@ fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
             let content_val = event.get("message").and_then(|m| m.get("content"));
             let reply_text =
                 cursor_content_to_text(content_val.unwrap_or(&serde_json::Value::Null));
+            let current_model_signature =
+                cursor_response_signature(content_val.unwrap_or(&serde_json::Value::Null));
+            let current_model = current_model_signature
+                .as_ref()
+                .and_then(|signature| model_mappings.get(signature))
+                .cloned()
+                .unwrap_or_else(|| "Unknown Model".to_string());
 
             if current_timestamp.is_empty() {
                 if let Ok(metadata) = filepath.metadata() {
@@ -3730,35 +4857,41 @@ fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
             let tokens = TokenStats {
                 input: input_tokens,
                 output: output_tokens,
-                cache_read: Some(0),
-                cache_write: Some(0),
+                // Cursor transcripts do not expose cache token counts.
+                cache_read: None,
+                cache_write: None,
+                cache_write_5m: None,
+                cache_write_1h: None,
                 reasoning: None,
                 total: total_tokens,
             };
 
-            results.push(UsageEntry {
-                timestamp: current_timestamp.clone(),
-                session_id: fallback_session_id.clone(),
-                session_name: session_name_selector
-                    .selected_name()
-                    .map(str::to_string)
-                    .or_else(|| Some(fallback_session_id.clone())),
-                transcript_path: Some(filepath.to_string_lossy().into_owned()),
-                cwd: None,
-                version: None,
-                turn_no: (results.len() + 1) as u32,
-                model: Some("Cursor Agent".to_string()),
-                model_id: Some("Cursor Agent".to_string()),
-                tokens: Some(tokens.clone()),
-                delta_tokens: Some(tokens),
-                context: None,
-                cost: None,
-                source_kind: None,
-                source_dir_key: None,
-                parent_session_id: None,
-                agent_nickname: None,
-                agent_role: None,
-                reasoning_effort: None,
+            results.push(CursorParsedEntry {
+                entry: UsageEntry {
+                    timestamp: current_timestamp.clone(),
+                    session_id: fallback_session_id.clone(),
+                    session_name: session_name_selector
+                        .selected_name()
+                        .map(str::to_string)
+                        .or_else(|| Some(fallback_session_id.clone())),
+                    transcript_path: Some(filepath.to_string_lossy().into_owned()),
+                    cwd: session_cwd.clone(),
+                    version: None,
+                    turn_no: (results.len() + 1) as u32,
+                    model: Some(current_model.clone()),
+                    model_id: Some(current_model.clone()),
+                    tokens: Some(tokens.clone()),
+                    delta_tokens: Some(tokens),
+                    context: None,
+                    cost: None,
+                    source_kind: source_kind.clone(),
+                    source_dir_key: None,
+                    parent_session_id: None,
+                    agent_nickname: None,
+                    agent_role: None,
+                    reasoning_effort: None,
+                },
+                model_signature: current_model_signature,
             });
         }
     }
@@ -3767,6 +4900,33 @@ fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
 }
 
 fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<(), String> {
+    run_cursor_model_attribution_migration(conn)?;
+    run_cursor_cache_tokens_unknown_migration(conn)?;
+
+    let state_db_path = get_cursor_state_db_path();
+    let source_id = if state_db_path.exists() {
+        let source_id = cursor_model_source_id(&state_db_path);
+        if let Err(error) = sync_cursor_model_signatures(conn, &state_db_path) {
+            eprintln!("同步 Cursor agentKv 模型資訊失敗: {error}");
+        }
+        if let Err(error) = sync_cursor_session_metadata(conn, &state_db_path) {
+            eprintln!("同步 Cursor composerData Session 中繼資料失敗: {error}");
+        }
+        Some(source_id)
+    } else {
+        None
+    };
+    let model_mappings = if let Some(source_id) = source_id.as_deref() {
+        load_cursor_model_signatures(conn, source_id)?
+    } else {
+        HashMap::new()
+    };
+    let session_metadata = if let Some(source_id) = source_id.as_deref() {
+        load_cursor_session_metadata(conn, source_id)?
+    } else {
+        HashMap::new()
+    };
+
     let projects_dir = cursor_dir.join("projects");
     if !projects_dir.exists() {
         return Ok(());
@@ -3797,13 +4957,14 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
         let current_size = metadata.len();
 
         if current_size != last_synced_size {
-            let parsed_entries = match parse_cursor_session_file(&filepath) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    eprintln!("解析 Cursor 會話檔案 {:?} 失敗: {}", filepath, e);
-                    continue;
-                }
-            };
+            let parsed_entries =
+                match parse_cursor_session_file(&filepath, &model_mappings, &session_metadata) {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        eprintln!("解析 Cursor 會話檔案 {:?} 失敗: {}", filepath, e);
+                        continue;
+                    }
+                };
 
             let tx = conn
                 .transaction()
@@ -3811,7 +4972,7 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
 
             let session_ids: HashSet<String> = parsed_entries
                 .iter()
-                .map(|entry| entry.session_id.clone())
+                .map(|parsed| parsed.entry.session_id.clone())
                 .collect();
             for session_id in session_ids {
                 let delete_res = tx.execute(
@@ -3826,22 +4987,34 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
             }
 
             let mut success = true;
-            for entry in &parsed_entries {
+            for parsed in &parsed_entries {
+                let entry = &parsed.entry;
                 let tokens = entry.tokens.as_ref();
                 let delta = entry.delta_tokens.as_ref();
                 let cost = entry.cost.as_ref();
+                let entry_date = cursor_date_from_timestamp(&entry.timestamp).ok_or_else(|| {
+                    format!(
+                        "Cursor Session {} 的時間戳記無有效日期: {}",
+                        entry.session_id, entry.timestamp
+                    )
+                })?;
 
                 let insert_res = tx.execute(
                     "INSERT INTO usage_entries (
-                        assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
-                        duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id, model_signature,
+                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
+                        duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort, source_kind
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?
+                    )",
                     params![
                         "cursor",
                         entry.timestamp,
-                        entry.timestamp.get(0..10).unwrap_or("unknown"),
+                        entry_date,
                         entry.session_id,
                         entry.session_name.as_deref(),
                         entry.transcript_path.as_deref(),
@@ -3850,16 +5023,21 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
                         entry.turn_no as i64,
                         entry.model.as_deref(),
                         entry.model_id.as_deref(),
+                        parsed.model_signature.as_deref(),
                         tokens.map(|t| t.input as i64),
                         tokens.map(|t| t.output as i64),
                         tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
                         tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
+                        tokens.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                        tokens.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                         tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
                         tokens.map(|t| t.total as i64),
                         delta.map(|t| t.input as i64),
                         delta.map(|t| t.output as i64),
                         delta.and_then(|t| t.cache_read.map(|v| v as i64)),
                         delta.and_then(|t| t.cache_write.map(|v| v as i64)),
+                        delta.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                        delta.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                         delta.and_then(|t| t.reasoning.map(|v| v as i64)),
                         delta.map(|t| t.total as i64),
                         cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
@@ -3867,7 +5045,8 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
                         entry.parent_session_id.as_deref(),
                         entry.agent_nickname.as_deref(),
                         entry.agent_role.as_deref(),
-                        entry.reasoning_effort.as_deref()
+                        entry.reasoning_effort.as_deref(),
+                        entry.source_kind.as_deref().unwrap_or("cursor")
                     ],
                 );
 
@@ -3934,9 +5113,9 @@ pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
         eprintln!("❌ 同步 Copilot CLI agent reconciliation 失敗: {}", e);
     }
 
-    // 3. Sync Codex CLI
+    // 3. Sync Codex CLI and Desktop
     if let Err(e) = sync_codex_usage_logs(conn) {
-        eprintln!("❌ 同步 Codex CLI 失敗: {}", e);
+        eprintln!("❌ 同步 Codex 失敗: {}", e);
     }
 
     // 4. Sync Claude Code
@@ -4244,8 +5423,8 @@ pub fn get_usage_entries_by_date(
 ) -> Result<Vec<(UsageDayExportRecord, String)>, String> {
     let mut query = "SELECT
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort, import_source_id, source_kind, source_dir_key
          FROM usage_entries WHERE date = ?".to_string();
     let mut params_vec = Vec::new();
@@ -4272,7 +5451,7 @@ pub fn get_usage_entries_by_date(
 
     let mut entries = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let ast_type = row.get::<_, String>(26).map_err(|e| e.to_string())?;
+        let ast_type = row.get::<_, String>(30).map_err(|e| e.to_string())?;
         let tokens_input: Option<u64> = row
             .get::<_, Option<i64>>(9)
             .map_err(|e| e.to_string())?
@@ -4289,12 +5468,20 @@ pub fn get_usage_entries_by_date(
             .get::<_, Option<i64>>(12)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let tokens_reasoning: Option<u64> = row
+        let tokens_cache_write_5m: Option<u64> = row
             .get::<_, Option<i64>>(13)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let tokens_total: Option<u64> = row
+        let tokens_cache_write_1h: Option<u64> = row
             .get::<_, Option<i64>>(14)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(15)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_total: Option<u64> = row
+            .get::<_, Option<i64>>(16)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
 
@@ -4306,6 +5493,8 @@ pub fn get_usage_entries_by_date(
                 output,
                 cache_read: tokens_cache_read,
                 cache_write: tokens_cache_write,
+                cache_write_5m: tokens_cache_write_5m,
+                cache_write_1h: tokens_cache_write_1h,
                 reasoning: tokens_reasoning,
                 total,
             })
@@ -4314,27 +5503,35 @@ pub fn get_usage_entries_by_date(
         };
 
         let delta_input: Option<u64> = row
-            .get::<_, Option<i64>>(15)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_output: Option<u64> = row
-            .get::<_, Option<i64>>(16)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_read: Option<u64> = row
             .get::<_, Option<i64>>(17)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let delta_cache_write: Option<u64> = row
+        let delta_output: Option<u64> = row
             .get::<_, Option<i64>>(18)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let delta_reasoning: Option<u64> = row
+        let delta_cache_read: Option<u64> = row
             .get::<_, Option<i64>>(19)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let delta_total: Option<u64> = row
+        let delta_cache_write: Option<u64> = row
             .get::<_, Option<i64>>(20)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_write_5m: Option<u64> = row
+            .get::<_, Option<i64>>(21)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_write_1h: Option<u64> = row
+            .get::<_, Option<i64>>(22)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(23)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_total: Option<u64> = row
+            .get::<_, Option<i64>>(24)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
 
@@ -4346,6 +5543,8 @@ pub fn get_usage_entries_by_date(
                 output,
                 cache_read: delta_cache_read,
                 cache_write: delta_cache_write,
+                cache_write_5m: delta_cache_write_5m,
+                cache_write_1h: delta_cache_write_1h,
                 reasoning: delta_reasoning,
                 total,
             })
@@ -4354,11 +5553,11 @@ pub fn get_usage_entries_by_date(
         };
 
         let duration_ms: Option<f64> = row
-            .get::<_, Option<i64>>(21)
+            .get::<_, Option<i64>>(25)
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
         let premium_requests: Option<f64> = row
-            .get::<_, Option<i64>>(22)
+            .get::<_, Option<i64>>(26)
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
 
@@ -4372,7 +5571,7 @@ pub fn get_usage_entries_by_date(
             None
         };
         let import_source_id = normalize_import_source_id(
-            row.get::<_, Option<String>>(28)
+            row.get::<_, Option<String>>(32)
                 .map_err(|e| e.to_string())?
                 .as_deref(),
         );
@@ -4392,12 +5591,12 @@ pub fn get_usage_entries_by_date(
                 delta_tokens,
                 context: None,
                 cost,
-                source_kind: row.get(29).ok(),
-                source_dir_key: row.get(30).ok(),
-                parent_session_id: row.get(23).ok(),
-                agent_nickname: row.get(24).ok(),
-                agent_role: row.get(25).ok(),
-                reasoning_effort: row.get(27).ok(),
+                source_kind: row.get(33).ok(),
+                source_dir_key: row.get(34).ok(),
+                parent_session_id: row.get(27).ok(),
+                agent_nickname: row.get(28).ok(),
+                agent_role: row.get(29).ok(),
+                reasoning_effort: row.get(31).ok(),
             },
             import_source_id,
         };
@@ -4450,22 +5649,44 @@ pub fn import_usage_day_entries(
     assistant: &str,
     date: &str,
     records: Vec<UsageDayExportRecord>,
+    metadata: UsageImportMetadata,
 ) -> Result<UsageDayImportSummary, String> {
     let total = records.len();
     if total == 0 {
         return Err("匯入資料為空".to_string());
     }
 
+    let batch_id = new_import_batch_id();
+    let created_at = unix_timestamp_secs();
+    let source_assistant = normalize_import_metadata_value(metadata.source_assistant, 64);
+    let source_file_name = normalize_import_metadata_value(metadata.source_file_name, 255);
     let mut inserted = 0usize;
     let mut skipped_duplicates = 0usize;
 
     let tx = conn
         .transaction()
         .map_err(|e| format!("建立匯入交易失敗: {}", e))?;
+    tx.execute(
+        "INSERT INTO import_batches (
+            id, assistant_type, source_assistant, source_file_name, import_date,
+            total_records, imported_records, skipped_duplicates, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)",
+        params![
+            batch_id,
+            assistant,
+            source_assistant,
+            source_file_name,
+            date,
+            total as i64,
+            created_at,
+        ],
+    )
+    .map_err(|e| format!("建立匯入批次失敗: {e}"))?;
 
     for record in records {
         let mut entry = record.entry;
         let normalized_id = normalize_import_source_id(record.import_source_id.as_deref());
+        let generated_source_id = build_usage_entry_import_source_id(assistant, date, &entry);
         let file_date = entry_date_from_timestamp(&entry.timestamp)
             .ok_or_else(|| "無效的 timestamp 格式，無法取得日期".to_string())?;
         if file_date != date {
@@ -4480,23 +5701,25 @@ pub fn import_usage_day_entries(
             .unwrap_or_else(|| "legacy".to_string());
         if assistant == "copilot" && matches!(source_kind.as_str(), "copilot-cli" | "legacy") {
             normalize_copilot_cli_usage_entry(&mut entry);
+        } else if assistant == "claude" {
+            normalize_legacy_claude_usage_entry(&mut entry);
         }
-        let source_id = normalized_id
-            .unwrap_or_else(|| build_usage_entry_import_source_id(assistant, date, &entry));
+        let source_id = normalized_id.unwrap_or(generated_source_id);
 
         let imported = tx
             .execute(
                 "INSERT OR IGNORE INTO usage_entries (
                     assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no,
-                    model, model_id, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-                    delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                    model, model_id, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+                    delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
                     duration_ms, premium_requests,
-                    parent_session_id, agent_nickname, agent_role, reasoning_effort, import_source_id
+                    parent_session_id, agent_nickname, agent_role, reasoning_effort,
+                    import_source_id, import_batch_id
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?
                 )",
                 rusqlite::params![
                     assistant,
@@ -4515,12 +5738,16 @@ pub fn import_usage_day_entries(
                     entry.tokens.as_ref().map(|t| t.output as i64),
                     entry.tokens.as_ref().and_then(|t| t.cache_read.map(|v| v as i64)),
                     entry.tokens.as_ref().and_then(|t| t.cache_write.map(|v| v as i64)),
+                    entry.tokens.as_ref().and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                    entry.tokens.as_ref().and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                     entry.tokens.as_ref().and_then(|t| t.reasoning.map(|v| v as i64)),
                     entry.tokens.as_ref().map(|t| t.total as i64),
                     entry.delta_tokens.as_ref().map(|t| t.input as i64),
                     entry.delta_tokens.as_ref().map(|t| t.output as i64),
                     entry.delta_tokens.as_ref().and_then(|t| t.cache_read.map(|v| v as i64)),
                     entry.delta_tokens.as_ref().and_then(|t| t.cache_write.map(|v| v as i64)),
+                    entry.delta_tokens.as_ref().and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                    entry.delta_tokens.as_ref().and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                     entry.delta_tokens.as_ref().and_then(|t| t.reasoning.map(|v| v as i64)),
                     entry.delta_tokens.as_ref().map(|t| t.total as i64),
                     entry.cost.as_ref().and_then(|c| c.total_api_duration_ms).map(|v| v as i64),
@@ -4530,6 +5757,7 @@ pub fn import_usage_day_entries(
                     entry.agent_role,
                     entry.reasoning_effort,
                     source_id,
+                    batch_id,
                 ],
             )
             .map_err(|e| format!("匯入資料寫入失敗: {}", e))?;
@@ -4541,6 +5769,13 @@ pub fn import_usage_day_entries(
         }
     }
 
+    tx.execute(
+        "UPDATE import_batches
+         SET imported_records = ?, skipped_duplicates = ?
+         WHERE id = ?",
+        params![inserted as i64, skipped_duplicates as i64, batch_id],
+    )
+    .map_err(|e| format!("更新匯入批次結果失敗: {e}"))?;
     tx.commit()
         .map_err(|e| format!("提交匯入結果失敗: {}", e))?;
 
@@ -4549,6 +5784,98 @@ pub fn import_usage_day_entries(
         total,
         imported: inserted,
         skipped_duplicates,
+        batch_id,
+    })
+}
+
+pub fn list_usage_import_batches(
+    conn: &Connection,
+    assistant: &str,
+    limit: usize,
+) -> Result<Vec<UsageImportBatch>, String> {
+    let limit = limit.clamp(1, 100) as i64;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, assistant_type, source_assistant, source_file_name, import_date,
+                    total_records, imported_records, skipped_duplicates, created_at,
+                    rolled_back_at, removed_records
+             FROM import_batches
+             WHERE assistant_type = ?
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?",
+        )
+        .map_err(|e| format!("準備匯入批次查詢失敗: {e}"))?;
+    let rows = stmt
+        .query_map(params![assistant, limit], |row| {
+            Ok(UsageImportBatch {
+                id: row.get(0)?,
+                assistant: row.get(1)?,
+                source_assistant: row.get(2)?,
+                source_file_name: row.get(3)?,
+                date: row.get(4)?,
+                total: row.get::<_, i64>(5)? as usize,
+                imported: row.get::<_, i64>(6)? as usize,
+                skipped_duplicates: row.get::<_, i64>(7)? as usize,
+                created_at: row.get(8)?,
+                rolled_back_at: row.get(9)?,
+                removed_records: row.get::<_, i64>(10)? as usize,
+            })
+        })
+        .map_err(|e| format!("查詢匯入批次失敗: {e}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("讀取匯入批次失敗: {e}"))
+}
+
+pub fn rollback_usage_import_batch(
+    conn: &mut Connection,
+    assistant: &str,
+    batch_id: &str,
+) -> Result<UsageImportRollbackSummary, String> {
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("建立撤銷交易失敗: {e}"))?;
+    let rolled_back_at = match tx.query_row(
+        "SELECT rolled_back_at
+         FROM import_batches
+         WHERE id = ? AND assistant_type = ?",
+        params![batch_id, assistant],
+        |row| row.get::<_, Option<i64>>(0),
+    ) {
+        Ok(value) => value,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Err("找不到指定的匯入批次".to_string());
+        }
+        Err(error) => return Err(format!("查詢匯入批次失敗: {error}")),
+    };
+    if rolled_back_at.is_some() {
+        return Err("指定的匯入批次已撤銷".to_string());
+    }
+
+    let removed_records = tx
+        .execute(
+            "DELETE FROM usage_entries
+             WHERE assistant_type = ? AND import_batch_id = ?",
+            params![assistant, batch_id],
+        )
+        .map_err(|e| format!("刪除匯入資料失敗: {e}"))?;
+    tx.execute(
+        "UPDATE import_batches
+         SET rolled_back_at = ?, removed_records = ?
+         WHERE id = ? AND assistant_type = ?",
+        params![
+            unix_timestamp_secs(),
+            removed_records as i64,
+            batch_id,
+            assistant
+        ],
+    )
+    .map_err(|e| format!("更新匯入批次狀態失敗: {e}"))?;
+    tx.commit().map_err(|e| format!("提交撤銷結果失敗: {e}"))?;
+
+    Ok(UsageImportRollbackSummary {
+        batch_id: batch_id.to_string(),
+        removed_records,
     })
 }
 
@@ -4564,8 +5891,106 @@ pub type SessionIdentity = (
     Option<String>,
 );
 
+/// Resolves the single `source_kind` used by the legacy `source_kind = None`
+/// fallback. All four session-lookup helpers
+/// ([`get_session_assistant_and_transcript`], [`get_session_cwd`],
+/// [`get_session_model`], [`get_session_turns_token_stats`]) MUST call this
+/// helper when invoked with `source_kind = None` so that the identity, CWD,
+/// model, and turn-stats lookups always pick rows from the same source — even
+/// when a single session id has rows from multiple collectors
+/// (e.g. `copilot-cli` turn 1 + `vscode-chat` turn 2, both with
+/// `source_dir_key IS NULL`).
+///
+/// Behaviour:
+///
+/// * `source_kind = Some(kind)` — returns `Some(kind.to_string())` directly,
+///   without touching the database. Mirrors the explicit production-handler
+///   call sites that always pass a concrete `source_kind`.
+/// * `source_kind = None` — runs a single, parameter-bound query against
+///   `usage_entries` matching `(assistant_type, session_id, source_dir_key
+///   predicate)`, ordered by the canonical tie-break:
+///   1. main agent rows first — `(parent_session_id IS NULL) DESC`,
+///   2. `source_kind ASC`,
+///   3. `turn_no ASC`,
+///   4. `id ASC` (final stable tie-breaker).
+///
+/// Returns the `source_kind` of the first row, or `None` if the query produced
+/// no rows. Never panics on empty result sets — it just returns `None`, so the
+/// downstream helper can still surface a clean "session not found" / empty
+/// result to the caller.
+///
+/// `source_dir_key` follows the same semantics as the four helpers: `Some(k)`
+/// filters by `source_dir_key = k`, `None` filters by `source_dir_key IS NULL`.
+/// `None` therefore means "non-App rows only" and never "any source".
+fn resolve_session_source_kind(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+    session_id: &str,
+    source_kind: Option<&str>,
+    source_dir_key: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(kind) = source_kind {
+        return Ok(Some(kind.to_string()));
+    }
+
+    let mut sql = String::from(
+        "SELECT source_kind FROM usage_entries
+         WHERE assistant_type = ? AND session_id = ?",
+    );
+    let mut params_vec: Vec<rusqlite::types::Value> = vec![
+        rusqlite::types::Value::Text(assistant.to_string()),
+        rusqlite::types::Value::Text(session_id.to_string()),
+    ];
+    if let Some(key) = source_dir_key {
+        sql.push_str(" AND source_dir_key = ?");
+        params_vec.push(rusqlite::types::Value::Text(key.to_string()));
+    } else {
+        sql.push_str(" AND source_dir_key IS NULL");
+    }
+    // Main agent rows first (parent_session_id IS NULL → 1; DESC puts them
+    // ahead of subagent rows which evaluate to 0). Then `source_kind ASC`
+    // for a deterministic tie-break between equally-scoped sources, then
+    // `turn_no ASC`, then `id ASC` as the final stable tie-breaker.
+    sql.push_str(
+        " ORDER BY (parent_session_id IS NULL) DESC, source_kind ASC, turn_no ASC, id ASC LIMIT 1",
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(params_vec))
+        .map_err(|e| e.to_string())?;
+    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let resolved: Option<String> = row.get(0).ok().flatten();
+        // The column is TEXT NOT NULL DEFAULT 'legacy' so this should always
+        // be Some, but fall back to the column default if a NULL sneaks in
+        // (e.g. via a future migration). This keeps the helper panic-free.
+        Ok(resolved.or_else(|| Some("legacy".to_string())))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Returns `(assistant_type, transcript_path, source_kind, source_dir_key,
 /// parent_session_id, agent_nickname)` for a given session id.
+///
+/// `source_kind` and `source_dir_key` narrow the query so that sessions with the
+/// same `session_id` from different sources (e.g. Copilot CLI vs. Copilot App,
+/// or two different Copilot App directories) are unambiguously identified.
+/// When either is `None`, the corresponding predicate is still applied
+/// explicitly (`source_dir_key IS NULL` when `source_dir_key` is `None`, no
+/// `source_kind` filter when `source_kind` is `None`) so the result is never
+/// derived from an arbitrary row.
+///
+/// For the legacy `source_kind = None` fallback the deterministic tie-break
+/// is: rows with `parent_session_id IS NULL` first (main agent rows before
+/// subagent synthetic rows), then `source_kind ASC`, then `turn_no ASC`, and
+/// finally the smallest `id` as a final stable tie-breaker. Callers that
+/// also query [`get_session_cwd`], [`get_session_model`], and
+/// [`get_session_turns_token_stats`] with the same `None` arguments MUST
+/// observe the same tie-break so identity, CWD, model, and turn stats
+/// always select the same source row (otherwise a request could pick
+/// identity from Copilot CLI while CWD/model/turn stats come from VS Code
+/// Chat for the same session id).
 ///
 /// `parent_session_id` and `agent_nickname` are populated for Copilot App
 /// subagent synthetic rows (`<main>__<agent_id>`); they are `None` for main
@@ -4577,18 +6002,65 @@ pub fn get_session_assistant_and_transcript(
     conn: &rusqlite::Connection,
     assistant: &str,
     session_id: &str,
+    source_kind: Option<&str>,
+    source_dir_key: Option<&str>,
 ) -> Result<SessionIdentity, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT assistant_type, transcript_path, source_kind, source_dir_key,
-                    parent_session_id, agent_nickname
-             FROM usage_entries WHERE session_id = ? AND assistant_type = ?
-             ORDER BY (parent_session_id IS NULL) ASC, turn_no ASC
-             LIMIT 1",
-        )
-        .map_err(|e| e.to_string())?;
+    // Build a deterministic query:
+    // - When source_kind is provided, filter by it exactly.
+    // - When source_dir_key is Some, filter by source_dir_key = ?.
+    // - When source_dir_key is None, filter by source_dir_key IS NULL.
+    //   This ensures None means "no source directory" (non-App), not "any".
+    // - When source_kind is None (legacy), resolve a single source_kind via
+    //   `resolve_session_source_kind` and then filter by it. This keeps the
+    //   legacy `None` fallback consistent with the other three session
+    //   helpers (`get_session_cwd`, `get_session_model`,
+    //   `get_session_turns_token_stats`) so identity, CWD, model, and turn
+    //   stats always observe the same source row even when the same
+    //   session_id has rows from multiple collectors (e.g. `copilot-cli`
+    //   turn 1 + `vscode-chat` turn 2, both with `source_dir_key IS NULL`).
+    let resolved_source_kind =
+        resolve_session_source_kind(conn, assistant, session_id, source_kind, source_dir_key)?;
+    // No matching row exists; mirror the previous "Session not found" error
+    // so callers see the same behaviour when the legacy lookup has nothing
+    // to fall back on.
+    let resolved_source_kind = match resolved_source_kind {
+        Some(k) => k,
+        None => return Err("Session not found".to_string()),
+    };
+
+    let mut sql = String::from(
+        "SELECT assistant_type, transcript_path, source_kind, source_dir_key,
+                parent_session_id, agent_nickname
+         FROM usage_entries
+         WHERE session_id = ? AND assistant_type = ? AND source_kind = ?",
+    );
+    let mut params_vec: Vec<rusqlite::types::Value> = vec![
+        rusqlite::types::Value::Text(session_id.to_string()),
+        rusqlite::types::Value::Text(assistant.to_string()),
+        rusqlite::types::Value::Text(resolved_source_kind),
+    ];
+
+    if let Some(key) = source_dir_key {
+        sql.push_str(" AND source_dir_key = ?");
+        params_vec.push(rusqlite::types::Value::Text(key.to_string()));
+    } else {
+        // None means source_dir_key IS NULL (non-App rows only).
+        sql.push_str(" AND source_dir_key IS NULL");
+    }
+
+    // Deterministic ordering: main agent rows first
+    // (`(parent_session_id IS NULL) DESC` puts NULL/main rows ahead of
+    // NOT NULL/subagent rows), then `source_kind ASC`, then the earliest
+    // turn, then the smallest row `id` as a final tie-breaker so the choice
+    // is stable even when multiple rows share the same (source_kind,
+    // turn_no).
+    sql.push_str(
+        " ORDER BY (parent_session_id IS NULL) DESC, source_kind ASC, turn_no ASC, id ASC LIMIT 1",
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let mut rows = stmt
-        .query(params![session_id, assistant])
+        .query(rusqlite::params_from_iter(params_vec))
         .map_err(|e| e.to_string())?;
     if let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let ast: String = row.get(0).map_err(|e| e.to_string())?;
@@ -4624,14 +6096,47 @@ pub fn get_session_assistant_and_transcript(
 
 pub fn get_session_cwd(
     conn: &rusqlite::Connection,
+    assistant: &str,
     session_id: &str,
+    source_kind: Option<&str>,
     source_dir_key: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let mut stmt = conn
-        .prepare("SELECT cwd FROM usage_entries WHERE session_id = ? AND cwd IS NOT NULL AND (? IS NULL OR source_dir_key = ?) LIMIT 1")
-        .map_err(|e| e.to_string())?;
+    // None means source_dir_key IS NULL (non-App rows only), not "any source".
+    // The legacy `source_kind = None` path MUST resolve a single
+    // `source_kind` via `resolve_session_source_kind` so the CWD lookup
+    // always observes the same source row as identity / model / turn
+    // stats; otherwise a session_id with rows from multiple collectors
+    // (e.g. `copilot-cli` turn 1 + `vscode-chat` turn 2, both
+    // `source_dir_key IS NULL`) could leak CWD from a different source.
+    let resolved_source_kind =
+        resolve_session_source_kind(conn, assistant, session_id, source_kind, source_dir_key)?;
+    let resolved_source_kind = match resolved_source_kind {
+        Some(k) => k,
+        None => return Ok(None),
+    };
+
+    let mut sql = String::from(
+        "SELECT cwd FROM usage_entries
+         WHERE assistant_type = ? AND session_id = ? AND source_kind = ?
+           AND cwd IS NOT NULL",
+    );
+    let mut params_vec: Vec<rusqlite::types::Value> = vec![
+        rusqlite::types::Value::Text(assistant.to_string()),
+        rusqlite::types::Value::Text(session_id.to_string()),
+        rusqlite::types::Value::Text(resolved_source_kind),
+    ];
+    if let Some(key) = source_dir_key {
+        sql.push_str(" AND source_dir_key = ?");
+        params_vec.push(rusqlite::types::Value::Text(key.to_string()));
+    } else {
+        sql.push_str(" AND source_dir_key IS NULL");
+    }
+    sql.push_str(
+        " ORDER BY (parent_session_id IS NULL) DESC, source_kind ASC, turn_no ASC, id ASC LIMIT 1",
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let mut rows = stmt
-        .query(params![session_id, source_dir_key, source_dir_key])
+        .query(rusqlite::params_from_iter(params_vec))
         .map_err(|e| e.to_string())?;
     if let Some(row) = rows.next().map_err(|e| e.to_string())? {
         Ok(row.get::<_, String>(0).ok())
@@ -4655,20 +6160,46 @@ pub fn get_session_cwd(
 /// model column populated (caller then falls back to the parser default).
 pub fn get_session_model(
     conn: &rusqlite::Connection,
+    assistant: &str,
     session_id: &str,
+    source_kind: Option<&str>,
     source_dir_key: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT model FROM usage_entries
-             WHERE session_id = ? AND model IS NOT NULL AND model != ''
-             AND (? IS NULL OR source_dir_key = ?)
-             ORDER BY (parent_session_id IS NULL) ASC, turn_no ASC
-             LIMIT 1",
-        )
-        .map_err(|e| e.to_string())?;
+    // None means source_dir_key IS NULL (non-App rows only), not "any source".
+    // The legacy `source_kind = None` path MUST resolve a single
+    // `source_kind` via `resolve_session_source_kind` so the model lookup
+    // always observes the same source row as identity / CWD / turn stats;
+    // otherwise a session_id with rows from multiple collectors could leak
+    // the model from a different source.
+    let resolved_source_kind =
+        resolve_session_source_kind(conn, assistant, session_id, source_kind, source_dir_key)?;
+    let resolved_source_kind = match resolved_source_kind {
+        Some(k) => k,
+        None => return Ok(None),
+    };
+
+    let mut sql = String::from(
+        "SELECT model FROM usage_entries
+         WHERE assistant_type = ? AND session_id = ? AND source_kind = ?
+           AND model IS NOT NULL AND model != ''",
+    );
+    let mut params_vec: Vec<rusqlite::types::Value> = vec![
+        rusqlite::types::Value::Text(assistant.to_string()),
+        rusqlite::types::Value::Text(session_id.to_string()),
+        rusqlite::types::Value::Text(resolved_source_kind),
+    ];
+    if let Some(key) = source_dir_key {
+        sql.push_str(" AND source_dir_key = ?");
+        params_vec.push(rusqlite::types::Value::Text(key.to_string()));
+    } else {
+        sql.push_str(" AND source_dir_key IS NULL");
+    }
+    sql.push_str(
+        " ORDER BY (parent_session_id IS NULL) DESC, source_kind ASC, turn_no ASC, id ASC LIMIT 1",
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let mut rows = stmt
-        .query(params![session_id, source_dir_key, source_dir_key])
+        .query(rusqlite::params_from_iter(params_vec))
         .map_err(|e| e.to_string())?;
     if let Some(row) = rows.next().map_err(|e| e.to_string())? {
         Ok(row.get::<_, Option<String>>(0).ok().flatten())
@@ -4679,25 +6210,67 @@ pub fn get_session_model(
 
 pub fn get_session_turns_token_stats(
     conn: &rusqlite::Connection,
+    assistant: &str,
     session_id: &str,
+    source_kind: Option<&str>,
     source_dir_key: Option<&str>,
 ) -> Result<HashMap<u32, (TokenStats, String)>, String> {
     let mut map = HashMap::new();
-    let mut stmt = conn.prepare(
-        "SELECT turn_no, delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total, model
+    // None means source_dir_key IS NULL (non-App rows only), not "any source".
+    // The legacy `source_kind = None` path MUST resolve a single
+    // `source_kind` via `resolve_session_source_kind` so the turn-stats
+    // lookup always observes the same source row as identity / CWD / model
+    // AND so all returned turns come from a single collector. Without
+    // resolving first, the previous per-turn "first row encountered" rule
+    // could mix rows from different sources (e.g. `copilot-cli` turn 1 +
+    // `vscode-chat` turn 2, both `source_dir_key IS NULL`) into a single
+    // map, violating the "legacy fallback must pick a single source"
+    // contract.
+    let resolved_source_kind =
+        resolve_session_source_kind(conn, assistant, session_id, source_kind, source_dir_key)?;
+    let resolved_source_kind = match resolved_source_kind {
+        Some(k) => k,
+        None => return Ok(map),
+    };
+
+    let mut sql = String::from(
+        "SELECT turn_no, delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total, model
          FROM usage_entries
-         WHERE session_id = ? AND (? IS NULL OR source_dir_key = ?)
-         ORDER BY turn_no ASC"
-    ).map_err(|e| e.to_string())?;
+         WHERE assistant_type = ? AND session_id = ? AND source_kind = ?",
+    );
+    let mut params_vec: Vec<rusqlite::types::Value> = vec![
+        rusqlite::types::Value::Text(assistant.to_string()),
+        rusqlite::types::Value::Text(session_id.to_string()),
+        rusqlite::types::Value::Text(resolved_source_kind),
+    ];
+    if let Some(key) = source_dir_key {
+        sql.push_str(" AND source_dir_key = ?");
+        params_vec.push(rusqlite::types::Value::Text(key.to_string()));
+    } else {
+        sql.push_str(" AND source_dir_key IS NULL");
+    }
+    // Order by turn_no first so the per-turn map mirrors natural turn order.
+    // Within the same turn_no, prefer main agent rows
+    // (`(parent_session_id IS NULL) DESC` puts NULL/main rows ahead of
+    // NOT NULL/subagent rows) so turn stats never mix main and subagent
+    // synthetic rows; then `source_kind ASC` (deterministic) and finally
+    // `id ASC` as the stable final tie-breaker. After resolving the
+    // source_kind above, every row in the result set already comes from
+    // the same source, so this ORDER BY only matters for tie-breaks
+    // within that source.
+    sql.push_str(
+        " ORDER BY turn_no ASC, (parent_session_id IS NULL) DESC, source_kind ASC, id ASC",
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let mut rows = stmt
-        .query(params![session_id, source_dir_key, source_dir_key])
+        .query(rusqlite::params_from_iter(params_vec))
         .map_err(|e| e.to_string())?;
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         if let (Ok(turn_no), Ok(delta_input), Ok(delta_output), Ok(delta_total)) = (
             row.get::<_, i64>(0),
             row.get::<_, Option<i64>>(1),
             row.get::<_, Option<i64>>(2),
-            row.get::<_, Option<i64>>(6),
+            row.get::<_, Option<i64>>(8),
         ) {
             if let (Some(input), Some(output), Some(total)) =
                 (delta_input, delta_output, delta_total)
@@ -4712,29 +6285,47 @@ pub fn get_session_turns_token_stats(
                     .ok()
                     .flatten()
                     .map(|v| v as u64);
-                let reasoning = row
+                let cache_write_5m = row
                     .get::<_, Option<i64>>(5)
                     .ok()
                     .flatten()
                     .map(|v| v as u64);
+                let cache_write_1h = row
+                    .get::<_, Option<i64>>(6)
+                    .ok()
+                    .flatten()
+                    .map(|v| v as u64);
+                let reasoning = row
+                    .get::<_, Option<i64>>(7)
+                    .ok()
+                    .flatten()
+                    .map(|v| v as u64);
                 let model = row
-                    .get::<_, Option<String>>(7)
+                    .get::<_, Option<String>>(9)
                     .unwrap_or(None)
                     .unwrap_or_else(|| "Gemini".to_string());
-                map.insert(
-                    turn_no as u32,
+                // Keep the first row encountered for each `turn_no`. Combined
+                // with the deterministic ORDER BY above (and the
+                // source_kind resolved before this query), this means turn
+                // stats for the same session id / turn_no always come from
+                // the same source row, mirroring the row picked by
+                // `get_session_assistant_and_transcript` /
+                // `get_session_cwd` / `get_session_model`.
+                map.entry(turn_no as u32).or_insert_with(|| {
                     (
                         TokenStats {
                             input: input as u64,
                             output: output as u64,
                             cache_read,
                             cache_write,
+                            cache_write_5m,
+                            cache_write_1h,
                             reasoning,
                             total: total as u64,
                         },
                         model,
-                    ),
-                );
+                    )
+                });
             }
         }
     }
@@ -4789,8 +6380,8 @@ pub fn get_usage_entries_by_month(
     let query_month = format!("{}-%", year_month);
     let mut query = "SELECT
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-            tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
-            delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
+            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
             date, source_kind, source_dir_key
          FROM usage_entries WHERE date LIKE ?".to_string();
@@ -4818,7 +6409,7 @@ pub fn get_usage_entries_by_month(
 
     let mut entries = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let ast_type = row.get::<_, String>(24).map_err(|e| e.to_string())?;
+        let ast_type = row.get::<_, String>(30).map_err(|e| e.to_string())?;
         let tokens_input: Option<u64> = row
             .get::<_, Option<i64>>(9)
             .map_err(|e| e.to_string())?
@@ -4831,12 +6422,24 @@ pub fn get_usage_entries_by_month(
             .get::<_, Option<i64>>(11)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let tokens_reasoning: Option<u64> = row
+        let tokens_cache_write: Option<u64> = row
             .get::<_, Option<i64>>(12)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let tokens_total: Option<u64> = row
+        let tokens_cache_write_5m: Option<u64> = row
             .get::<_, Option<i64>>(13)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_cache_write_1h: Option<u64> = row
+            .get::<_, Option<i64>>(14)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(15)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_total: Option<u64> = row
+            .get::<_, Option<i64>>(16)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
 
@@ -4847,7 +6450,9 @@ pub fn get_usage_entries_by_month(
                 input,
                 output,
                 cache_read: tokens_cache_read,
-                cache_write: None,
+                cache_write: tokens_cache_write,
+                cache_write_5m: tokens_cache_write_5m,
+                cache_write_1h: tokens_cache_write_1h,
                 reasoning: tokens_reasoning,
                 total,
             })
@@ -4856,23 +6461,35 @@ pub fn get_usage_entries_by_month(
         };
 
         let delta_input: Option<u64> = row
-            .get::<_, Option<i64>>(14)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_output: Option<u64> = row
-            .get::<_, Option<i64>>(15)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_read: Option<u64> = row
-            .get::<_, Option<i64>>(16)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_reasoning: Option<u64> = row
             .get::<_, Option<i64>>(17)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let delta_total: Option<u64> = row
+        let delta_output: Option<u64> = row
             .get::<_, Option<i64>>(18)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_read: Option<u64> = row
+            .get::<_, Option<i64>>(19)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_write: Option<u64> = row
+            .get::<_, Option<i64>>(20)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_write_5m: Option<u64> = row
+            .get::<_, Option<i64>>(21)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_write_1h: Option<u64> = row
+            .get::<_, Option<i64>>(22)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(23)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_total: Option<u64> = row
+            .get::<_, Option<i64>>(24)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
 
@@ -4883,7 +6500,9 @@ pub fn get_usage_entries_by_month(
                 input,
                 output,
                 cache_read: delta_cache_read,
-                cache_write: None,
+                cache_write: delta_cache_write,
+                cache_write_5m: delta_cache_write_5m,
+                cache_write_1h: delta_cache_write_1h,
                 reasoning: delta_reasoning,
                 total,
             })
@@ -4892,11 +6511,11 @@ pub fn get_usage_entries_by_month(
         };
 
         let duration_ms: Option<f64> = row
-            .get::<_, Option<i64>>(19)
+            .get::<_, Option<i64>>(25)
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
         let premium_requests: Option<f64> = row
-            .get::<_, Option<i64>>(20)
+            .get::<_, Option<i64>>(26)
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
 
@@ -4910,7 +6529,7 @@ pub fn get_usage_entries_by_month(
             None
         };
 
-        let entry_date = row.get::<_, String>(26).map_err(|e| e.to_string())?;
+        let entry_date = row.get::<_, String>(32).map_err(|e| e.to_string())?;
 
         entries.push((
             UsageEntry {
@@ -4927,12 +6546,12 @@ pub fn get_usage_entries_by_month(
                 delta_tokens,
                 context: None,
                 cost,
-                source_kind: row.get(27).ok(),
-                source_dir_key: row.get(28).ok(),
-                parent_session_id: row.get(21).ok(),
-                agent_nickname: row.get(22).ok(),
-                agent_role: row.get(23).ok(),
-                reasoning_effort: row.get(25).ok(),
+                source_kind: row.get(33).ok(),
+                source_dir_key: row.get(34).ok(),
+                parent_session_id: row.get(27).ok(),
+                agent_nickname: row.get(28).ok(),
+                agent_role: row.get(29).ok(),
+                reasoning_effort: row.get(31).ok(),
             },
             ast_type,
             entry_date,
@@ -4989,8 +6608,8 @@ pub fn get_usage_entries_by_year(
     let query_year = format!("{}-%", year);
     let mut query = "SELECT
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-            tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
-            delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
+            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
             date, source_kind, source_dir_key
          FROM usage_entries WHERE date LIKE ?".to_string();
@@ -5018,7 +6637,7 @@ pub fn get_usage_entries_by_year(
 
     let mut entries = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let ast_type = row.get::<_, String>(24).map_err(|e| e.to_string())?;
+        let ast_type = row.get::<_, String>(30).map_err(|e| e.to_string())?;
         let tokens_input: Option<u64> = row
             .get::<_, Option<i64>>(9)
             .map_err(|e| e.to_string())?
@@ -5031,12 +6650,24 @@ pub fn get_usage_entries_by_year(
             .get::<_, Option<i64>>(11)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let tokens_reasoning: Option<u64> = row
+        let tokens_cache_write: Option<u64> = row
             .get::<_, Option<i64>>(12)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let tokens_total: Option<u64> = row
+        let tokens_cache_write_5m: Option<u64> = row
             .get::<_, Option<i64>>(13)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_cache_write_1h: Option<u64> = row
+            .get::<_, Option<i64>>(14)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(15)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_total: Option<u64> = row
+            .get::<_, Option<i64>>(16)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
 
@@ -5047,7 +6678,9 @@ pub fn get_usage_entries_by_year(
                 input,
                 output,
                 cache_read: tokens_cache_read,
-                cache_write: None,
+                cache_write: tokens_cache_write,
+                cache_write_5m: tokens_cache_write_5m,
+                cache_write_1h: tokens_cache_write_1h,
                 reasoning: tokens_reasoning,
                 total,
             })
@@ -5056,23 +6689,35 @@ pub fn get_usage_entries_by_year(
         };
 
         let delta_input: Option<u64> = row
-            .get::<_, Option<i64>>(14)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_output: Option<u64> = row
-            .get::<_, Option<i64>>(15)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_read: Option<u64> = row
-            .get::<_, Option<i64>>(16)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_reasoning: Option<u64> = row
             .get::<_, Option<i64>>(17)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let delta_total: Option<u64> = row
+        let delta_output: Option<u64> = row
             .get::<_, Option<i64>>(18)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_read: Option<u64> = row
+            .get::<_, Option<i64>>(19)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_write: Option<u64> = row
+            .get::<_, Option<i64>>(20)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_write_5m: Option<u64> = row
+            .get::<_, Option<i64>>(21)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_write_1h: Option<u64> = row
+            .get::<_, Option<i64>>(22)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(23)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_total: Option<u64> = row
+            .get::<_, Option<i64>>(24)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
 
@@ -5083,7 +6728,9 @@ pub fn get_usage_entries_by_year(
                 input,
                 output,
                 cache_read: delta_cache_read,
-                cache_write: None,
+                cache_write: delta_cache_write,
+                cache_write_5m: delta_cache_write_5m,
+                cache_write_1h: delta_cache_write_1h,
                 reasoning: delta_reasoning,
                 total,
             })
@@ -5092,11 +6739,11 @@ pub fn get_usage_entries_by_year(
         };
 
         let duration_ms: Option<f64> = row
-            .get::<_, Option<i64>>(19)
+            .get::<_, Option<i64>>(25)
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
         let premium_requests: Option<f64> = row
-            .get::<_, Option<i64>>(20)
+            .get::<_, Option<i64>>(26)
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
 
@@ -5110,7 +6757,7 @@ pub fn get_usage_entries_by_year(
             None
         };
 
-        let entry_date = row.get::<_, String>(26).map_err(|e| e.to_string())?;
+        let entry_date = row.get::<_, String>(32).map_err(|e| e.to_string())?;
 
         entries.push((
             UsageEntry {
@@ -5127,12 +6774,12 @@ pub fn get_usage_entries_by_year(
                 delta_tokens,
                 context: None,
                 cost,
-                source_kind: row.get(27).ok(),
-                source_dir_key: row.get(28).ok(),
-                parent_session_id: row.get(21).ok(),
-                agent_nickname: row.get(22).ok(),
-                agent_role: row.get(23).ok(),
-                reasoning_effort: row.get(25).ok(),
+                source_kind: row.get(33).ok(),
+                source_dir_key: row.get(34).ok(),
+                parent_session_id: row.get(27).ok(),
+                agent_nickname: row.get(28).ok(),
+                agent_role: row.get(29).ok(),
+                reasoning_effort: row.get(31).ok(),
             },
             ast_type,
             entry_date,
@@ -5290,6 +6937,8 @@ mod tests {
                     output: 20,
                     cache_read: Some(30),
                     cache_write: Some(10),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
                     reasoning: Some(5),
                     total: 120,
                 }),
@@ -5298,6 +6947,8 @@ mod tests {
                     output: 2,
                     cache_read: Some(3),
                     cache_write: Some(1),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
                     reasoning: Some(1),
                     total: 12,
                 }),
@@ -5420,6 +7071,8 @@ mod tests {
             output: 1_370,
             cache_read: Some(401_024),
             cache_write: Some(0),
+            cache_write_5m: None,
+            cache_write_1h: None,
             reasoning: Some(384),
             total: 444_924,
         });
@@ -5449,6 +7102,8 @@ mod tests {
             output: 1_370,
             cache_read: Some(401_024),
             cache_write: Some(0),
+            cache_write_5m: None,
+            cache_write_1h: None,
             reasoning: Some(384),
             total: 444_924,
         });
@@ -5515,6 +7170,8 @@ mod tests {
             output: 1_370,
             cache_read: Some(401_024),
             cache_write: Some(0),
+            cache_write_5m: None,
+            cache_write_1h: None,
             reasoning: Some(384),
             total: 444_924,
         });
@@ -5547,14 +7204,25 @@ mod tests {
         init_db(&conn).unwrap();
         let record = sample_import_record();
 
-        let first =
-            import_usage_day_entries(&mut conn, "codex", "2026-07-10", vec![record.clone()])
-                .unwrap();
+        let first = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record.clone()],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
         assert_eq!(first.imported, 1);
         assert_eq!(first.skipped_duplicates, 0);
 
-        let second =
-            import_usage_day_entries(&mut conn, "codex", "2026-07-10", vec![record]).unwrap();
+        let second = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
         assert_eq!(second.imported, 0);
         assert_eq!(second.skipped_duplicates, 1);
 
@@ -5569,6 +7237,148 @@ mod tests {
     }
 
     #[test]
+    fn import_batches_track_source_and_rollback_only_imported_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no
+             ) VALUES (
+                'codex', '2026-07-10T00:00:00Z', '2026-07-10', 'native-session', 1
+             )",
+            [],
+        )
+        .unwrap();
+        let record = sample_import_record();
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata {
+                source_assistant: Some("codex".to_string()),
+                source_file_name: Some("token-usage-codex.json".to_string()),
+            },
+        )
+        .unwrap();
+
+        let batches = list_usage_import_batches(&conn, "codex", 50).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].id, summary.batch_id);
+        assert_eq!(batches[0].source_assistant.as_deref(), Some("codex"));
+        assert_eq!(
+            batches[0].source_file_name.as_deref(),
+            Some("token-usage-codex.json")
+        );
+        assert_eq!(batches[0].imported, 1);
+        assert_eq!(batches[0].rolled_back_at, None);
+
+        let rollback = rollback_usage_import_batch(&mut conn, "codex", &summary.batch_id).unwrap();
+        assert_eq!(rollback.removed_records, 1);
+        let remaining_native_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'native-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let remaining_imported_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE import_batch_id = ?",
+                params![summary.batch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_native_rows, 1);
+        assert_eq!(remaining_imported_rows, 0);
+
+        let batches = list_usage_import_batches(&conn, "codex", 50).unwrap();
+        assert!(batches[0].rolled_back_at.is_some());
+        assert_eq!(batches[0].removed_records, 1);
+        let error = rollback_usage_import_batch(&mut conn, "codex", &summary.batch_id).unwrap_err();
+        assert_eq!(error, "指定的匯入批次已撤銷");
+    }
+
+    #[test]
+    fn legacy_import_without_ttl_fields_keeps_previous_source_id() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut record = sample_import_record();
+        record.entry.session_id = "legacy-source-id".to_string();
+        record.entry.model = Some("claude-fable-5".to_string());
+        record.entry.model_id = Some("claude-fable-5".to_string());
+        record.import_source_id = None;
+
+        let entry = &record.entry;
+        let tokens = entry.tokens.as_ref().unwrap();
+        let delta = entry.delta_tokens.as_ref().unwrap();
+        let legacy_tokens_signature = format!(
+            "{}|{}|{}|{}|{}|{}",
+            tokens.input,
+            tokens.output,
+            tokens.cache_read.unwrap_or(0),
+            tokens.cache_write.unwrap_or(0),
+            tokens.reasoning.unwrap_or(0),
+            tokens.total
+        );
+        let legacy_delta_signature = format!(
+            "{}|{}|{}|{}|{}|{}",
+            delta.input,
+            delta.output,
+            delta.cache_read.unwrap_or(0),
+            delta.cache_write.unwrap_or(0),
+            delta.reasoning.unwrap_or(0),
+            delta.total
+        );
+        let legacy_signature = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "claude",
+            "2026-07-10",
+            entry.timestamp,
+            entry.session_id,
+            entry.turn_no,
+            entry.model.as_deref().unwrap_or_default(),
+            entry.model_id.as_deref().unwrap_or_default(),
+            entry.version.as_deref().unwrap_or_default(),
+            entry.cwd.as_deref().unwrap_or_default(),
+            entry.transcript_path.as_deref().unwrap_or_default(),
+            entry.parent_session_id.as_deref().unwrap_or_default(),
+            entry.agent_nickname.as_deref().unwrap_or_default(),
+            entry.agent_role.as_deref().unwrap_or_default(),
+            legacy_tokens_signature,
+            legacy_delta_signature
+        );
+        let legacy_source_id = format!("{:016x}", hash_fnv1a_64(&legacy_signature));
+        assert_eq!(
+            build_usage_entry_import_source_id("claude", "2026-07-10", entry),
+            legacy_source_id
+        );
+
+        let mut existing_record = record.clone();
+        existing_record.import_source_id = Some(legacy_source_id);
+        let first = import_usage_day_entries(
+            &mut conn,
+            "claude",
+            "2026-07-10",
+            vec![existing_record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(first.imported, 1);
+
+        let second = import_usage_day_entries(
+            &mut conn,
+            "claude",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.skipped_duplicates, 1);
+    }
+
+    #[test]
     fn import_usage_day_entries_normalizes_copilot_cached_input() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -5580,13 +7390,22 @@ mod tests {
             output: 1_370,
             cache_read: Some(401_024),
             cache_write: Some(0),
+            cache_write_5m: None,
+            cache_write_1h: None,
             reasoning: Some(384),
             total: 444_924,
         });
         record.entry.delta_tokens = record.entry.tokens.clone();
         record.import_source_id = Some("imported-copilot-cache".to_string());
 
-        import_usage_day_entries(&mut conn, "copilot", "2026-07-10", vec![record]).unwrap();
+        import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
 
         let inserted: (u64, u64) = conn
             .query_row(
@@ -5598,6 +7417,252 @@ mod tests {
             )
             .unwrap();
         assert_eq!(inserted, (42_530, 42_530));
+    }
+
+    #[test]
+    fn import_usage_day_entries_normalizes_legacy_claude_cache_writes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut record = sample_import_record();
+        record.entry.session_id = "imported-legacy-claude-cache".to_string();
+        record.entry.model = Some("claude-fable-5".to_string());
+        record.entry.model_id = Some("claude-fable-5".to_string());
+        record.entry.tokens = Some(TokenStats {
+            input: 110,
+            output: 20,
+            cache_read: Some(30),
+            cache_write: Some(10),
+            cache_write_5m: None,
+            cache_write_1h: None,
+            reasoning: None,
+            total: 160,
+        });
+        record.entry.delta_tokens = Some(TokenStats {
+            input: 11,
+            output: 2,
+            cache_read: Some(3),
+            cache_write: Some(1),
+            cache_write_5m: None,
+            cache_write_1h: None,
+            reasoning: None,
+            total: 16,
+        });
+        record.import_source_id = Some("imported-legacy-claude-cache".to_string());
+
+        import_usage_day_entries(
+            &mut conn,
+            "claude",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+
+        let inserted: (u64, u64, u64, u64, u64, u64) = conn
+            .query_row(
+                "SELECT tokens_input, tokens_cache_write_5m, tokens_cache_write_1h,
+                        delta_input, delta_cache_write_5m, delta_cache_write_1h
+                 FROM usage_entries
+                 WHERE assistant_type = 'claude'
+                   AND session_id = 'imported-legacy-claude-cache'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(inserted, (100, 10, 0, 10, 1, 0));
+    }
+
+    #[test]
+    fn usage_queries_round_trip_claude_cache_write_ttls() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut record = sample_import_record();
+        record.entry.session_id = "claude-cache-write-ttl".to_string();
+        record.entry.model = Some("claude-fable-5".to_string());
+        record.entry.model_id = Some("claude-fable-5".to_string());
+        record.entry.tokens = Some(TokenStats {
+            input: 100,
+            output: 20,
+            cache_read: Some(30),
+            cache_write: Some(10),
+            cache_write_5m: Some(3),
+            cache_write_1h: Some(7),
+            reasoning: None,
+            total: 160,
+        });
+        record.entry.delta_tokens = Some(TokenStats {
+            input: 10,
+            output: 2,
+            cache_read: Some(3),
+            cache_write: Some(4),
+            cache_write_5m: Some(1),
+            cache_write_1h: Some(3),
+            reasoning: None,
+            total: 19,
+        });
+        record.import_source_id = Some("claude-cache-write-ttl".to_string());
+
+        import_usage_day_entries(
+            &mut conn,
+            "claude",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+
+        let day_entries = get_usage_entries_by_date(&conn, "2026-07-10", "claude").unwrap();
+        let month_entries = get_usage_entries_by_month(&conn, "2026-07", "claude").unwrap();
+        let year_entries = get_usage_entries_by_year(&conn, "2026", "claude").unwrap();
+        let turn_entries =
+            get_session_turns_token_stats(&conn, "claude", "claude-cache-write-ttl", None, None)
+                .unwrap();
+        let entries = [
+            &day_entries[0].0.entry,
+            &month_entries[0].0,
+            &year_entries[0].0,
+        ];
+
+        for entry in entries {
+            let tokens = entry.tokens.as_ref().unwrap();
+            assert_eq!(tokens.input, 100);
+            assert_eq!(tokens.cache_write, Some(10));
+            assert_eq!(tokens.cache_write_5m, Some(3));
+            assert_eq!(tokens.cache_write_1h, Some(7));
+
+            let delta = entry.delta_tokens.as_ref().unwrap();
+            assert_eq!(delta.input, 10);
+            assert_eq!(delta.cache_write, Some(4));
+            assert_eq!(delta.cache_write_5m, Some(1));
+            assert_eq!(delta.cache_write_1h, Some(3));
+        }
+
+        let turn = &turn_entries.get(&1).unwrap().0;
+        assert_eq!(turn.cache_write, Some(4));
+        assert_eq!(turn.cache_write_5m, Some(1));
+        assert_eq!(turn.cache_write_1h, Some(3));
+    }
+
+    #[test]
+    fn init_db_migrates_legacy_claude_cache_write_pricing_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no,
+                tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_total,
+                delta_input, delta_output, delta_cache_read, delta_cache_write, delta_total
+             ) VALUES (
+                'claude', '2026-07-10T00:00:00Z', '2026-07-10', 'legacy-claude-cache', 1,
+                110, 20, 30, 10, 160,
+                11, 2, 3, 1, 16
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no,
+                tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_total,
+                delta_input, delta_output, delta_cache_read, delta_cache_write, delta_total
+             ) VALUES (
+                'codex', '2026-07-10T00:01:00Z', '2026-07-10',
+                'legacy-misclassified-claude-cache', '/home/user/.claude/projects/session.jsonl', 1,
+                220, 40, 60, 20, 320,
+                22, 4, 6, 2, 32
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('claude:projects/session.jsonl', 100, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('codex:claude:projects/session.jsonl', 100, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![CLAUDE_CACHE_WRITE_PRICING_MIGRATION_KEY],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+        init_db(&conn).unwrap();
+
+        let migrated: (u64, u64, u64, u64, u64, u64) = conn
+            .query_row(
+                "SELECT tokens_input, tokens_cache_write_5m, tokens_cache_write_1h,
+                        delta_input, delta_cache_write_5m, delta_cache_write_1h
+                 FROM usage_entries
+                 WHERE session_id = 'legacy-claude-cache'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let claude_sync_state_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state
+                 WHERE filename LIKE 'claude:%'
+                    OR filename LIKE 'codex:claude:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let misclassified_migrated: (u64, u64, u64, u64, u64, u64) = conn
+            .query_row(
+                "SELECT tokens_input, tokens_cache_write_5m, tokens_cache_write_1h,
+                        delta_input, delta_cache_write_5m, delta_cache_write_1h
+                 FROM usage_entries
+                 WHERE session_id = 'legacy-misclassified-claude-cache'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let migration_marker_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
+                params![CLAUDE_CACHE_WRITE_PRICING_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(migrated, (100, 10, 0, 10, 1, 0));
+        assert_eq!(misclassified_migrated, (200, 20, 0, 20, 2, 0));
+        assert_eq!(claude_sync_state_count, 0);
+        assert_eq!(migration_marker_count, 1);
     }
 
     #[test]
@@ -5970,6 +8035,110 @@ mod tests {
     }
 
     #[test]
+    fn parse_codex_desktop_session_preserves_source_and_cache_write_tokens() {
+        let path = temp_jsonl_path("codex-desktop");
+        let content = r#"{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"desktop-session","session_id":"desktop-session","originator":"Codex Desktop","source":"vscode","cwd":"/tmp/project","cli_version":"0.145.0-alpha.30"}}
+{"timestamp":"2026-07-26T10:00:00.500Z","type":"session_meta","payload":{"id":"desktop-session","session_id":"desktop-session","source":"cli","cwd":"/tmp/project","cli_version":"0.145.0-alpha.30"}}
+{"timestamp":"2026-07-26T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"cache_write_input_tokens":5,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+{"timestamp":"2026-07-26T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":30,"cache_write_input_tokens":8,"output_tokens":15,"reasoning_output_tokens":7,"total_tokens":165},"model_context_window":258400}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.source_kind.as_deref() == Some(CODEX_DESKTOP_SOURCE_KIND)));
+
+        let first = entries[0].delta_tokens.as_ref().unwrap();
+        assert_eq!(first.cache_write, Some(5));
+
+        let second = entries[1].delta_tokens.as_ref().unwrap();
+        assert_eq!(second.input, 40);
+        assert_eq!(second.cache_read, Some(10));
+        assert_eq!(second.cache_write, Some(3));
+        assert_eq!(second.output, 5);
+        assert_eq!(second.reasoning, Some(3));
+        assert_eq!(second.total, 55);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_tracks_archived_and_unarchived_desktop_sessions() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-archive-sync-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir.join("sessions/2026/07/26");
+        let archived_dir = codex_dir.join("archived_sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&archived_dir).unwrap();
+        let active_path = sessions_dir.join("rollout-2026-07-26T10-00-00-desktop-session.jsonl");
+        let archived_path = archived_dir.join("rollout-2026-07-26T10-00-00-desktop-session.jsonl");
+        let content = r#"{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"desktop-session","session_id":"desktop-session","originator":"Codex Desktop","source":"vscode","cwd":"/tmp/project","cli_version":"0.145.0-alpha.30"}}
+{"timestamp":"2026-07-26T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"cache_write_input_tokens":5,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+"#;
+
+        fs::write(&active_path, content).unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let first_sync: (String, String, u64) = conn
+            .query_row(
+                "SELECT source_kind, transcript_path, tokens_cache_write
+                 FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'desktop-session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(first_sync.0, CODEX_DESKTOP_SOURCE_KIND);
+        assert_eq!(PathBuf::from(first_sync.1), active_path);
+        assert_eq!(first_sync.2, 5);
+
+        fs::rename(&active_path, &archived_path).unwrap();
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let archived_transcript: String = conn
+            .query_row(
+                "SELECT transcript_path FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'desktop-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(PathBuf::from(archived_transcript), archived_path);
+
+        fs::rename(&archived_path, &active_path).unwrap();
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let restored_transcript: String = conn
+            .query_row(
+                "SELECT transcript_path FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'desktop-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(PathBuf::from(restored_transcript), active_path);
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
     fn sync_codex_usage_logs_writes_recomputed_delta_totals() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_codex_dir = std::env::var("CODEX_DIR").ok();
@@ -6180,6 +8349,7 @@ mod tests {
             "{{\"timestamp\":\"2026-07-10T03:45:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"child-session\"}}}}\n{}",
             " ".repeat(1000)
         );
+        let empty_child_size = empty_child_content.len() as u64;
         fs::write(&child_path, empty_child_content).unwrap();
         assert_ne!(fs::metadata(&child_path).unwrap().len(), synced_child_size);
         sync_codex_usage_logs(&mut conn).unwrap();
@@ -6190,15 +8360,18 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let state_size_after_empty_parse: u64 = conn
+        let state_after_empty_parse: (u64, i64) = conn
             .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
+                "SELECT last_synced_size, last_synced_time
+                 FROM sync_state
+                 WHERE filename = ?",
                 params![child_state_key],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(preserved_child_rows, 1);
-        assert_eq!(state_size_after_empty_parse, synced_child_size);
+        assert_eq!(state_after_empty_parse.0, empty_child_size);
+        assert_eq!(state_after_empty_parse.1, CODEX_EMPTY_TRANSCRIPT_SYNC_TIME);
 
         if let Some(value) = old_codex_dir {
             std::env::set_var("CODEX_DIR", value);
@@ -6214,8 +8387,8 @@ mod tests {
 
         let content = r#"{"type":"user","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:48.190Z","uuid":"u1","message":{"role":"user","content":"Build the report"}}
 {"type":"user","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:49.190Z","uuid":"u2","message":{"role":"user","content":"Use monthly grouping"}}
-{"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"thinking","thinking":"working"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5}}}
-{"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.948Z","uuid":"a2","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5}}}
+{"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"thinking","thinking":"working"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2}}}}
+{"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.948Z","uuid":"a2","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2}}}}
 "#;
 
         fs::write(&path, content).unwrap();
@@ -6231,11 +8404,78 @@ mod tests {
         assert_eq!(entry.model.as_deref(), Some("claude-haiku-4-5-20251001"));
 
         let tokens = entry.tokens.as_ref().unwrap();
-        assert_eq!(tokens.input, 13);
+        assert_eq!(tokens.input, 10);
         assert_eq!(tokens.cache_write, Some(3));
+        assert_eq!(tokens.cache_write_5m, Some(1));
+        assert_eq!(tokens.cache_write_1h, Some(2));
         assert_eq!(tokens.cache_read, Some(7));
         assert_eq!(tokens.output, 5);
         assert_eq!(tokens.total, 25);
+    }
+
+    #[test]
+    fn parse_claude_session_file_defaults_unclassified_cache_writes_to_5m() {
+        let path = temp_jsonl_path("claude-cache-default");
+        let content = r#"{"type":"assistant","sessionId":"session-cache-default","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_claude_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        let tokens = entries[0].tokens.as_ref().unwrap();
+        assert_eq!(tokens.input, 10);
+        assert_eq!(tokens.cache_write, Some(3));
+        assert_eq!(tokens.cache_write_5m, Some(3));
+        assert_eq!(tokens.cache_write_1h, Some(0));
+        assert_eq!(tokens.total, 25);
+    }
+
+    #[test]
+    fn sync_claude_usage_logs_writes_cache_write_ttls() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_claude_dir = std::env::var("CLAUDE_DIR").ok();
+        let claude_dir = temp_jsonl_path("claude-cache-sync").with_extension("");
+        let projects_dir = claude_dir.join("projects/test-project");
+        fs::create_dir_all(&projects_dir).unwrap();
+        let session_path = projects_dir.join("session-cache-sync.jsonl");
+        let content = r#"{"type":"assistant","sessionId":"session-cache-sync","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2}}}}
+"#;
+        fs::write(&session_path, content).unwrap();
+        std::env::set_var("CLAUDE_DIR", &claude_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_claude_usage_logs(&mut conn).unwrap();
+
+        let stored: (u64, u64, u64, u64, u64, u64) = conn
+            .query_row(
+                "SELECT tokens_input, tokens_cache_write_5m, tokens_cache_write_1h,
+                        delta_input, delta_cache_write_5m, delta_cache_write_1h
+                 FROM usage_entries
+                 WHERE assistant_type = 'claude'
+                   AND session_id = 'session-cache-sync'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(stored, (10, 1, 2, 10, 1, 2));
+
+        if let Some(value) = old_claude_dir {
+            std::env::set_var("CLAUDE_DIR", value);
+        } else {
+            std::env::remove_var("CLAUDE_DIR");
+        }
+        fs::remove_dir_all(claude_dir).unwrap();
     }
 
     #[test]
@@ -6249,13 +8489,544 @@ mod tests {
 "#;
 
         fs::write(&path, content).unwrap();
-        let entries = parse_cursor_session_file(&path).unwrap();
+        let entries = parse_cursor_session_file(&path, &HashMap::new(), &HashMap::new()).unwrap();
         let _ = fs::remove_file(&path);
 
         assert_eq!(entries.len(), 2);
         assert!(entries
             .iter()
-            .all(|entry| entry.session_name.as_deref() == Some("第二條提示")));
+            .all(|entry| entry.entry.session_name.as_deref() == Some("第二條提示")));
+    }
+
+    #[test]
+    fn cursor_response_signature_matches_plain_text_agent_kv_content() {
+        let transcript_content = serde_json::json!([
+            {
+                "type": "text",
+                "text": "Plain answer"
+            }
+        ]);
+        let agent_kv_content = serde_json::json!([
+            {
+                "type": "text",
+                "data": "Plain answer",
+                "providerOptions": {
+                    "cursor": {
+                        "modelName": "composer-2.5"
+                    }
+                }
+            }
+        ]);
+
+        assert_eq!(
+            cursor_response_signature(&transcript_content),
+            cursor_response_signature(&agent_kv_content)
+        );
+    }
+
+    #[test]
+    fn cursor_response_signature_matches_agent_kv_tool_calls() {
+        let transcript_content = serde_json::json!([
+            {
+                "type": "text",
+                "text": "Running"
+            },
+            {
+                "type": "tool_use",
+                "name": "Shell",
+                "input": {
+                    "command": "echo hi",
+                    "block_until_ms": 120_000
+                }
+            }
+        ]);
+        let agent_kv_event = serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "data": "Running",
+                    "providerOptions": {
+                        "cursor": {
+                            "modelName": "composer-2.5"
+                        }
+                    }
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "Shell",
+                    "args": {
+                        "block_until_ms": 120_000,
+                        "command": "echo hi"
+                    }
+                }
+            ]
+        });
+        let raw = serde_json::to_vec(&agent_kv_event).unwrap();
+        let (signature, model) = parse_cursor_agent_kv_model_signature(&raw).unwrap();
+
+        assert_eq!(
+            Some(signature),
+            cursor_response_signature(&transcript_content)
+        );
+        assert_eq!(model, "composer-2.5");
+    }
+
+    #[test]
+    fn cursor_parser_does_not_reuse_a_previous_reply_model() {
+        let path = temp_jsonl_path("cursor-model-reset");
+        let content = r#"{"role":"user","message":{"content":"Prompt"}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"Known reply"}]}}
+{"role":"assistant","message":{"content":[{"type":"image","data":"omitted"}]}}
+"#;
+        fs::write(&path, content).unwrap();
+        let signature = cursor_response_signature(
+            &serde_json::json!([{"type": "text", "text": "Known reply"}]),
+        )
+        .unwrap();
+        let model_mappings = HashMap::from([(signature, "composer-2.5".to_string())]);
+
+        let entries = parse_cursor_session_file(&path, &model_mappings, &HashMap::new()).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].entry.model.as_deref(), Some("composer-2.5"));
+        assert!(entries[0].model_signature.is_some());
+        assert_eq!(entries[1].entry.model.as_deref(), Some("Unknown Model"));
+        assert!(entries[1].model_signature.is_none());
+    }
+
+    #[test]
+    fn cursor_session_metadata_treats_non_agent_modes_as_ide() {
+        let (_, false_overrides_agent_mode) = parse_cursor_session_metadata(
+            "composerData:false-overrides-agent",
+            br#"{
+                "composerId": "false-overrides-agent",
+                "unifiedMode": "agent",
+                "isAgentic": false
+            }"#,
+        )
+        .unwrap();
+        let (_, non_agent_mode_overrides_true) = parse_cursor_session_metadata(
+            "composerData:chat-overrides-true",
+            br#"{
+                "composerId": "chat-overrides-true",
+                "unifiedMode": "chat",
+                "isAgentic": true
+            }"#,
+        )
+        .unwrap();
+        let (_, agent_mode) = parse_cursor_session_metadata(
+            "composerData:agent",
+            br#"{
+                "composerId": "agent",
+                "unifiedMode": "agent",
+                "isAgentic": true
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(false_overrides_agent_mode.mode.as_deref(), Some("ide"));
+        assert_eq!(non_agent_mode_overrides_true.mode.as_deref(), Some("ide"));
+        assert_eq!(agent_mode.mode.as_deref(), Some("agent"));
+    }
+
+    #[test]
+    fn cursor_cache_token_migration_marks_legacy_values_unknown() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no,
+                tokens_cache_read, tokens_cache_write,
+                tokens_cache_write_5m, tokens_cache_write_1h,
+                delta_cache_read, delta_cache_write,
+                delta_cache_write_5m, delta_cache_write_1h
+             ) VALUES (
+                'cursor', '2026-07-24T00:00:00Z', '2026-07-24',
+                'cursor-cache-session', 1, 0, 0, 0, 0, 0, 0, 0, 0
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no,
+                tokens_cache_read, tokens_cache_write,
+                tokens_cache_write_5m, tokens_cache_write_1h,
+                delta_cache_read, delta_cache_write,
+                delta_cache_write_5m, delta_cache_write_1h
+             ) VALUES (
+                'cursor', '2026-07-24T00:01:00Z', '2026-07-24',
+                'cursor-cache-measured', 1, 10, 20, 30, 40, 1, 2, 3, 4
+             )",
+            [],
+        )
+        .unwrap();
+
+        run_cursor_cache_tokens_unknown_migration(&mut conn).unwrap();
+        run_cursor_cache_tokens_unknown_migration(&mut conn).unwrap();
+
+        let values: [Option<u64>; 8] = conn
+            .query_row(
+                "SELECT
+                    tokens_cache_read, tokens_cache_write,
+                    tokens_cache_write_5m, tokens_cache_write_1h,
+                    delta_cache_read, delta_cache_write,
+                    delta_cache_write_5m, delta_cache_write_1h
+                 FROM usage_entries
+                 WHERE session_id = 'cursor-cache-session'",
+                [],
+                |row| {
+                    Ok([
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ])
+                },
+            )
+            .unwrap();
+        let migration_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
+                params![CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let measured_values: [u64; 8] = conn
+            .query_row(
+                "SELECT
+                    tokens_cache_read, tokens_cache_write,
+                    tokens_cache_write_5m, tokens_cache_write_1h,
+                    delta_cache_read, delta_cache_write,
+                    delta_cache_write_5m, delta_cache_write_1h
+                 FROM usage_entries
+                 WHERE session_id = 'cursor-cache-measured'",
+                [],
+                |row| {
+                    Ok([
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ])
+                },
+            )
+            .unwrap();
+
+        assert_eq!(values, [None; 8]);
+        assert_eq!(measured_values, [10, 20, 30, 40, 1, 2, 3, 4]);
+        assert_eq!(migration_count, 1);
+    }
+
+    #[test]
+    fn cursor_sync_backfills_plain_text_model_and_rejects_ambiguous_mapping() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_state_db = std::env::var("CURSOR_STATE_DB").ok();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cursor-agent-kv-sync-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        let transcript_dir = root
+            .join("projects")
+            .join("workspace")
+            .join("agent-transcripts")
+            .join("session-model");
+        fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_path = transcript_dir.join("session-model.jsonl");
+        fs::write(
+            &transcript_path,
+            concat!(
+                "{\"role\":\"user\",\"message\":{\"content\":[",
+                "{\"type\":\"text\",\"text\":\"",
+                "<timestamp>Friday, Jul 24, 2026, 9:00 AM (UTC+8)</timestamp>",
+                "<user_query>Inspect the project</user_query>\"}]}}\n",
+                "{\"role\":\"assistant\",\"message\":{\"content\":[",
+                "{\"type\":\"text\",\"text\":\"Plain answer\"}]}}\n"
+            ),
+        )
+        .unwrap();
+
+        let state_db_path = root.join("state.vscdb");
+        let state_conn = Connection::open(&state_db_path).unwrap();
+        state_conn
+            .execute(
+                "CREATE TABLE cursorDiskKV (
+                    key TEXT UNIQUE ON CONFLICT REPLACE,
+                    value BLOB
+                )",
+                [],
+            )
+            .unwrap();
+        state_conn
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    "composerData:session-model",
+                    r#"{
+                        "composerId": "session-model",
+                        "workspaceIdentifier": {
+                            "uri": {
+                                "fsPath": "/tmp/project"
+                            }
+                        },
+                        "unifiedMode": "agent",
+                        "isAgentic": false
+                    }"#
+                ],
+            )
+            .unwrap();
+        drop(state_conn);
+        std::env::set_var("CURSOR_STATE_DB", &state_db_path);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_cursor_usage_logs(&mut conn, &root).unwrap();
+        let initial: (
+            String,
+            String,
+            String,
+            String,
+            Option<u64>,
+            Option<u64>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT model, cwd, source_kind, date,
+                        tokens_cache_read, tokens_cache_write, model_signature
+                 FROM usage_entries
+                 WHERE assistant_type = 'cursor'
+                   AND session_id = 'session-model'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        let state_conn = Connection::open(&state_db_path).unwrap();
+        state_conn
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    "agentKv:blob:plain-text-model",
+                    r#"{
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "text",
+                                "data": "Plain answer",
+                                "providerOptions": {
+                                    "cursor": {
+                                        "modelName": "composer-2.5"
+                                    }
+                                }
+                            }
+                        ]
+                    }"#
+                ],
+            )
+            .unwrap();
+        drop(state_conn);
+        sync_cursor_usage_logs(&mut conn, &root).unwrap();
+        let matched_model: String = conn
+            .query_row(
+                "SELECT model FROM usage_entries
+                 WHERE assistant_type = 'cursor'
+                   AND session_id = 'session-model'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let state_conn = Connection::open(&state_db_path).unwrap();
+        state_conn
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    "composerData:session-model",
+                    r#"{
+                        "composerId": "session-model",
+                        "unifiedMode": "agent",
+                        "isAgentic": true
+                    }"#
+                ],
+            )
+            .unwrap();
+        drop(state_conn);
+        sync_cursor_usage_logs(&mut conn, &root).unwrap();
+        let mode_only_update: (String, String) = conn
+            .query_row(
+                "SELECT cwd, source_kind
+                 FROM usage_entries
+                 WHERE assistant_type = 'cursor'
+                   AND session_id = 'session-model'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        let state_conn = Connection::open(&state_db_path).unwrap();
+        state_conn
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    "composerData:session-model",
+                    r#"{
+                        "composerId": "session-model",
+                        "workspaceIdentifier": {
+                            "uri": {
+                                "fsPath": "/tmp/updated-project"
+                            }
+                        }
+                    }"#
+                ],
+            )
+            .unwrap();
+        drop(state_conn);
+        sync_cursor_usage_logs(&mut conn, &root).unwrap();
+        let cwd_only_update: (String, String) = conn
+            .query_row(
+                "SELECT cwd, source_kind
+                 FROM usage_entries
+                 WHERE assistant_type = 'cursor'
+                   AND session_id = 'session-model'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        let state_conn = Connection::open(&state_db_path).unwrap();
+        state_conn
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    "agentKv:blob:ambiguous-plain-text-model",
+                    r#"{
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "text",
+                                "data": "Plain answer",
+                                "providerOptions": {
+                                    "cursor": {
+                                        "modelName": "cursor-grok-4.5-high-fast"
+                                    }
+                                }
+                            }
+                        ]
+                    }"#
+                ],
+            )
+            .unwrap();
+        drop(state_conn);
+        sync_cursor_usage_logs(&mut conn, &root).unwrap();
+        let (ambiguous_model, is_ambiguous): (String, bool) = conn
+            .query_row(
+                "SELECT usage.model, signatures.is_ambiguous
+                 FROM usage_entries usage
+                 JOIN cursor_model_signatures signatures
+                   ON signatures.signature = usage.model_signature
+                 WHERE usage.assistant_type = 'cursor'
+                   AND usage.session_id = 'session-model'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        let state_conn = Connection::open(&state_db_path).unwrap();
+        state_conn.execute("DELETE FROM cursorDiskKV", []).unwrap();
+        state_conn
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    "composerData:session-model",
+                    r#"{
+                        "composerId": "session-model",
+                        "workspaceIdentifier": {
+                            "uri": {
+                                "fsPath": "/tmp/replaced-project"
+                            }
+                        },
+                        "unifiedMode": "agent",
+                        "isAgentic": true
+                    }"#
+                ],
+            )
+            .unwrap();
+        drop(state_conn);
+        sync_cursor_usage_logs(&mut conn, &root).unwrap();
+        let reset_state: (String, String, String, u64) = conn
+            .query_row(
+                "SELECT usage.model, usage.cwd, usage.source_kind,
+                        (SELECT COUNT(*) FROM cursor_model_signatures)
+                 FROM usage_entries usage
+                 WHERE usage.assistant_type = 'cursor'
+                   AND usage.session_id = 'session-model'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        if let Some(value) = old_state_db {
+            std::env::set_var("CURSOR_STATE_DB", value);
+        } else {
+            std::env::remove_var("CURSOR_STATE_DB");
+        }
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(initial.0, "Unknown Model");
+        assert_eq!(initial.1, "/tmp/project");
+        assert_eq!(initial.2, CURSOR_IDE_SOURCE_KIND);
+        assert_eq!(initial.3, "2026-07-24");
+        assert_eq!(initial.4, None);
+        assert_eq!(initial.5, None);
+        assert!(initial.6.is_some());
+        assert_eq!(matched_model, "composer-2.5");
+        assert_eq!(ambiguous_model, "Unknown Model");
+        assert!(is_ambiguous);
+        assert_eq!(
+            mode_only_update,
+            (
+                "/tmp/project".to_string(),
+                CURSOR_AGENT_SOURCE_KIND.to_string()
+            )
+        );
+        assert_eq!(
+            cwd_only_update,
+            (
+                "/tmp/updated-project".to_string(),
+                CURSOR_AGENT_SOURCE_KIND.to_string()
+            )
+        );
+        assert_eq!(
+            reset_state,
+            (
+                "Unknown Model".to_string(),
+                "/tmp/replaced-project".to_string(),
+                CURSOR_AGENT_SOURCE_KIND.to_string(),
+                0
+            )
+        );
     }
 
     #[test]
@@ -6263,6 +9034,8 @@ mod tests {
         let ts = "Wednesday, Jul 8, 2026, 2:24 AM (UTC+8)";
         let parsed = parse_cursor_timestamp(ts);
         assert_eq!(parsed, "2026-07-08T02:24:00+08:00");
+        assert_eq!(cursor_date_from_timestamp(&parsed), Some("2026-07-08"));
+        assert_eq!(cursor_date_from_timestamp("unknown"), None);
     }
 
     #[test]
@@ -6364,6 +9137,175 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state_after_second_run, 1);
+    }
+
+    #[test]
+    fn codex_source_kind_migration_resets_active_and_archived_state_once() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for key in [
+            "codex:sessions/2026/07/active.jsonl",
+            r"codex:sessions\2026\07\active.jsonl",
+            "codex:archived_sessions/archived.jsonl",
+            r"codex:archived_sessions\archived.jsonl",
+            "codex:claude:legacy.jsonl",
+        ] {
+            conn.execute(
+                "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+                 VALUES (?, 10, 0)",
+                params![key],
+            )
+            .unwrap();
+        }
+
+        run_codex_source_kind_migration(&mut conn).unwrap();
+
+        let codex_transcript_states: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state
+                 WHERE filename LIKE 'codex:sessions%'
+                    OR filename LIKE 'codex:archived_sessions%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let unrelated_state: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state
+                 WHERE filename = 'codex:claude:legacy.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(codex_transcript_states, 0);
+        assert_eq!(unrelated_state, 1);
+
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('codex:archived_sessions/new.jsonl', 10, 0)",
+            [],
+        )
+        .unwrap();
+        run_codex_source_kind_migration(&mut conn).unwrap();
+        let state_after_second_run: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state
+                 WHERE filename = 'codex:archived_sessions/new.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_after_second_run, 1);
+    }
+
+    #[test]
+    fn init_db_indexes_assistant_transcript_path_lookups() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let mut index_columns = conn
+            .prepare("PRAGMA index_info('idx_assistant_transcript_path')")
+            .unwrap();
+        let columns: Vec<String> = index_columns
+            .query_map([], |row| row.get(2))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(columns, ["assistant_type", "transcript_path"]);
+
+        let mut query_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT EXISTS(
+                    SELECT 1 FROM usage_entries
+                    WHERE assistant_type = 'codex' AND transcript_path = ?
+                 )",
+            )
+            .unwrap();
+        let details: Vec<String> = query_plan
+            .query_map(["/tmp/session.jsonl"], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_assistant_transcript_path")),
+            "查詢計畫未使用 transcript 路徑索引：{details:?}"
+        );
+    }
+
+    #[test]
+    fn codex_sync_skips_unchanged_empty_transcripts() {
+        assert!(codex_transcript_needs_sync(10, None, false));
+        assert!(codex_transcript_needs_sync(10, Some((9, 0)), true));
+        assert!(codex_transcript_needs_sync(10, Some((10, 0)), false));
+        assert!(!codex_transcript_needs_sync(10, Some((10, 0)), true));
+        assert!(!codex_transcript_needs_sync(
+            10,
+            Some((10, CODEX_EMPTY_TRANSCRIPT_SYNC_TIME)),
+            false
+        ));
+    }
+
+    #[test]
+    fn windows_codex_transcript_paths_keep_original_values_for_indexed_deletion() {
+        let stored_path =
+            "C:/USERS/RUNNER/APPDATA/LOCAL/TEMP/CODEX/SESSIONS/SESSION.JSONL".to_string();
+        let current_path = r"c:\users\runner\appdata\local\temp\codex\sessions\session.jsonl";
+
+        let grouped_paths = group_codex_transcript_paths([stored_path.clone()], true);
+        let current_key = codex_transcript_path_key_for_platform(current_path, true);
+
+        assert_eq!(grouped_paths.get(&current_key), Some(&vec![stored_path]));
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_records_empty_transcript_state() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-empty-sync-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir.join("sessions/2026/07/26");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let transcript_path = sessions_dir.join("empty-session.jsonl");
+        let content = r#"{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"empty-session","session_id":"empty-session","originator":"Codex Desktop"}}"#;
+        fs::write(&transcript_path, content).unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let state_key = format!(
+            "codex:{}",
+            portable_relative_path(&codex_dir, &transcript_path)
+        );
+        let state: (u64, i64) = conn
+            .query_row(
+                "SELECT last_synced_size, last_synced_time
+                 FROM sync_state
+                 WHERE filename = ?",
+                params![state_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+
+        assert_eq!(state.0, content.len() as u64);
+        assert_eq!(state.1, CODEX_EMPTY_TRANSCRIPT_SYNC_TIME);
     }
 
     #[test]
@@ -10468,16 +13410,31 @@ mod tests {
 
         // The subagent synthetic row must resolve to K2.7 (its own model),
         // not the parent's GLM5.2-medium.
-        let child_model = get_session_model(&conn, &synthetic, Some("abcdef00")).unwrap();
+        let child_model = get_session_model(
+            &conn,
+            "copilot",
+            &synthetic,
+            Some("copilot-app"),
+            Some("abcdef00"),
+        )
+        .unwrap();
         assert_eq!(child_model.as_deref(), Some("K2.7"));
 
         // The main session must resolve to its own model.
-        let main_model = get_session_model(&conn, parent, Some("abcdef00")).unwrap();
+        let main_model = get_session_model(
+            &conn,
+            "copilot",
+            parent,
+            Some("copilot-app"),
+            Some("abcdef00"),
+        )
+        .unwrap();
         assert_eq!(main_model.as_deref(), Some("GLM5.2-medium"));
 
-        // No source_dir_key scoping still resolves the child model.
-        let unscoped = get_session_model(&conn, &synthetic, None).unwrap();
-        assert_eq!(unscoped.as_deref(), Some("K2.7"));
+        // No source_dir_key (None) means source_dir_key IS NULL — App rows
+        // are excluded, so the synthetic App session is not found.
+        let unscoped = get_session_model(&conn, "copilot", &synthetic, None, None).unwrap();
+        assert_eq!(unscoped, None);
     }
 
     /// Regression: `get_session_model` returns `None` when the session has no
@@ -10501,11 +13458,1002 @@ mod tests {
             [],
         )
         .unwrap();
-        let model = get_session_model(&conn, "no-model-sess", None).unwrap();
+        let model = get_session_model(&conn, "copilot", "no-model-sess", Some("copilot-cli"), None)
+            .unwrap();
         assert!(
             model.is_none(),
             "expected None for model-less session, got {:?}",
             model
         );
+    }
+
+    /// Regression: two Copilot App sessions with the same `session_id` but
+    /// different `source_dir_key` values must be isolated by
+    /// `get_session_assistant_and_transcript`, `get_session_cwd`,
+    /// `get_session_model`, and `get_session_turns_token_stats`.
+    #[test]
+    fn session_queries_isolate_copilot_app_by_source_dir_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "shared-app-session";
+        let dir_a = "aaaa00";
+        let dir_b = "bbbb00";
+
+        // Insert App row from directory A.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', ?, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GLM5.2-high', '/home/dirA',
+                100, 10, 110,
+                100, 10, 110
+             )",
+            params![dir_a, session_id],
+        )
+        .unwrap();
+
+        // Insert App row from directory B with same session_id.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', ?, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'K2.7-code', '/home/dirB',
+                200, 20, 220,
+                200, 20, 220
+             )",
+            params![dir_b, session_id],
+        )
+        .unwrap();
+
+        // get_session_assistant_and_transcript must return the correct
+        // source_dir_key when queried with explicit source_kind + source_dir_key.
+        let (_, _, sk_a, sdk_a, _, _) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_a),
+        )
+        .unwrap();
+        assert_eq!(sk_a, "copilot-app");
+        assert_eq!(sdk_a.as_deref(), Some(dir_a));
+
+        let (_, _, sk_b, sdk_b, _, _) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_b),
+        )
+        .unwrap();
+        assert_eq!(sk_b, "copilot-app");
+        assert_eq!(sdk_b.as_deref(), Some(dir_b));
+
+        // get_session_cwd must return the correct CWD per source_dir_key.
+        let cwd_a = get_session_cwd(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_a),
+        )
+        .unwrap();
+        assert_eq!(cwd_a.as_deref(), Some("/home/dirA"));
+        let cwd_b = get_session_cwd(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_b),
+        )
+        .unwrap();
+        assert_eq!(cwd_b.as_deref(), Some("/home/dirB"));
+
+        // get_session_model must return the correct model per source_dir_key.
+        let model_a = get_session_model(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_a),
+        )
+        .unwrap();
+        assert_eq!(model_a.as_deref(), Some("GLM5.2-high"));
+        let model_b = get_session_model(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_b),
+        )
+        .unwrap();
+        assert_eq!(model_b.as_deref(), Some("K2.7-code"));
+
+        // get_session_turns_token_stats must return the correct tokens.
+        let turns_a = get_session_turns_token_stats(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_a),
+        )
+        .unwrap();
+        let turns_b = get_session_turns_token_stats(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_b),
+        )
+        .unwrap();
+        assert_eq!(turns_a.len(), 1);
+        assert_eq!(turns_b.len(), 1);
+        assert_eq!(turns_a[&1].0.total, 110);
+        assert_eq!(turns_b[&1].0.total, 220);
+    }
+
+    /// Regression: Copilot CLI and Copilot App sessions with the same
+    /// `session_id` must be isolated. CLI rows have `source_dir_key IS NULL`,
+    /// App rows have `source_dir_key = <hex>`. Querying with `None` must
+    /// return only the CLI row, not the App row.
+    #[test]
+    fn session_queries_isolate_copilot_cli_from_app_with_same_session_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "shared-cli-app-session";
+        let dir_app = "dead00";
+
+        // CLI row (source_dir_key IS NULL).
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GPT-5.4', '/home/cli',
+                50, 5, 55,
+                50, 5, 55
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // App row (source_dir_key = hex).
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', ?, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GLM5.2-high', '/home/app',
+                100, 10, 110,
+                100, 10, 110
+             )",
+            params![dir_app, session_id],
+        )
+        .unwrap();
+
+        // Query with source_kind=copilot-cli, source_dir_key=None must find
+        // the CLI row only.
+        let (_, _, sk, _sdk, _, _) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-cli"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(sk, "copilot-cli");
+
+        // Query with source_kind=copilot-app, source_dir_key=hex must find
+        // the App row only.
+        let (_, _, sk_app, sdk_app, _, _) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_app),
+        )
+        .unwrap();
+        assert_eq!(sk_app, "copilot-app");
+        assert_eq!(sdk_app.as_deref(), Some(dir_app));
+
+        // CWD isolation: None -> CLI row; Some(dir) -> App row.
+        let cwd_cli =
+            get_session_cwd(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
+        assert_eq!(cwd_cli.as_deref(), Some("/home/cli"));
+        let cwd_app = get_session_cwd(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_app),
+        )
+        .unwrap();
+        assert_eq!(cwd_app.as_deref(), Some("/home/app"));
+
+        // Model isolation: None -> CLI model; Some(dir) -> App model.
+        let model_cli =
+            get_session_model(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
+        assert_eq!(model_cli.as_deref(), Some("GPT-5.4"));
+        let model_app = get_session_model(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_app),
+        )
+        .unwrap();
+        assert_eq!(model_app.as_deref(), Some("GLM5.2-high"));
+
+        // Turn stats isolation: None -> CLI totals; Some(dir) -> App totals.
+        let turns_cli =
+            get_session_turns_token_stats(&conn, "copilot", session_id, Some("copilot-cli"), None)
+                .unwrap();
+        let turns_app = get_session_turns_token_stats(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_app),
+        )
+        .unwrap();
+        assert_eq!(turns_cli[&1].0.total, 55);
+        assert_eq!(turns_app[&1].0.total, 110);
+    }
+
+    /// Regression: Copilot CLI and VS Code Chat rows both have a NULL
+    /// source_dir_key, so downstream session queries must also filter by
+    /// source_kind to avoid mixing their CWD, model, or turn token stats.
+    #[test]
+    fn session_queries_isolate_null_source_kinds_with_same_session_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "shared-cli-vscode-session";
+
+        for (source_kind, model, cwd, total) in [
+            ("copilot-cli", "GPT-5.4", "/home/cli", 55i64),
+            ("vscode-chat", "GPT-4.1", "/home/vscode", 110i64),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, source_dir_key, timestamp, date,
+                    session_id, turn_no, model, cwd,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total
+                 ) VALUES (
+                    'copilot', ?, NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                    ?, 1, ?, ?,
+                    ?, 5, ?,
+                    ?, 5, ?
+                 )",
+                params![
+                    source_kind,
+                    session_id,
+                    model,
+                    cwd,
+                    total - 5,
+                    total,
+                    total - 5,
+                    total,
+                ],
+            )
+            .unwrap();
+        }
+
+        // A different assistant may also reuse the same session_id; the
+        // assistant_type predicate must keep it out of Copilot queries.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'codex', 'codex-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'o3', '/home/codex',
+                28, 5, 33,
+                28, 5, 33
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        let (_, _, cli_kind, cli_dir, _, _) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-cli"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cli_kind, "copilot-cli");
+        assert_eq!(cli_dir, None);
+
+        let cli_cwd =
+            get_session_cwd(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
+        let vscode_cwd =
+            get_session_cwd(&conn, "copilot", session_id, Some("vscode-chat"), None).unwrap();
+        assert_eq!(cli_cwd.as_deref(), Some("/home/cli"));
+        assert_eq!(vscode_cwd.as_deref(), Some("/home/vscode"));
+
+        let cli_model =
+            get_session_model(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
+        let vscode_model =
+            get_session_model(&conn, "copilot", session_id, Some("vscode-chat"), None).unwrap();
+        assert_eq!(cli_model.as_deref(), Some("GPT-5.4"));
+        assert_eq!(vscode_model.as_deref(), Some("GPT-4.1"));
+
+        let cli_turns =
+            get_session_turns_token_stats(&conn, "copilot", session_id, Some("copilot-cli"), None)
+                .unwrap();
+        let vscode_turns =
+            get_session_turns_token_stats(&conn, "copilot", session_id, Some("vscode-chat"), None)
+                .unwrap();
+        assert_eq!(cli_turns[&1].0.total, 55);
+        assert_eq!(vscode_turns[&1].0.total, 110);
+
+        let codex_cwd =
+            get_session_cwd(&conn, "codex", session_id, Some("codex-cli"), None).unwrap();
+        let codex_model =
+            get_session_model(&conn, "codex", session_id, Some("codex-cli"), None).unwrap();
+        let codex_turns =
+            get_session_turns_token_stats(&conn, "codex", session_id, Some("codex-cli"), None)
+                .unwrap();
+        assert_eq!(codex_cwd.as_deref(), Some("/home/codex"));
+        assert_eq!(codex_model.as_deref(), Some("o3"));
+        assert_eq!(codex_turns[&1].0.total, 33);
+    }
+
+    /// Regression: when no source_kind or source_dir_key is provided (legacy
+    /// caller), the query must deterministically return the non-App row
+    /// (source_dir_key IS NULL), not an arbitrary row.
+    #[test]
+    fn session_queries_legacy_none_is_deterministic_and_prefers_non_app() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "ambiguous-session";
+
+        // Insert an App row first (lower turn_no to test ordering is not
+        // by insertion or turn_no).
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', 'dead00', '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GLM5.2-high', '/home/app',
+                100, 10, 110,
+                100, 10, 110
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Insert a CLI row (source_dir_key IS NULL) after the App row.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 2, 'GPT-5.4', '/home/cli',
+                50, 5, 55,
+                50, 5, 55
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Legacy query (both source_kind and source_dir_key are None) must
+        // return the CLI row because source_dir_key IS NULL is the filter.
+        let (_, _, sk, _sdk, _, _) =
+            get_session_assistant_and_transcript(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(sk, "copilot-cli");
+
+        // CWD with None must be the CLI CWD.
+        let cwd = get_session_cwd(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(cwd.as_deref(), Some("/home/cli"));
+
+        // Model with None must be the CLI model.
+        let model = get_session_model(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(model.as_deref(), Some("GPT-5.4"));
+
+        // Turn stats with None must be the CLI totals.
+        let turns =
+            get_session_turns_token_stats(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[&2].0.total, 55);
+    }
+
+    /// Regression: Copilot CLI and VS Code Chat sessions share a NULL
+    /// `source_dir_key` (they are non-App collectors) and may collide on the
+    /// same `session_id`. Querying with an explicit `source_kind` must keep
+    /// identity, CWD, model, and turn stats strictly isolated.
+    ///
+    /// Coverage:
+    /// - same `assistant_type`
+    /// - same `session_id`
+    /// - same `turn_no` (so `get_session_turns_token_stats` cannot rely on
+    ///   the turn number to distinguish sources)
+    /// - both `source_dir_key IS NULL`
+    /// - different `source_kind` / `cwd` / `model` / token counts
+    /// - explicit `source_kind` → identity, CWD, model, turn stats never
+    ///   mix between CLI and VS Code Chat.
+    #[test]
+    fn session_queries_isolate_copilot_cli_vs_vscode_chat_with_same_session_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "iso-cli-vscode-chat";
+
+        // Same assistant, same session_id, same turn_no, both source_dir_key
+        // IS NULL, different source_kind / CWD / model / token totals.
+        for (source_kind, model, cwd, total) in [
+            ("copilot-cli", "GPT-5.4", "/home/cli", 55i64),
+            ("vscode-chat", "GPT-4.1", "/home/vscode", 110i64),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, source_dir_key, timestamp, date,
+                    session_id, turn_no, model, cwd,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total
+                 ) VALUES (
+                    'copilot', ?, NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                    ?, 1, ?, ?,
+                    ?, 5, ?,
+                    ?, 5, ?
+                 )",
+                params![
+                    source_kind,
+                    session_id,
+                    model,
+                    cwd,
+                    total - 5,
+                    total,
+                    total - 5,
+                    total,
+                ],
+            )
+            .unwrap();
+        }
+
+        // Identity must select the matching source_kind and report
+        // source_dir_key as None for both.
+        let (_, _, sk_cli, sdk_cli, _, _) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-cli"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(sk_cli, "copilot-cli");
+        assert_eq!(sdk_cli, None);
+
+        let (_, _, sk_vscode, sdk_vscode, _, _) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            session_id,
+            Some("vscode-chat"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(sk_vscode, "vscode-chat");
+        assert_eq!(sdk_vscode, None);
+
+        // CWD isolation per source_kind.
+        let cwd_cli =
+            get_session_cwd(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
+        let cwd_vscode =
+            get_session_cwd(&conn, "copilot", session_id, Some("vscode-chat"), None).unwrap();
+        assert_eq!(cwd_cli.as_deref(), Some("/home/cli"));
+        assert_eq!(cwd_vscode.as_deref(), Some("/home/vscode"));
+
+        // Model isolation per source_kind.
+        let model_cli =
+            get_session_model(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
+        let model_vscode =
+            get_session_model(&conn, "copilot", session_id, Some("vscode-chat"), None).unwrap();
+        assert_eq!(model_cli.as_deref(), Some("GPT-5.4"));
+        assert_eq!(model_vscode.as_deref(), Some("GPT-4.1"));
+
+        // Turn stats isolation per source_kind. The map must contain exactly
+        // one entry per source_kind (same turn_no on both sides) and the
+        // totals must not cross-pollinate.
+        let turns_cli =
+            get_session_turns_token_stats(&conn, "copilot", session_id, Some("copilot-cli"), None)
+                .unwrap();
+        let turns_vscode =
+            get_session_turns_token_stats(&conn, "copilot", session_id, Some("vscode-chat"), None)
+                .unwrap();
+        assert_eq!(turns_cli.len(), 1);
+        assert_eq!(turns_vscode.len(), 1);
+        assert_eq!(turns_cli[&1].0.total, 55);
+        assert_eq!(turns_vscode[&1].0.total, 110);
+    }
+
+    /// Regression: different assistant types may share a `session_id` and
+    /// both have `source_dir_key IS NULL` (e.g. Copilot CLI and Codex CLI
+    /// can both use the same hex-looking id). The assistant_type predicate
+    /// must keep downstream CWD / model / turn stats isolated per assistant.
+    ///
+    /// Coverage:
+    /// - different `assistant_type`
+    /// - same `session_id`
+    /// - same `turn_no`
+    /// - both `source_dir_key IS NULL`
+    /// - different CWD / model / token totals per assistant
+    /// - downstream queries (CWD / model / turn stats) must be isolated
+    ///   by assistant_type.
+    #[test]
+    fn session_queries_isolate_cross_assistant_with_same_session_id_and_null_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "iso-cross-assistant";
+
+        // Copilot row.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GPT-5.4', '/home/copilot',
+                50, 5, 55,
+                50, 5, 55
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Codex row with the same session_id, same turn_no, both NULL key.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'codex', 'codex-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'o3', '/home/codex',
+                28, 5, 33,
+                28, 5, 33
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Downstream queries with assistant='copilot' must NOT see codex data.
+        let cwd_copilot =
+            get_session_cwd(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
+        let model_copilot =
+            get_session_model(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
+        let turns_copilot =
+            get_session_turns_token_stats(&conn, "copilot", session_id, Some("copilot-cli"), None)
+                .unwrap();
+        assert_eq!(cwd_copilot.as_deref(), Some("/home/copilot"));
+        assert_eq!(model_copilot.as_deref(), Some("GPT-5.4"));
+        assert_eq!(turns_copilot[&1].0.total, 55);
+
+        // Downstream queries with assistant='codex' must NOT see copilot data.
+        let cwd_codex =
+            get_session_cwd(&conn, "codex", session_id, Some("codex-cli"), None).unwrap();
+        let model_codex =
+            get_session_model(&conn, "codex", session_id, Some("codex-cli"), None).unwrap();
+        let turns_codex =
+            get_session_turns_token_stats(&conn, "codex", session_id, Some("codex-cli"), None)
+                .unwrap();
+        assert_eq!(cwd_codex.as_deref(), Some("/home/codex"));
+        assert_eq!(model_codex.as_deref(), Some("o3"));
+        assert_eq!(turns_codex[&1].0.total, 33);
+    }
+
+    /// Regression: the legacy `source_kind = None` fallback must pick a
+    /// deterministic source even when there are multiple non-App,
+    /// `source_dir_key IS NULL` rows for the same `(assistant, session_id,
+    /// turn_no)`. The test inserts TWO non-App NULL-key sources (Copilot
+    /// CLI and VS Code Chat) sharing the same turn number so the choice
+    /// cannot be justified by a different turn_no alone.
+    ///
+    /// Coverage:
+    /// - at least two non-App, `source_dir_key IS NULL` sources
+    /// - same `turn_no` (so the tie-break is not happening on turn_no)
+    /// - multiple `source_kind = None` calls must all pick the same source
+    /// - identity, CWD, model, and turn stats must all pick the same source
+    ///   for the same `source_kind = None` legacy call.
+    #[test]
+    fn session_queries_legacy_none_is_deterministic_with_multiple_null_key_sources() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "iso-legacy-multi-null";
+
+        // Insert two non-App, source_dir_key = NULL rows with the same
+        // turn_no=1. The deterministic tie-break must pick one consistently.
+        // Insertion order: VS Code Chat first (alphabetically later), then
+        // Copilot CLI (alphabetically earlier). With the deterministic
+        // ORDER BY (source_kind ASC), Copilot CLI must win because
+        // "copilot-cli" sorts before "vscode-chat".
+        for (source_kind, model, cwd, total) in [
+            ("vscode-chat", "GPT-4.1", "/home/vscode", 110i64),
+            ("copilot-cli", "GPT-5.4", "/home/cli", 55i64),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, source_dir_key, timestamp, date,
+                    session_id, turn_no, model, cwd,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total
+                 ) VALUES (
+                    'copilot', ?, NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                    ?, 1, ?, ?,
+                    ?, 5, ?,
+                    ?, 5, ?
+                 )",
+                params![
+                    source_kind,
+                    session_id,
+                    model,
+                    cwd,
+                    total - 5,
+                    total,
+                    total - 5,
+                    total,
+                ],
+            )
+            .unwrap();
+        }
+
+        // Helper closures so we can call each lookup many times and assert
+        // they all observe the same source row.
+        let pick_identity = || {
+            get_session_assistant_and_transcript(&conn, "copilot", session_id, None, None)
+                .map(|(_, _, sk, sdk, _, _)| (sk, sdk))
+        };
+        let pick_cwd = || get_session_cwd(&conn, "copilot", session_id, None, None);
+        let pick_model = || get_session_model(&conn, "copilot", session_id, None, None);
+        let pick_turns = || get_session_turns_token_stats(&conn, "copilot", session_id, None, None);
+
+        // All four lookups must agree on the same source row.
+        let (id_sk_1, id_sdk_1) = pick_identity().unwrap();
+        let cwd_1 = pick_cwd().unwrap();
+        let model_1 = pick_model().unwrap();
+        let turns_1 = pick_turns().unwrap();
+
+        // The tie-break is `source_kind ASC` → "copilot-cli" wins.
+        assert_eq!(id_sk_1, "copilot-cli");
+        assert_eq!(id_sdk_1, None);
+        assert_eq!(cwd_1.as_deref(), Some("/home/cli"));
+        assert_eq!(model_1.as_deref(), Some("GPT-5.4"));
+        assert_eq!(turns_1.len(), 1);
+        assert_eq!(turns_1[&1].0.total, 55);
+
+        // Calling the same legacy lookup several more times must yield the
+        // exact same result. This is the core determinism guarantee: the
+        // choice is never dependent on arbitrary row order, even with two
+        // matching non-App NULL-key sources.
+        for _ in 0..5 {
+            let (id_sk, id_sdk) = pick_identity().unwrap();
+            let cwd = pick_cwd().unwrap();
+            let model = pick_model().unwrap();
+            let turns = pick_turns().unwrap();
+
+            assert_eq!(id_sk, "copilot-cli");
+            assert_eq!(id_sdk, None);
+            assert_eq!(cwd.as_deref(), Some("/home/cli"));
+            assert_eq!(model.as_deref(), Some("GPT-5.4"));
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[&1].0.total, 55);
+        }
+    }
+
+    /// Regression: when an App row (`source_dir_key IS NOT NULL`) and a
+    /// non-App row (`source_dir_key IS NULL`) both exist for the same
+    /// `(assistant, session_id, turn_no)`, the legacy `source_kind = None`
+    /// fallback must prefer the non-App row because the WHERE clause
+    /// explicitly filters by `source_dir_key IS NULL`. The tie-break is
+    /// therefore `source_kind ASC` within the non-App NULL-key rows; the
+    /// App row is invisible to the legacy caller.
+    ///
+    /// This complements the test above by ensuring the App row never leaks
+    /// into a legacy `None` lookup even when the same turn_no exists on
+    /// both sides.
+    #[test]
+    fn session_queries_legacy_none_excludes_app_row_when_null_key_alternative_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "iso-legacy-app-vs-null";
+
+        // App row with same turn_no=1 and a different model / cwd.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', 'dead00', '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GLM5.2-high', '/home/app',
+                100, 10, 110,
+                100, 10, 110
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Non-App NULL-key row (Copilot CLI) with same turn_no=1.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GPT-5.4', '/home/cli',
+                50, 5, 55,
+                50, 5, 55
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Legacy `None` lookup must see only the CLI row, never the App row.
+        let (_, _, sk, sdk, _, _) =
+            get_session_assistant_and_transcript(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(sk, "copilot-cli");
+        assert_eq!(sdk, None);
+
+        let cwd = get_session_cwd(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(cwd.as_deref(), Some("/home/cli"));
+
+        let model = get_session_model(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(model.as_deref(), Some("GPT-5.4"));
+
+        let turns =
+            get_session_turns_token_stats(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[&1].0.total, 55);
+    }
+
+    /// Regression: when a single `session_id` carries rows from two different
+    /// non-App collectors — `copilot-cli` turn 1 and `vscode-chat` turn 2,
+    /// both with `source_dir_key IS NULL` — the legacy `source_kind = None`
+    /// fallback must NOT mix turns from different sources into a single
+    /// turn-stats map. The fallback must first resolve a single
+    /// `source_kind` (deterministically via `source_kind ASC` → `copilot-cli`)
+    /// and then return only the rows for that resolved source. Otherwise
+    /// `get_session_turns_token_stats` would return a map that contains
+    /// CLI turn 1 *and* VS Code Chat turn 2, violating the "legacy
+    /// fallback must pick a single source" contract even though the
+    /// helper would have reported the identity as CLI.
+    ///
+    /// Coverage:
+    /// - same `assistant_type` (`copilot`)
+    /// - same `session_id`
+    /// - two different `source_kind` (`copilot-cli`, `vscode-chat`)
+    /// - both `source_dir_key IS NULL`
+    /// - different `turn_no` (CLI=1, VS Code=2) — the per-turn "first row
+    ///   encountered" rule would otherwise keep BOTH turns when ordered
+    ///   by `turn_no ASC`
+    /// - different `model` / `cwd` / token totals
+    /// - legacy `source_kind = None` must report CLI as the resolved
+    ///   source for identity, CWD, model, and turn stats
+    /// - turn stats must contain only the CLI turn 1 row, never the VS
+    ///   Code Chat turn 2 row
+    #[test]
+    fn session_queries_legacy_none_picks_single_source_for_interleaved_turns() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "iso-legacy-interleaved";
+
+        // Copilot CLI turn 1 (NULL source_dir_key). Inserted first; its
+        // turn_no is the only one that should survive in the turn-stats
+        // map after the legacy fallback.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GPT-5.4', '/home/cli',
+                50, 5, 55,
+                50, 5, 55
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // VS Code Chat turn 2 (also NULL source_dir_key) for the same
+        // session_id. This row must NEVER appear in the legacy
+        // turn-stats map once the resolver has picked `copilot-cli`.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'vscode-chat', NULL, '2026-07-20T10:01:00Z', '2026-07-20',
+                ?, 2, 'GPT-4.1', '/home/vscode',
+                100, 10, 110,
+                100, 10, 110
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Identity, CWD, model all must come from the CLI source.
+        let (_, _, sk, sdk, _, _) =
+            get_session_assistant_and_transcript(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(sk, "copilot-cli");
+        assert_eq!(sdk, None);
+
+        let cwd = get_session_cwd(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(cwd.as_deref(), Some("/home/cli"));
+
+        let model = get_session_model(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(model.as_deref(), Some("GPT-5.4"));
+
+        // Turn stats must contain ONLY the CLI turn 1 row. The VS Code
+        // Chat turn 2 row must not appear in the map at all because
+        // its source_kind differs from the resolved `copilot-cli`.
+        let turns =
+            get_session_turns_token_stats(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(
+            turns.len(),
+            1,
+            "legacy turn stats must not mix turns from different sources"
+        );
+        assert!(turns.contains_key(&1), "CLI turn 1 must be present");
+        assert!(
+            !turns.contains_key(&2),
+            "VS Code Chat turn 2 must be excluded by the resolved source_kind filter"
+        );
+        assert_eq!(turns[&1].0.total, 55);
+        assert_eq!(turns[&1].1, "GPT-5.4");
+    }
+
+    /// Regression: the legacy `source_kind = None` fallback must prefer a
+    /// main agent row (`parent_session_id IS NULL`) over a subagent
+    /// synthetic row (`parent_session_id IS NOT NULL`) for the same
+    /// `(assistant_type, source_kind, source_dir_key, session_id)`, even
+    /// when the subagent row has an earlier `turn_no`. The old
+    /// `ORDER BY (parent_session_id IS NULL) ASC` actually returned
+    /// subagent rows first (because `IS NULL` evaluates to `1` while
+    /// `IS NOT NULL` evaluates to `0` and `ASC` puts `0` first), so the
+    /// subagent row would be picked even when a main row existed.
+    ///
+    /// Coverage:
+    /// - same `assistant_type`, same `session_id`, same `source_kind`,
+    ///   same `source_dir_key`
+    /// - subagent row: `parent_session_id = Some("parent-id")`,
+    ///   `turn_no = 1` (earlier turn)
+    /// - main row: `parent_session_id = NULL`, `turn_no = 2` (later turn)
+    /// - different model / cwd / token totals so the assertions can
+    ///   distinguish which row was selected
+    /// - different `turn_no` keeps the partial unique index
+    ///   `uidx_assistant_source_session_turn` happy (the index is
+    ///   `assistant_type, source_kind, session_id, turn_no`).
+    #[test]
+    fn session_queries_legacy_none_prefers_main_over_subagent_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "iso-legacy-main-vs-subagent";
+
+        // Subagent synthetic row: `parent_session_id` is set, turn_no = 1
+        // (earlier turn), with a distinct model and cwd. If the helper
+        // ever picks this row, the assertions below will fail.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, parent_session_id,
+                agent_nickname, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', 'dead00', 'parent-id',
+                'call_sub', '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'K2.7-code', '/home/subagent',
+                30, 3, 33,
+                30, 3, 33
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Main agent row: `parent_session_id` is NULL, turn_no = 2
+        // (later turn), with a distinct model and cwd. This is the row
+        // the helper MUST select.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, parent_session_id,
+                agent_nickname, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', 'dead00', NULL,
+                NULL, '2026-07-20T10:01:00Z', '2026-07-20',
+                ?, 2, 'GLM5.2-high', '/home/main',
+                100, 10, 110,
+                100, 10, 110
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Use the legacy `source_kind = None` fallback while scoping the
+        // query to the App directory. The resolver must still prefer the
+        // main row over the subagent row.
+        let (_, path, sk, sdk, parent, agent) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            session_id,
+            None,
+            Some("dead00"),
+        )
+        .unwrap();
+        assert_eq!(sk, "copilot-app");
+        assert_eq!(sdk.as_deref(), Some("dead00"));
+        assert_eq!(
+            parent, None,
+            "main row must win: parent_session_id must be NULL"
+        );
+        assert_eq!(
+            agent, None,
+            "main row must win: agent_nickname must be None"
+        );
+        // transcript_path can be NULL in this fixture; we only assert
+        // that we got *some* row back (None is acceptable here).
+        let _ = path;
+
+        // CWD must come from the main row (`/home/main`), not the
+        // subagent row (`/home/subagent`).
+        let cwd = get_session_cwd(&conn, "copilot", session_id, None, Some("dead00")).unwrap();
+        assert_eq!(cwd.as_deref(), Some("/home/main"));
+
+        // Model must come from the main row (`GLM5.2-high`), not the
+        // subagent row (`K2.7-code`).
+        let model = get_session_model(&conn, "copilot", session_id, None, Some("dead00")).unwrap();
+        assert_eq!(model.as_deref(), Some("GLM5.2-high"));
+
+        // Turn stats must contain both turns, but the per-turn first-row
+        // rule must pick the main row (`turn_no = 2`, total 110) for
+        // turn 2 and the subagent row (`turn_no = 1`, total 33) for
+        // turn 1 — the only row that exists for turn 1. The critical
+        // assertion is turn 2: it must reflect the main row's totals,
+        // not be missing because of an off-by-one ordering bug.
+        let turns =
+            get_session_turns_token_stats(&conn, "copilot", session_id, None, Some("dead00"))
+                .unwrap();
+        assert_eq!(turns.len(), 2, "must contain both turn 1 and turn 2");
+        assert_eq!(turns[&1].0.total, 33);
+        assert_eq!(turns[&1].1, "K2.7-code");
+        assert_eq!(
+            turns[&2].0.total, 110,
+            "turn 2 must come from the main row, not the subagent row"
+        );
+        assert_eq!(turns[&2].1, "GLM5.2-high");
     }
 }

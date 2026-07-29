@@ -14,11 +14,21 @@ use std::{
 
 use super::*;
 use crate::db::{self, TokenStats};
-use crate::pricing::{calculate_usage_cost, load_pricing_rules};
+use crate::pricing::load_pricing_rules;
 use crate::timeline::{
     parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
     parse_copilot_timeline_filtered, parse_cursor_timeline, parse_vscode_timeline, TimelineItem,
 };
+
+fn add_usage_to_day_summary(summary: &mut DaySummary, usage: &UsageAggregation) {
+    summary.total_tokens += usage.total_tokens;
+    summary.total_input_tokens += usage.input_tokens;
+    summary.total_output_tokens += usage.output_tokens;
+    summary.total_cache_read_tokens += usage.cache_read_tokens;
+    summary.total_cache_write_tokens += usage.cache_write_tokens;
+    summary.total_reasoning_tokens += usage.reasoning_tokens;
+    summary.total_cost_usd += usage.cost_usd;
+}
 
 fn is_safe_session_id(session_id: &str) -> bool {
     if session_id.is_empty() || session_id.len() > 128 {
@@ -80,18 +90,18 @@ fn resolve_codex_transcript_path(
     }
 
     if !path.exists() {
-        return Err("找不到該 Codex CLI 會話的本地日誌檔案。".to_string());
+        return Err("找不到該 Codex 會話的本地日誌檔案。".to_string());
     }
 
     let codex_root = codex_dir
         .canonicalize()
-        .map_err(|_| "無法存取 Codex CLI 根目錄。".to_string())?;
+        .map_err(|_| "無法存取 Codex 根目錄。".to_string())?;
     let canonical_path = path
         .canonicalize()
-        .map_err(|_| "無法解析 Codex CLI 會話日誌路徑。".to_string())?;
+        .map_err(|_| "無法解析 Codex 會話日誌路徑。".to_string())?;
 
     if !canonical_path.starts_with(codex_root) {
-        return Err("Codex CLI 會話日誌路徑不在預期目錄內。".to_string());
+        return Err("Codex 會話日誌路徑不在預期目錄內。".to_string());
     }
 
     Ok(canonical_path)
@@ -464,7 +474,7 @@ fn resolve_session_file_path(
             let path = transcript_path_db.ok_or_else(|| {
                 SessionFileErrorExt::new(
                     StatusCode::NOT_FOUND,
-                    "找不到 Codex CLI 會話日誌檔案路徑。",
+                    "找不到 Codex 會話日誌檔案路徑。".to_string(),
                 )
             })?;
             resolve_codex_transcript_path(&db::get_codex_dir(), path)
@@ -673,7 +683,8 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
         crate::paths::find_resource(&copilot_source_relative).unwrap_or(copilot_source_relative);
 
     let codex_dir = db::get_codex_dir();
-    let codex_exists = codex_dir.join("sessions").exists();
+    let codex_exists =
+        codex_dir.join("sessions").exists() || codex_dir.join("archived_sessions").exists();
 
     let claude_dir = db::get_claude_dir();
     let claude_exists = claude_dir.join("projects").exists();
@@ -722,7 +733,7 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
         },
         codex: AssistantSetupStatus {
             dir_path: codex_dir.to_string_lossy().into_owned(),
-            data_path: codex_dir.join("sessions").to_string_lossy().into_owned(),
+            data_path: codex_dir.to_string_lossy().into_owned(),
             exists: codex_exists,
             script_path: "".to_string(),
             source_script_path: "".to_string(),
@@ -860,46 +871,7 @@ pub async fn get_usage_details(
             .get(&key)
             .cloned()
             .unwrap_or_else(|| s_entries[0].clone());
-
-        let session_tokens = s_entries
-            .iter()
-            .map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0))
-            .sum::<u64>();
-        let session_input_tokens = s_entries
-            .iter()
-            .map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0))
-            .sum::<u64>();
-        let session_output_tokens = s_entries
-            .iter()
-            .map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0))
-            .sum::<u64>();
-        let session_cache_read = s_entries
-            .iter()
-            .map(|e| {
-                e.delta_tokens
-                    .as_ref()
-                    .and_then(|t| t.cache_read)
-                    .unwrap_or(0)
-            })
-            .sum::<u64>();
-        let session_cache_write = s_entries
-            .iter()
-            .map(|e| {
-                e.delta_tokens
-                    .as_ref()
-                    .and_then(|t| t.cache_write)
-                    .unwrap_or(0)
-            })
-            .sum::<u64>();
-        let session_reasoning = s_entries
-            .iter()
-            .map(|e| {
-                e.delta_tokens
-                    .as_ref()
-                    .and_then(|t| t.reasoning)
-                    .unwrap_or(0)
-            })
-            .sum::<u64>();
+        let session_usage = summarize_session_usage(&pricing_rules, s_entries);
 
         let session_duration = last_entry
             .cost
@@ -915,58 +887,13 @@ pub async fn get_usage_details(
         summary.total_duration_ms += session_duration;
         summary.total_requests += session_requests;
 
-        let total_cache_read_tokens = if session_tokens > 0 {
-            session_cache_read
-        } else {
-            last_entry
-                .tokens
-                .as_ref()
-                .and_then(|t| t.cache_read)
-                .unwrap_or(0)
-        };
-        let total_cache_write_tokens = if session_tokens > 0 {
-            session_cache_write
-        } else {
-            last_entry
-                .tokens
-                .as_ref()
-                .and_then(|t| t.cache_write)
-                .unwrap_or(0)
-        };
-        let total_reasoning_tokens = if session_tokens > 0 {
-            session_reasoning
-        } else {
-            last_entry
-                .tokens
-                .as_ref()
-                .and_then(|t| t.reasoning)
-                .unwrap_or(0)
-        };
-        let total_input_tokens = if session_tokens > 0 {
-            session_input_tokens
-        } else {
-            last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0)
-        };
-        let total_output_tokens = if session_tokens > 0 {
-            session_output_tokens
-        } else {
-            last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0)
-        };
-
-        let cost_usd = match calculate_usage_cost(
-            &pricing_rules,
-            last_entry.model.as_deref(),
-            total_input_tokens,
-            total_output_tokens,
-            total_cache_read_tokens,
-        ) {
-            Ok(v) => v,
-            Err(err) => {
-                eprintln!("⚠️ 計算成本失敗: {}", err);
-                0.0
-            }
-        };
-        summary.total_cost_usd += cost_usd;
+        let total_input_tokens = session_usage.usage.input_tokens;
+        let total_output_tokens = session_usage.usage.output_tokens;
+        let total_cache_read_tokens = session_usage.usage.cache_read_tokens;
+        let total_cache_write_tokens = session_usage.usage.cache_write_tokens;
+        let total_reasoning_tokens = session_usage.usage.reasoning_tokens;
+        let cost_usd = session_usage.usage.cost_usd;
+        add_usage_to_day_summary(&mut summary, &session_usage.usage);
 
         sessions_summary.push(SessionSummary {
             session_id: session_id.clone(),
@@ -975,15 +902,10 @@ pub async fn get_usage_details(
                 .unwrap_or_else(|| "Start Coding Session".to_string()),
             assistant_type: ast_type.clone(),
             source_kind: source_kind.clone(),
+            source_dir_key: _source_dir_key.clone(),
             cwd: last_entry.cwd.unwrap_or_default(),
-            model: last_entry
-                .model
-                .unwrap_or_else(|| "Unknown Model".to_string()),
-            total_tokens: if session_tokens > 0 {
-                session_tokens
-            } else {
-                last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0)
-            },
+            model: session_usage.display_model,
+            total_tokens: session_usage.usage.total_tokens,
             total_input_tokens,
             total_output_tokens,
             total_cache_read_tokens,
@@ -1177,8 +1099,28 @@ fn get_git_info(cwd_str: &str) -> (Option<String>, Option<String>) {
     (branch, repo)
 }
 
+/// Query parameters for the session detail API.
+/// `source_kind` and `source_dir_key` allow the client to disambiguate
+/// sessions that share the same `session_id` across different sources
+/// (e.g. Copilot CLI vs. Copilot App, or two different Copilot App
+/// directories). Both are optional for backward compatibility; when omitted
+/// the query falls back to non-App rows only.
+#[derive(Deserialize)]
+pub struct SessionDetailQuery {
+    source_kind: Option<String>,
+    source_dir_key: Option<String>,
+}
+
+/// Validates a `source_dir_key` value. The key is a hex-encoded canonical
+/// path produced by the Copilot App collector; it must only contain
+/// hex characters so it cannot be used for path injection.
+fn is_safe_source_dir_key(key: &str) -> bool {
+    !key.is_empty() && key.len() <= 512 && key.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 pub async fn get_session_details(
     Path((assistant, session_id)): Path<(String, String)>,
+    Query(query): Query<SessionDetailQuery>,
 ) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
     if !is_supported_assistant(&assistant) {
@@ -1197,12 +1139,33 @@ pub async fn get_session_details(
             .into_response();
     }
 
+    // Validate source_dir_key if provided — must be hex-only to prevent
+    // path injection. source_kind is a short identifier validated by the
+    // database query (it must match a known source_kind value).
+    if let Some(ref sdk) = query.source_dir_key {
+        if !is_safe_source_dir_key(sdk) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "非法的 source_dir_key 格式。" })),
+            )
+                .into_response();
+        }
+    }
+
     let session_info: Result<db::SessionIdentity, String> = tokio::task::spawn_blocking({
         let sid = session_id.clone();
         let assistant_name = assistant.clone();
+        let sk = query.source_kind.clone();
+        let sdk = query.source_dir_key.clone();
         move || {
             let conn = db::get_db_conn()?;
-            db::get_session_assistant_and_transcript(&conn, &assistant_name, &sid)
+            db::get_session_assistant_and_transcript(
+                &conn,
+                &assistant_name,
+                &sid,
+                sk.as_deref(),
+                sdk.as_deref(),
+            )
         }
     })
     .await
@@ -1296,15 +1259,35 @@ pub async fn get_session_details(
 
     // 3. 預先載入 SQLite 中的回合 (turn_no) 增量 token 數據
     let sid_clone = session_id.clone();
+    let assistant_clone = resolved_assistant.clone();
+    let source_kind_clone = source_kind.clone();
     let sdk_clone = source_dir_key.clone();
     let session_db_data: SessionDbData = tokio::task::spawn_blocking(move || {
         if let Ok(conn) = db::get_db_conn() {
-            let session_cwd =
-                db::get_session_cwd(&conn, &sid_clone, sdk_clone.as_deref()).unwrap_or(None);
-            let session_model =
-                db::get_session_model(&conn, &sid_clone, sdk_clone.as_deref()).unwrap_or(None);
-            let map = db::get_session_turns_token_stats(&conn, &sid_clone, sdk_clone.as_deref())
-                .unwrap_or_default();
+            let session_cwd = db::get_session_cwd(
+                &conn,
+                &assistant_clone,
+                &sid_clone,
+                Some(&source_kind_clone),
+                sdk_clone.as_deref(),
+            )
+            .unwrap_or(None);
+            let session_model = db::get_session_model(
+                &conn,
+                &assistant_clone,
+                &sid_clone,
+                Some(&source_kind_clone),
+                sdk_clone.as_deref(),
+            )
+            .unwrap_or(None);
+            let map = db::get_session_turns_token_stats(
+                &conn,
+                &assistant_clone,
+                &sid_clone,
+                Some(&source_kind_clone),
+                sdk_clone.as_deref(),
+            )
+            .unwrap_or_default();
             SessionDbData {
                 db_entries: map,
                 session_cwd,
@@ -1535,9 +1518,34 @@ pub async fn get_session_details(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pricing::PricingRule;
     use rusqlite::Connection;
     use std::collections::HashMap;
     use std::fs;
+
+    fn legacy_usage_entry(turn_no: u32, model: &str, tokens: TokenStats) -> UsageEntry {
+        UsageEntry {
+            timestamp: format!("2026-07-10T10:{turn_no:02}:00Z"),
+            session_id: "legacy-session".to_string(),
+            session_name: None,
+            transcript_path: None,
+            cwd: None,
+            version: None,
+            turn_no,
+            model: Some(model.to_string()),
+            model_id: Some(model.to_string()),
+            tokens: Some(tokens),
+            delta_tokens: None,
+            context: None,
+            cost: None,
+            source_kind: None,
+            source_dir_key: None,
+            parent_session_id: None,
+            agent_nickname: None,
+            agent_role: None,
+            reasoning_effort: None,
+        }
+    }
 
     fn user_prompt(prompt: &str, turn_no: u32) -> TimelineItem {
         TimelineItem::UserPrompt {
@@ -1790,7 +1798,14 @@ mod tests {
         .unwrap();
 
         let (_ast, _path, source_kind, _sdk, parent_id, nickname) =
-            crate::db::get_session_assistant_and_transcript(&conn, "copilot", &synthetic).unwrap();
+            crate::db::get_session_assistant_and_transcript(
+                &conn,
+                "copilot",
+                &synthetic,
+                Some("copilot-app"),
+                Some("abcdef00"),
+            )
+            .unwrap();
         assert_eq!(source_kind, "copilot-app");
         assert_eq!(parent_id.as_deref(), Some(parent));
         assert_eq!(nickname.as_deref(), Some(agent));
@@ -1812,7 +1827,14 @@ mod tests {
         )
         .unwrap();
         let (_ast, _path, _sk, _sdk, main_parent, main_nick) =
-            crate::db::get_session_assistant_and_transcript(&conn, "copilot", parent).unwrap();
+            crate::db::get_session_assistant_and_transcript(
+                &conn,
+                "copilot",
+                parent,
+                Some("copilot-app"),
+                Some("abcdef00"),
+            )
+            .unwrap();
         assert!(main_parent.is_none());
         assert!(main_nick.is_none());
     }
@@ -2059,5 +2081,69 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn day_summary_uses_last_real_cumulative_legacy_entry() {
+        let rules = [PricingRule {
+            model_name: "test-model".to_string(),
+            input_price: 1.0,
+            cache_input_price: 0.1,
+            output_price: 2.0,
+        }];
+        let entries = vec![
+            legacy_usage_entry(
+                1,
+                "test-model",
+                TokenStats {
+                    input: 100,
+                    output: 20,
+                    cache_read: Some(10),
+                    cache_write: Some(0),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: Some(5),
+                    total: 135,
+                },
+            ),
+            legacy_usage_entry(
+                2,
+                "test-model",
+                TokenStats {
+                    input: 200,
+                    output: 40,
+                    cache_read: Some(20),
+                    cache_write: Some(0),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: Some(10),
+                    total: 270,
+                },
+            ),
+            legacy_usage_entry(
+                3,
+                "<synthetic>",
+                TokenStats {
+                    input: 0,
+                    output: 0,
+                    cache_read: Some(0),
+                    cache_write: Some(0),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: Some(0),
+                    total: 0,
+                },
+            ),
+        ];
+        let session_usage = summarize_session_usage(&rules, &entries);
+        let mut summary = DaySummary::default();
+
+        add_usage_to_day_summary(&mut summary, &session_usage.usage);
+
+        assert_eq!(summary.total_tokens, 270);
+        assert_eq!(summary.total_input_tokens, 200);
+        assert_eq!(summary.total_output_tokens, 40);
+        assert_eq!(summary.total_cache_read_tokens, 20);
+        assert_eq!(summary.total_reasoning_tokens, 10);
     }
 }

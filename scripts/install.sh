@@ -8,6 +8,7 @@ default_bin_dir="${HOME}/.local/bin"
 install_dir="${TOKEN_USAGE_INSIGHTS_INSTALL_DIR:-$default_install_dir}"
 bin_dir="${TOKEN_USAGE_INSIGHTS_BIN_DIR:-$default_bin_dir}"
 port="${PORT:-3003}"
+host="${HOST:-0.0.0.0}"
 install_service=false
 
 usage() {
@@ -17,6 +18,7 @@ Usage: ./install.sh [--service]
 Environment:
   TOKEN_USAGE_INSIGHTS_INSTALL_DIR  Install directory. Default: ${default_install_dir}
   TOKEN_USAGE_INSIGHTS_BIN_DIR      Directory for the executable link. Default: ${default_bin_dir}
+  HOST                              Dashboard bind address. Default: 0.0.0.0
   PORT                              Dashboard port. Default: 3003
 
 Options:
@@ -100,6 +102,7 @@ ExecStart=${install_dir}/${app_name}
 Restart=always
 RestartSec=5
 Environment=PORT=${port}
+Environment=HOST=${host}
 
 [Install]
 WantedBy=default.target
@@ -119,6 +122,5 @@ Executable:
   ${bin_dir}/${app_name}
 
 Run:
-  PORT=${port} ${bin_dir}/${app_name}
+  HOST=${host} PORT=${port} ${bin_dir}/${app_name}
 DONE
-

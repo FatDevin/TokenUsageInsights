@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::*;
 use crate::db;
-use crate::pricing::{calculate_usage_cost, load_pricing_rules};
+use crate::pricing::load_pricing_rules;
 
 /// API 5: 獲取可用的有使用記錄月份
 pub async fn get_available_months(Path(assistant): Path<String>) -> impl IntoResponse {
@@ -117,6 +117,7 @@ pub async fn get_monthly_details(
         let mut day_output = 0;
         let mut day_reasoning = 0;
         let mut day_cache_read = 0;
+        let mut day_cache_write = 0;
         let mut day_cost_usd = 0.0;
         let mut day_sessions = HashSet::new();
 
@@ -129,102 +130,22 @@ pub async fn get_monthly_details(
                 .push(e.clone());
         }
 
-        for (sid, s_entries) in &day_sessions_map {
-            let s_tokens = s_entries
-                .iter()
-                .map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0))
-                .sum::<u64>();
-            let s_input = s_entries
-                .iter()
-                .map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0))
-                .sum::<u64>();
-            let s_output = s_entries
-                .iter()
-                .map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0))
-                .sum::<u64>();
-            let s_cache = s_entries
-                .iter()
-                .map(|e| {
-                    e.delta_tokens
-                        .as_ref()
-                        .and_then(|t| t.cache_read)
-                        .unwrap_or(0)
-                })
-                .sum::<u64>();
-            let s_reasoning = s_entries
-                .iter()
-                .map(|e| {
-                    e.delta_tokens
-                        .as_ref()
-                        .and_then(|t| t.reasoning)
-                        .unwrap_or(0)
-                })
-                .sum::<u64>();
-
-            let last_entry = session_last_entries
-                .get(sid)
-                .cloned()
-                .unwrap_or_else(|| s_entries[0].clone());
-            let final_input = if s_tokens > 0 {
-                s_input
-            } else {
-                last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0)
-            };
-            let final_output = if s_tokens > 0 {
-                s_output
-            } else {
-                last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0)
-            };
-            let final_cache = if s_tokens > 0 {
-                s_cache
-            } else {
-                last_entry
-                    .tokens
-                    .as_ref()
-                    .and_then(|t| t.cache_read)
-                    .unwrap_or(0)
-            };
-            let final_reasoning = if s_tokens > 0 {
-                s_reasoning
-            } else {
-                last_entry
-                    .tokens
-                    .as_ref()
-                    .and_then(|t| t.reasoning)
-                    .unwrap_or(0)
-            };
-            let final_total = if s_tokens > 0 {
-                s_tokens
-            } else {
-                last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0)
-            };
-
-            let cost_usd = match calculate_usage_cost(
-                &pricing_rules,
-                last_entry.model.as_deref(),
-                final_input,
-                final_output,
-                final_cache,
-            ) {
-                Ok(v) => v,
-                Err(err) => {
-                    eprintln!("⚠️ 計算成本失敗: {}", err);
-                    0.0
-                }
-            };
-
-            day_tokens += final_total;
-            day_input += final_input;
-            day_output += final_output;
-            day_cache_read += final_cache;
-            day_reasoning += final_reasoning;
-            day_cost_usd += cost_usd;
+        for s_entries in day_sessions_map.values() {
+            let session_usage = summarize_session_usage(&pricing_rules, s_entries);
+            day_tokens += session_usage.usage.total_tokens;
+            day_input += session_usage.usage.input_tokens;
+            day_output += session_usage.usage.output_tokens;
+            day_cache_read += session_usage.usage.cache_read_tokens;
+            day_cache_write += session_usage.usage.cache_write_tokens;
+            day_reasoning += session_usage.usage.reasoning_tokens;
+            day_cost_usd += session_usage.usage.cost_usd;
         }
 
         monthly_summary.total_tokens += day_tokens;
         monthly_summary.total_input_tokens += day_input;
         monthly_summary.total_output_tokens += day_output;
         monthly_summary.total_cache_read_tokens += day_cache_read;
+        monthly_summary.total_cache_write_tokens += day_cache_write;
         monthly_summary.total_reasoning_tokens += day_reasoning;
         monthly_summary.total_cost_usd += day_cost_usd;
 
@@ -252,110 +173,33 @@ pub async fn get_monthly_details(
             .get(session_id)
             .cloned()
             .unwrap_or_else(|| s_entries[0].clone());
-
-        let s_tokens = s_entries
-            .iter()
-            .map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0))
-            .sum::<u64>();
-        let s_input = s_entries
-            .iter()
-            .map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0))
-            .sum::<u64>();
-        let s_output = s_entries
-            .iter()
-            .map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0))
-            .sum::<u64>();
-        let s_cache = s_entries
-            .iter()
-            .map(|e| {
-                e.delta_tokens
-                    .as_ref()
-                    .and_then(|t| t.cache_read)
-                    .unwrap_or(0)
-            })
-            .sum::<u64>();
-        let s_reasoning = s_entries
-            .iter()
-            .map(|e| {
-                e.delta_tokens
-                    .as_ref()
-                    .and_then(|t| t.reasoning)
-                    .unwrap_or(0)
-            })
-            .sum::<u64>();
-
-        let final_input = if s_tokens > 0 {
-            s_input
-        } else {
-            last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0)
-        };
-        let final_output = if s_tokens > 0 {
-            s_output
-        } else {
-            last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0)
-        };
-        let final_cache = if s_tokens > 0 {
-            s_cache
-        } else {
-            last_entry
-                .tokens
-                .as_ref()
-                .and_then(|t| t.cache_read)
-                .unwrap_or(0)
-        };
-        let final_reasoning = if s_tokens > 0 {
-            s_reasoning
-        } else {
-            last_entry
-                .tokens
-                .as_ref()
-                .and_then(|t| t.reasoning)
-                .unwrap_or(0)
-        };
-        let final_total = if s_tokens > 0 {
-            s_tokens
-        } else {
-            last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0)
-        };
-
-        let cost_usd = match calculate_usage_cost(
-            &pricing_rules,
-            last_entry.model.as_deref(),
-            final_input,
-            final_output,
-            final_cache,
-        ) {
-            Ok(v) => v,
-            Err(err) => {
-                eprintln!("⚠️ 計算成本失敗: {}", err);
-                0.0
-            }
-        };
+        let session_usage = summarize_session_usage(&pricing_rules, s_entries);
 
         let cwd = last_entry.cwd.unwrap_or_else(|| "Unknown CWD".to_string());
         let project_stat = project_map_stats.entry(cwd).or_insert((0, 0, 0.0));
         project_stat.0 += 1;
-        project_stat.1 += final_total;
-        project_stat.2 += cost_usd;
+        project_stat.1 += session_usage.usage.total_tokens;
+        project_stat.2 += session_usage.usage.cost_usd;
 
-        let model = last_entry
-            .model
-            .unwrap_or_else(|| "Unknown Model".to_string());
-        let model_stat = model_map_stats.entry(model).or_insert((0, 0, 0, 0, 0, 0.0));
-        model_stat.0 += 1;
-        model_stat.1 += final_total;
-        model_stat.2 += final_input;
-        model_stat.3 += final_output;
-        model_stat.4 += final_cache;
-        model_stat.5 += cost_usd;
+        for model_usage in &session_usage.models {
+            let model_stat = model_map_stats
+                .entry(model_usage.model.clone())
+                .or_insert((0, 0, 0, 0, 0, 0.0));
+            model_stat.0 += 1;
+            model_stat.1 += model_usage.usage.total_tokens;
+            model_stat.2 += model_usage.usage.input_tokens;
+            model_stat.3 += model_usage.usage.output_tokens;
+            model_stat.4 += model_usage.usage.cache_read_tokens;
+            model_stat.5 += model_usage.usage.cost_usd;
+        }
 
         let agent_stat = agent_map_stats.entry(ast_type.clone()).or_default();
-        agent_stat.total_tokens += final_total;
-        agent_stat.total_input_tokens += final_input;
-        agent_stat.total_output_tokens += final_output;
-        agent_stat.total_cache_read_tokens += final_cache;
-        agent_stat.total_reasoning_tokens += final_reasoning;
-        agent_stat.total_cost_usd += cost_usd;
+        agent_stat.total_tokens += session_usage.usage.total_tokens;
+        agent_stat.total_input_tokens += session_usage.usage.input_tokens;
+        agent_stat.total_output_tokens += session_usage.usage.output_tokens;
+        agent_stat.total_cache_read_tokens += session_usage.usage.cache_read_tokens;
+        agent_stat.total_reasoning_tokens += session_usage.usage.reasoning_tokens;
+        agent_stat.total_cost_usd += session_usage.usage.cost_usd;
         agent_stat.total_sessions += 1;
     }
 
