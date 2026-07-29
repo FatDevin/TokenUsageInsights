@@ -52,6 +52,11 @@ pub struct UsageEntry {
     pub cost: Option<CostStats>,
     #[serde(default)]
     pub source_kind: Option<String>,
+    /// Source directory key (hex-encoded canonical path) for Copilot App rows.
+    /// `None` for all other collectors. Used to isolate sessions from different
+    /// COPILOT_APP_DIR values that may share the same session_id.
+    #[serde(default)]
+    pub source_dir_key: Option<String>,
 
     // Codex-specific / Extended fields
     pub parent_session_id: Option<String>,
@@ -150,6 +155,19 @@ const CODEX_DESKTOP_SOURCE_KIND: &str = "codex-desktop";
 const CODEX_OTHER_SOURCE_KIND: &str = "codex-other";
 const CODEX_EMPTY_TRANSCRIPT_SYNC_TIME: i64 = -1;
 const COPILOT_SOURCE_KIND_MIGRATION_KEY: &str = "migration:copilot_source_kind_v1";
+
+/// Source kind written for usage entries originating from the Copilot App
+/// (Tauri desktop application). Distinguishes them from `copilot-cli` and
+/// VS Code Copilot Chat sessions within the shared `copilot` assistant type.
+const COPILOT_APP_SOURCE_KIND: &str = "copilot-app";
+
+/// `sync_state.filename` key prefix storing the maximum
+/// The full cursor filename is
+/// `sync:copilot_app:cursor:<hex(canonical_source_path)>::<created_at>::<id>`.
+/// The cursor is scoped per source directory and switching
+/// `COPILOT_APP_DIR`/`COPILOT_DIR` starts a fresh cursor instead of reusing the
+/// previous directory's.
+const COPILOT_APP_CURSOR_PREFIX: &str = "sync:copilot_app:cursor:";
 const VSCODE_EMPTY_SESSION_MIGRATION_KEY: &str = "migration:vscode_empty_sessions_v1";
 const COPILOT_CACHED_INPUT_MIGRATION_KEY: &str = "migration:copilot_cached_input_v1";
 const CLAUDE_CACHE_WRITE_PRICING_MIGRATION_KEY: &str = "migration:claude_cache_write_pricing_v1";
@@ -159,6 +177,32 @@ const CURSOR_MODEL_ATTRIBUTION_MIGRATION_KEY: &str = "migration:cursor_model_att
 const CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY: &str = "migration:cursor_cache_tokens_unknown_v1";
 const CURSOR_AGENT_SOURCE_KIND: &str = "cursor-agent";
 const CURSOR_IDE_SOURCE_KIND: &str = "cursor-ide";
+
+/// Source kind written for usage entries originating from the Copilot CLI
+/// status-line hook (`~/.copilot/usage/usage-YYYY-MM-DD.jsonl`). The hook
+/// records session-cumulative totals with no `agent_id`, so subagent usage is
+/// folded into the main session. The CLI agent reconciler
+/// ([`sync_copilot_cli_agent_usage_logs`]) replaces these merged rows with
+/// per-agent split rows (same `source_kind`, distinct `import_source_id`
+/// namespace) when `session-store.db` provides per-agent attribution.
+const COPILOT_CLI_SOURCE_KIND: &str = "copilot-cli";
+
+/// `sync_state.filename` key prefix for the Copilot CLI agent reconciliation
+/// cursor. The full cursor filename is
+/// `sync:copilot_cli_agents:<hex(canonical_copilot_dir)>::<created_at>::<id>`.
+/// This namespace is intentionally separate from
+/// [`COPILOT_APP_CURSOR_PREFIX`] so CLI reconciliation and the Copilot App
+/// collector advance independently and never overwrite each other's
+/// high-water mark. Scoped by the canonical Copilot directory so switching
+/// `COPILOT_DIR` starts a fresh cursor.
+const COPILOT_CLI_AGENT_CURSOR_PREFIX: &str = "sync:copilot_cli_agents:";
+
+/// Versioned migration key recording that the first CLI agent reconciliation
+/// backfill has completed. The migration scans every CLI-classified session
+/// (transcript at `session-state/<id>/events.jsonl`) and replaces its merged
+/// `copilot-cli` hook rows with per-agent split rows. Idempotent and safe to
+/// retry; only affects `copilot-cli` rows, never `copilot-app` or others.
+const COPILOT_CLI_AGENT_MIGRATION_KEY: &str = "migration:copilot_cli_agent_split_v1";
 
 #[derive(Default)]
 enum InitialUserPromptState {
@@ -503,6 +547,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             duration_ms INTEGER,
             premium_requests INTEGER,
             source_kind TEXT NOT NULL DEFAULT 'legacy',
+            usage_identity TEXT NOT NULL DEFAULT '',
 
             -- Codex-specific fields
             parent_session_id TEXT,
@@ -555,22 +600,104 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE usage_entries ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'legacy'",
         [],
     );
+    // source_dir_key isolates Copilot App rows by source directory so that
+    // identical (session_id, turn_no) from different COPILOT_APP_DIR values
+    // do not REPLACE each other via the unique index. NULL for all other
+    // collectors.
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN source_dir_key TEXT",
+        [],
+    );
+    // Most collectors write one row per (assistant, source, session, turn)
+    // and keep the default empty identity. Collectors that legitimately emit
+    // multiple rows for the same turn, such as Copilot per-model attribution,
+    // provide a stable non-empty identity so each row remains independently
+    // upsertable without weakening uniqueness for existing collectors.
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN usage_identity TEXT NOT NULL DEFAULT ''",
+        [],
+    );
     let _ = conn.execute(
         "ALTER TABLE usage_entries ADD COLUMN model_signature TEXT",
         [],
     );
 
-    // Include the original source in the identity so VS Code and Copilot CLI
-    // records can be aggregated without colliding on a reused session id.
+    // Migration: delete legacy copilot-app rows that predate source_dir_key.
+    // These rows have source_kind = 'copilot-app', source_dir_key IS NULL, and
+    // the old import_source_id format (copilot-app:<session>:<turn>, without
+    // the hex source key segment). They cannot be attributed to a specific
+    // source directory, so they must be removed to avoid double-counting when
+    // the new collector re-syncs the same turns from the actual directory.
+    let legacy_deleted: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM usage_entries
+             WHERE source_kind = 'copilot-app'
+               AND source_dir_key IS NULL
+               AND import_source_id LIKE 'copilot-app:%:%'
+               AND import_source_id NOT LIKE 'copilot-app:%:%:%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if legacy_deleted > 0 {
+        let _ = conn.execute(
+            "DELETE FROM usage_entries
+             WHERE source_kind = 'copilot-app'
+               AND source_dir_key IS NULL
+               AND import_source_id LIKE 'copilot-app:%:%'
+               AND import_source_id NOT LIKE 'copilot-app:%:%:%'",
+            [],
+        );
+        println!(
+            "✅ 遷移：清除 {} 筆舊版 Copilot App 資料（無 source_dir_key）",
+            legacy_deleted
+        );
+    }
+
+    // Use two partial unique indexes to preserve original uniqueness semantics
+    // for non-copilot-app collectors while isolating copilot-app rows by source
+    // directory. A single nullable-column index would treat NULLs as distinct,
+    // breaking uniqueness for codex/claude/cursor/copilot-cli/vscode.
     let _ = conn.execute("DROP INDEX IF EXISTS uidx_assistant_session_turn", []);
+    let _ = conn.execute(
+        "DROP INDEX IF EXISTS uidx_assistant_source_session_turn",
+        [],
+    );
+    let _ = conn.execute(
+        "DROP INDEX IF EXISTS uidx_assistant_source_dir_session_turn",
+        [],
+    );
+
+    // Partial index for collectors without source_dir_key (NULL): preserves
+    // the original uniqueness because existing collectors use the default
+    // empty usage_identity, while explicitly keyed collectors may retain
+    // multiple independently upsertable rows for one logical turn.
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_source_session_turn
-         ON usage_entries(assistant_type, source_kind, session_id, turn_no)",
+         ON usage_entries(assistant_type, source_kind, session_id, turn_no, usage_identity)
+         WHERE source_dir_key IS NULL",
         [],
     )
     .map_err(|e| {
         format!(
             "建立唯一索引 uidx_assistant_source_session_turn 失敗: {}",
+            e
+        )
+    })?;
+
+    // Partial index for copilot-app rows (source_dir_key IS NOT NULL): includes
+    // source_dir_key so different COPILOT_APP_DIR values are isolated.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_source_dir_session_turn
+         ON usage_entries(
+            assistant_type, source_kind, source_dir_key, session_id, turn_no, usage_identity
+         )
+         WHERE source_dir_key IS NOT NULL",
+        [],
+    )
+    .map_err(|e| {
+        format!(
+            "建立唯一索引 uidx_assistant_source_dir_session_turn 失敗: {}",
             e
         )
     })?;
@@ -1066,7 +1193,7 @@ fn sync_hook_usage_logs(
 
     let entries = fs::read_dir(usage_dir).map_err(|e| format!("無法讀取 usage 目錄: {}", e))?;
     let source_kind = if assistant_type == "copilot" {
-        "copilot-cli"
+        COPILOT_CLI_SOURCE_KIND
     } else {
         "legacy"
     };
@@ -1752,6 +1879,7 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
             context,
             cost: None,
             source_kind: Some(source_kind.clone()),
+            source_dir_key: None,
             parent_session_id: parent_session_id.clone(),
             agent_nickname: agent_nickname.clone(),
             agent_role: agent_role.clone(),
@@ -1844,6 +1972,1476 @@ fn portable_relative_path(root: &Path, path: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Sync token usage from the Copilot App (Tauri desktop application).
+///
+/// The Copilot App writes per-API-call usage into `~/.copilot/session-store.db`
+/// (`assistant_usage_events`) and per-session aggregates into `~/.copilot/data.db`
+/// (`sessions`). This collector groups API calls by `(session_id, turn_index)`
+/// into per-turn `UsageEntry` rows with `source_kind = "copilot-app"`, and
+/// deduplicates via the `import_source_id` unique index
+/// (`copilot-app:<session_id>:<turn_index>`).
+///
+/// Incremental sync is tracked by storing the maximum `(created_at, id)` seen
+/// in `sync_state`, scoped by the canonical source directory so switching
+/// `COPILOT_APP_DIR`/`COPILOT_DIR` starts a fresh cursor.
+///
+/// Because `assistant_usage_events` records per-API-call usage (not cumulative
+/// session totals), `delta_*` columns are set equal to the per-turn SUM; no
+/// differencing against a previous turn is performed. To handle turns that
+/// receive additional API calls after the first sync, affected turns are
+/// re-aggregated from the full event history (not just `created_at > cursor`)
+/// and upserted via `INSERT OR REPLACE` keyed on `import_source_id`.
+fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
+    let app_dir = crate::paths::copilot_app_dir();
+    let session_store_path = app_dir.join("session-store.db");
+
+    // Canonicalize the source directory so the cursor is stable across trailing
+    // slashes / symlinks and isolated per COPILOT_APP_DIR / COPILOT_DIR value.
+    // Hex-encode the canonical path's raw OS-encoded bytes so the cursor key is
+    // injective (no two distinct paths map to the same key) and free of LIKE
+    // wildcard characters (`%`, `_`). Encoding raw bytes (not lossy UTF-8) avoids
+    // collisions from Unicode replacement chars and from `\\` vs `/` normalization.
+    let canonical_app_dir = app_dir.canonicalize().unwrap_or_else(|_| app_dir.clone());
+    let source_key = encode_hex(canonical_app_dir.as_os_str().as_encoded_bytes());
+    let cursor_key_prefix = format!("{}{}::", COPILOT_APP_CURSOR_PREFIX, source_key);
+
+    // `data.db.sessions` is the authoritative registry for Copilot App
+    // sessions. The session-store is shared with Copilot CLI, so without a
+    // validated registry it is unsafe to classify any usage event as App.
+    let data_db_path = app_dir.join("data.db");
+    if !data_db_path.exists() {
+        eprintln!(
+            "⚠️ Copilot App 同步跳過：找不到 data.db ({})",
+            data_db_path.display()
+        );
+        return Ok(());
+    }
+    let data_db = match Connection::open_with_flags(
+        &data_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "⚠️ Copilot App 同步跳過：無法開啟 data.db ({}): {}",
+                data_db_path.display(),
+                e
+            );
+            return Ok(());
+        }
+    };
+    let _ = data_db.busy_timeout(std::time::Duration::from_secs(2));
+
+    let sessions_table_exists: bool = data_db
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !sessions_table_exists {
+        eprintln!(
+            "⚠️ Copilot App 同步跳過：data.db 缺少 sessions table ({})",
+            data_db_path.display()
+        );
+        return Ok(());
+    }
+
+    let app_session_ids_result: rusqlite::Result<HashSet<String>> = (|| {
+        let mut stmt = data_db.prepare("SELECT id FROM sessions")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    })();
+    let app_session_ids: HashSet<String> = match app_session_ids_result {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!(
+                "⚠️ Copilot App 同步跳過：讀取 data.db.sessions 失敗 ({}): {}",
+                data_db_path.display(),
+                e
+            );
+            return Ok(());
+        }
+    };
+
+    let existing_app_session_ids = query_copilot_app_session_ids(conn, &source_key)?;
+    let reconciliation_session_ids: Vec<String> = app_session_ids
+        .difference(&existing_app_session_ids)
+        .cloned()
+        .collect();
+    let stale_app_session_ids: Vec<String> = existing_app_session_ids
+        .difference(&app_session_ids)
+        .cloned()
+        .collect();
+
+    if !session_store_path.exists() {
+        cleanup_stale_copilot_app_rows(conn, &source_key, &stale_app_session_ids)?;
+        return Ok(());
+    }
+
+    // Open the Copilot App session-store in read-only mode with a busy timeout
+    // so concurrent writes from the app do not block us.
+    let session_store = match Connection::open_with_flags(
+        &session_store_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "⚠️ 無法開啟 Copilot App session-store.db ({}): {}",
+                session_store_path.display(),
+                e
+            );
+            cleanup_stale_copilot_app_rows(conn, &source_key, &stale_app_session_ids)?;
+            return Ok(());
+        }
+    };
+    let _ = session_store.busy_timeout(std::time::Duration::from_secs(2));
+
+    // Confirm the expected table exists; older or future schemas may differ.
+    let table_exists: bool = session_store
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='assistant_usage_events'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !table_exists {
+        cleanup_stale_copilot_app_rows(conn, &source_key, &stale_app_session_ids)?;
+        return Ok(());
+    }
+
+    // Load last sync cursor (scoped by canonical source path). New cursors
+    // store `created_at` and the INTEGER event id. A legacy timestamp-only
+    // cursor is read as `(timestamp, i64::MIN)` so all events at that
+    // timestamp are safely re-processed once before it is upgraded.
+    let stored_cursor: Option<String> = conn
+        .query_row(
+            "SELECT filename FROM sync_state WHERE filename LIKE ? ESCAPE '\\' LIMIT 1",
+            params![format!("{}%", cursor_key_prefix)],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|f| f.strip_prefix(&cursor_key_prefix).map(|s| s.to_string()));
+    let (last_cursor, legacy_cursor) = stored_cursor
+        .map(|suffix| parse_copilot_app_cursor(&suffix))
+        .unwrap_or((None, false));
+
+    // Scan new events in stable high-water-mark order. The legacy path uses
+    // the same strict tuple predicate, with the minimum INTEGER id as its
+    // one-time compatibility baseline.
+    let touched_query = if last_cursor.is_some() {
+        "SELECT session_id, turn_index, created_at, id
+         FROM assistant_usage_events
+         WHERE created_at > ?
+            OR (created_at = ? AND id > ?)
+         ORDER BY created_at ASC, id ASC"
+    } else {
+        "SELECT session_id, turn_index, created_at, id
+         FROM assistant_usage_events
+         ORDER BY created_at ASC, id ASC"
+    };
+
+    let mut touched_stmt = session_store
+        .prepare(touched_query)
+        .map_err(|e| format!("準備 Copilot App touched-turns 查詢失敗: {}", e))?;
+    let map_touched = |row: &rusqlite::Row| -> rusqlite::Result<(String, i64, String, i64)> {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    };
+    let touched_iter = if let Some(ref cursor) = last_cursor {
+        touched_stmt
+            .query_map(
+                params![cursor.0.as_str(), cursor.0.as_str(), cursor.1],
+                map_touched,
+            )
+            .map_err(|e| format!("執行 Copilot App touched-turns 查詢失敗: {}", e))?
+    } else {
+        touched_stmt
+            .query_map([], map_touched)
+            .map_err(|e| format!("執行 Copilot App touched-turns 查詢失敗: {}", e))?
+    };
+
+    // Deduplicate touched turns while preserving the stable event order, and
+    // retain the final event tuple as the source high-water mark.
+    let mut touched_turns: Vec<(String, i64)> = Vec::new();
+    let mut touched_set: HashSet<(String, i64)> = HashSet::new();
+    let mut max_event_cursor: Option<(String, i64)> = None;
+    let mut scan_failed = false;
+    for row_res in touched_iter {
+        match row_res {
+            Ok((session_id, turn_index, created_at, id)) => {
+                max_event_cursor = Some((created_at, id));
+                if matches!(
+                    classify_copilot_app_session(&app_dir, &app_session_ids, &session_id),
+                    CopilotAppSessionKind::App
+                ) && touched_set.insert((session_id.clone(), turn_index))
+                {
+                    touched_turns.push((session_id, turn_index));
+                }
+            }
+            Err(e) => {
+                eprintln!("⚠️ 讀取 Copilot App touched-turn 失敗: {}", e);
+                scan_failed = true;
+            }
+        }
+    }
+
+    if scan_failed {
+        return Ok(());
+    }
+
+    // Upgrade a legacy timestamp-only cursor even when there are no events
+    // after it. The maximum id at the legacy timestamp is the safest tuple
+    // boundary and prevents the old timestamp from causing repeated scans.
+    // Add all turns for registry sessions which do not yet have an App row.
+    // This is the history-based reconciliation path for events whose cursor
+    // was already advanced before data.db.sessions contained the session.
+    if !reconciliation_session_ids.is_empty() {
+        let mut reconciliation_stmt = session_store
+            .prepare(
+                "SELECT DISTINCT session_id, turn_index
+                 FROM assistant_usage_events
+                 WHERE session_id = ?
+                 ORDER BY turn_index ASC",
+            )
+            .map_err(|e| format!("準備 Copilot App reconciliation 查詢失敗: {}", e))?;
+        for session_id in &reconciliation_session_ids {
+            let rows = reconciliation_stmt
+                .query_map(params![session_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(|e| format!("執行 Copilot App reconciliation 查詢失敗: {}", e))?;
+            for row in rows {
+                let turn =
+                    row.map_err(|e| format!("讀取 Copilot App reconciliation turn 失敗: {}", e))?;
+                if touched_set.insert(turn.clone()) {
+                    touched_turns.push(turn);
+                }
+            }
+        }
+    }
+
+    if touched_turns.is_empty() && stale_app_session_ids.is_empty() {
+        if legacy_cursor {
+            let legacy_timestamp = last_cursor
+                .as_ref()
+                .map(|cursor| cursor.0.as_str())
+                .ok_or_else(|| "Copilot App legacy cursor 遺失 timestamp".to_string())?;
+            let max_id: Option<i64> = session_store
+                .query_row(
+                    "SELECT MAX(id) FROM assistant_usage_events WHERE created_at = ?",
+                    params![legacy_timestamp],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("讀取 Copilot App legacy cursor id 失敗: {}", e))?;
+            let tx = conn.transaction().map_err(|e| {
+                format!("開啟 Copilot App cursor migration transaction 失敗: {}", e)
+            })?;
+            write_copilot_app_cursor(
+                &tx,
+                &cursor_key_prefix,
+                legacy_timestamp,
+                max_id.unwrap_or(0),
+            )?;
+            tx.commit()
+                .map_err(|e| format!("Copilot App cursor migration COMMIT 失敗: {}", e))?;
+        }
+        if max_event_cursor.is_none() {
+            return Ok(());
+        }
+    }
+
+    // Re-aggregate each touched turn from the FULL event history for that
+    // (session_id, turn_index), regardless of cursor. This guarantees that
+    // turns which straddle the cursor boundary are written with their complete
+    // token totals rather than only the post-cursor subset.
+    //
+    // Subagents (non-null `agent_id`) share the main session's `session_id` and
+    // `turn_index` but use a different model, so the aggregation key is
+    // (session_id, turn_index, agent_id, model). `agent_id IS NULL` identifies
+    // the main agent; a non-null `agent_id` identifies a subagent. Grouping by
+    // both keeps the main agent and each subagent as separate usage rows so
+    // their token totals are not merged and the subagent model is preserved.
+    //
+    // `assistant_usage_events.input_tokens` already INCLUDES cache reads
+    // (cache retrievals are a subset of the input the model processed). To
+    // avoid double-counting cache-read tokens in both `tokens_input` and
+    // `tokens_cache_read` (and again in `tokens_total` / pricing), we store
+    // the net non-cached input as `tokens_input = SUM(input_tokens) -
+    // SUM(cache_read_tokens)`, mirroring the Copilot CLI normalization
+    // (`separate_copilot_cli_cached_input`). `tokens_cache_read` keeps the
+    // raw cache-read total; `tokens_total` sums net input + output +
+    // cache_read + cache_write + reasoning, so cache read is counted once.
+    let aggregate_query = "SELECT MIN(created_at) AS ts,
+                SUM(input_tokens), SUM(output_tokens),
+                SUM(cache_read_tokens), SUM(cache_write_tokens),
+                SUM(reasoning_tokens), SUM(duration_ms),
+                model, MIN(reasoning_effort), agent_id, MIN(initiator)
+         FROM assistant_usage_events
+         WHERE session_id = ? AND turn_index = ?
+         GROUP BY session_id, turn_index, agent_id, model";
+
+    let mut agg_stmt = session_store
+        .prepare(aggregate_query)
+        .map_err(|e| format!("準備 Copilot App 聚合查詢失敗: {}", e))?;
+
+    let mut turn_rows: Vec<CopilotAppTurnRow> = Vec::new();
+    for (session_id, turn_index) in &touched_turns {
+        let rows_res = agg_stmt
+            .query_map(params![session_id, turn_index], |row| {
+                let raw_input: i64 = row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(0);
+                let cache_read: i64 = row.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0);
+                // Net non-cached input; clamp at 0 in case of schema drift.
+                let net_input = (raw_input - cache_read).max(0) as u64;
+                Ok(CopilotAppTurnRow {
+                    session_id: session_id.clone(),
+                    turn_index: *turn_index,
+                    ts: row.get::<_, String>(0)?,
+                    input_tokens: net_input,
+                    output_tokens: row.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0) as u64,
+                    cache_read: cache_read as u64,
+                    cache_write: row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u64,
+                    reasoning: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as u64,
+                    duration_ms: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0) as u64,
+                    model: row.get::<_, Option<String>>(7)?,
+                    reasoning_effort: row.get::<_, Option<String>>(8)?,
+                    agent_id: row.get::<_, Option<String>>(9)?,
+                    initiator: row.get::<_, Option<String>>(10)?,
+                })
+            })
+            .map_err(|e| format!("執行 Copilot App 聚合查詢失敗: {}", e));
+        match rows_res {
+            Ok(rows) => {
+                for row in rows {
+                    match row {
+                        Ok(r) => turn_rows.push(r),
+                        Err(e) => {
+                            eprintln!(
+                                "⚠️ 讀取 Copilot App 聚合結果 (session {} turn {}) 失敗: {}",
+                                session_id, turn_index, e
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "⚠️ 聚合 Copilot App turn (session {} turn {}) 失敗: {}",
+                    session_id, turn_index, e
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    if turn_rows.is_empty() && stale_app_session_ids.is_empty() && max_event_cursor.is_none() {
+        return Ok(());
+    }
+
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("開啟 Copilot App transaction 失敗: {}", e))?;
+
+    // Cache session title/workspace lookups.
+    let mut session_meta_cache: HashMap<String, CopilotAppSessionMeta> = HashMap::new();
+
+    let mut upserted = 0usize;
+    let deleted = delete_stale_copilot_app_rows(&tx, &source_key, &stale_app_session_ids)?;
+
+    // Reconcile legacy merged Copilot App rows: the old collector aggregated
+    // by (session_id, turn_index) and used `MIN(model)`, producing a single row
+    // per turn with a 3-segment `import_source_id`
+    // (`copilot-app:<source_key>:<session_id>:<turn_index>`) that merged
+    // main-agent and subagent events. The new collector writes one 4-segment
+    // row per (session_id, turn_index, agent_id, model) group. Delete the
+    // legacy 3-segment rows for sessions being synced so the new split rows
+    // replace them instead of coexisting and causing double-counting. Only
+    // rows with this source_kind and a non-null source_dir_key are affected;
+    // CLI/VS Code rows never match.
+    let touched_session_ids: HashSet<&String> = turn_rows.iter().map(|r| &r.session_id).collect();
+    let mut legacy_cleaned = 0usize;
+    for session_id in &touched_session_ids {
+        legacy_cleaned += tx
+            .execute(
+                "DELETE FROM usage_entries
+                 WHERE source_kind = ?
+                   AND source_dir_key = ?
+                   AND session_id = ?
+                   AND import_source_id LIKE 'copilot-app:%:%:%'
+                   AND import_source_id NOT LIKE 'copilot-app:%:%:%:%'",
+                params![COPILOT_APP_SOURCE_KIND, source_key, session_id],
+            )
+            .map_err(|e| format!("清除舊版合併 Copilot App 資料失敗: {}", e))?;
+    }
+    if legacy_cleaned > 0 {
+        println!(
+            "✅ Copilot App reconciliation：清除 {} 筆舊版合併資料（主從 Agent 未分列）",
+            legacy_cleaned
+        );
+    }
+
+    for row in turn_rows {
+        // Resolve session metadata (title + cwd) from the original session.
+        let meta = session_meta_cache
+            .entry(row.session_id.clone())
+            .or_insert_with(|| resolve_copilot_app_session_meta(&data_db, &row.session_id))
+            .clone();
+
+        // Normalize timestamp: Copilot App uses `YYYY-MM-DD HH:MM:SS` UTC.
+        // Convert to ISO 8601 with `Z` to match other collectors.
+        let timestamp = normalize_copilot_app_timestamp(&row.ts);
+        let date_str = timestamp.get(..10).unwrap_or(&row.ts).to_string();
+        let turn_no = (row.turn_index.max(0) + 1) as u32;
+
+        // tokens_total counts cache_read once (as its own component), since
+        // tokens_input has already been normalized to the non-cached portion.
+        let total =
+            row.input_tokens + row.output_tokens + row.cache_read + row.cache_write + row.reasoning;
+
+        // Delta tokens: the source records per-API-call usage (not cumulative
+        // session totals), so the per-turn SUM already represents the delta for
+        // this turn. Set delta_* equal to the per-turn totals directly; do NOT
+        // subtract the previous turn's totals.
+        let delta_input = row.input_tokens;
+        let delta_output = row.output_tokens;
+        let delta_cache_read = row.cache_read;
+        let delta_cache_write = row.cache_write;
+        let delta_reasoning = row.reasoning;
+        let delta_total = total;
+
+        // Subagents share the main session's `session_id` and `turn_index`
+        // but use a different model and a non-null `agent_id`. To keep them as
+        // distinct usage rows (the daily handler and UI tree key sessions by
+        // `session_id`), subagents get a synthetic session id
+        // `<session_id>__<agent_id>` and `parent_session_id = <session_id>` so
+        // the existing UI tree renders them under the main session. The `__`
+        // separator keeps the synthetic id within the `is_safe_session_id`
+        // charset. The main agent keeps its original session id.
+        let (row_session_id, parent_session_id, agent_nickname, agent_id_segment, agent_role) =
+            match &row.agent_id {
+                Some(agent) if !agent.is_empty() => {
+                    let synthetic = format!("{}__{}", row.session_id, agent);
+                    let segment = agent.clone();
+                    // Only surface agent_role when the source explicitly marked
+                    // the agent as a sub-agent; never guess. Any other
+                    // initiator value (including NULL) leaves agent_role NULL.
+                    let role = if row.initiator.as_deref() == Some("sub-agent") {
+                        Some("sub-agent".to_string())
+                    } else {
+                        None
+                    };
+                    (
+                        synthetic,
+                        Some(row.session_id.clone()),
+                        Some(agent.clone()),
+                        segment,
+                        role,
+                    )
+                }
+                _ => (row.session_id.clone(), None, None, "main".to_string(), None),
+            };
+
+        // Build a session name for subagents that surfaces their agent id.
+        let session_name = match (&row.agent_id, &meta.title) {
+            (Some(agent), Some(title)) if !agent.is_empty() => {
+                Some(format!("{} (subagent {})", title, agent))
+            }
+            (Some(agent), None) if !agent.is_empty() => Some(format!("Subagent {}", agent)),
+            _ => meta.title.clone(),
+        };
+
+        // Include the source directory key and an agent segment in
+        // import_source_id so turns from different COPILOT_APP_DIR and from
+        // different agents (main vs subagent) with the same (session_id,
+        // turn_index) do not upsert-overwrite each other.
+        let model_identity = encode_hex(row.model.as_deref().unwrap_or("").as_bytes());
+        let usage_identity = format!(
+            "agent={};model={}",
+            encode_hex(agent_id_segment.as_bytes()),
+            model_identity
+        );
+        let import_source_id = format!(
+            "copilot-app:{}:{}:{}:{}:{}",
+            source_key, row.session_id, row.turn_index, agent_id_segment, model_identity
+        );
+
+        // Rows written by the original collector predate usage_identity and
+        // may have merged several models into the default identity. Remove
+        // only the matching logical agent/turn row before inserting the
+        // independently keyed model rows; untouched turns remain intact.
+        tx.execute(
+            "DELETE FROM usage_entries
+             WHERE assistant_type = 'copilot'
+               AND source_kind = ?
+               AND source_dir_key = ?
+               AND session_id = ?
+               AND turn_no = ?
+               AND usage_identity = ''",
+            params![
+                COPILOT_APP_SOURCE_KIND,
+                source_key,
+                row_session_id,
+                turn_no as i64
+            ],
+        )
+        .map_err(|e| format!("清除舊版 Copilot App 單列模型資料失敗: {}", e))?;
+
+        // Use INSERT OR REPLACE so turns that received additional API calls
+        // after the first sync are updated with the complete re-aggregated
+        // totals instead of being silently dropped by INSERT OR IGNORE.
+        // source_dir_key isolates rows by source directory in the unique index.
+        let insert_res = tx.execute(
+            "INSERT OR REPLACE INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, usage_identity, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
+                delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                duration_ms, premium_requests, import_source_id, reasoning_effort,
+                parent_session_id, agent_nickname, agent_role
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)",
+            params![
+                "copilot",
+                COPILOT_APP_SOURCE_KIND,
+                source_key,
+                usage_identity,
+                timestamp,
+                date_str,
+                row_session_id,
+                session_name,
+                meta.cwd,
+                turn_no as i64,
+                row.model,
+                row.model,
+                row.input_tokens as i64,
+                row.output_tokens as i64,
+                row.cache_read as i64,
+                row.cache_write as i64,
+                row.reasoning as i64,
+                total as i64,
+                delta_input as i64,
+                delta_output as i64,
+                delta_cache_read as i64,
+                delta_cache_write as i64,
+                delta_reasoning as i64,
+                delta_total as i64,
+                row.duration_ms as i64,
+                import_source_id,
+                row.reasoning_effort,
+                parent_session_id,
+                agent_nickname,
+                // `agent_role` reuses `initiator` semantics: only
+                // `initiator = 'sub-agent'` produces `agent_role = 'sub-agent'`
+                // for subagent rows; any other initiator (or the main agent)
+                // leaves agent_role NULL so the frontend Subagent badge is the
+                // sole role marker and never duplicates.
+                agent_role,
+            ],
+        );
+
+        match insert_res {
+            Ok(_) => upserted += 1,
+            Err(e) => {
+                eprintln!(
+                    "⚠️ 寫入 Copilot App usage 失敗 (session {} turn {}): {}",
+                    row.session_id, row.turn_index, e
+                );
+                let _ = tx.rollback();
+                return Ok(());
+            }
+        }
+    }
+
+    // Store the maximum raw event tuple for this source directory.
+    // Use the max raw event `created_at` (not per-turn MIN) so a turn whose
+    // events straddle the cursor does not pin the cursor at its earliest event
+    // and get re-aggregated on every subsequent sync.
+    //
+    // Only advance the cursor when every touched turn was aggregated and
+    // written successfully. If any turn failed (aggregation or upsert error),
+    // keep the cursor at its previous value so the failed turns are retried on
+    // the next sync instead of being permanently skipped.
+    if let Some((created_at, id)) = max_event_cursor {
+        if let Err(e) = write_copilot_app_cursor(&tx, &cursor_key_prefix, &created_at, id) {
+            eprintln!("⚠️ 寫入 Copilot App cursor 失敗: {}", e);
+            let _ = tx.rollback();
+            return Ok(());
+        }
+    }
+
+    tx.commit()
+        .map_err(|e| format!("Copilot App transaction COMMIT 失敗: {}", e))?;
+
+    if upserted > 0 {
+        println!("✅ 同步 Copilot App：{} 筆 turn（upsert）", upserted);
+    }
+    if deleted > 0 {
+        println!("✅ Copilot App reconciliation：清除 {} 筆錯誤資料", deleted);
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CopilotAppSessionKind {
+    App,
+    Cli,
+    Unknown,
+}
+
+fn classify_copilot_app_session(
+    app_dir: &Path,
+    app_session_ids: &HashSet<String>,
+    session_id: &str,
+) -> CopilotAppSessionKind {
+    if app_session_ids.contains(session_id) {
+        return CopilotAppSessionKind::App;
+    }
+
+    let cli_transcript = app_dir
+        .join("session-state")
+        .join(session_id)
+        .join("events.jsonl");
+    if cli_transcript.is_file() {
+        CopilotAppSessionKind::Cli
+    } else {
+        CopilotAppSessionKind::Unknown
+    }
+}
+
+fn query_copilot_app_session_ids(
+    conn: &Connection,
+    source_key: &str,
+) -> Result<HashSet<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT session_id
+             FROM usage_entries
+             WHERE assistant_type = 'copilot'
+               AND source_kind = ?
+               AND source_dir_key = ?",
+        )
+        .map_err(|e| format!("查詢 Copilot App session 失敗: {}", e))?;
+    let rows = stmt
+        .query_map(params![COPILOT_APP_SOURCE_KIND, source_key], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| format!("讀取 Copilot App session 失敗: {}", e))?;
+    let mut ids = HashSet::new();
+    for row in rows {
+        let raw = row.map_err(|e| format!("讀取 Copilot App session 失敗: {}", e))?;
+        // Subagent rows use a synthetic `<session_id>__<agent_id>` id. Strip
+        // the agent suffix so reconciliation compares the original session id
+        // against `data.db.sessions`, otherwise subagent rows would always be
+        // classified as stale and deleted on every sync.
+        let base = raw.split("__").next().unwrap_or(&raw).to_string();
+        ids.insert(base);
+    }
+    Ok(ids)
+}
+
+fn delete_stale_copilot_app_rows(
+    tx: &rusqlite::Transaction<'_>,
+    source_key: &str,
+    session_ids: &[String],
+) -> Result<usize, String> {
+    let mut deleted = 0usize;
+    for session_id in session_ids {
+        // Delete the main session row plus any subagent synthetic rows
+        // (`<session_id>__<agent_id>`). Use a prefix match (`session_id` + '__')
+        // so stale subagent rows are removed together with their parent.
+        deleted += tx
+            .execute(
+                "DELETE FROM usage_entries
+                 WHERE assistant_type = 'copilot'
+                   AND source_kind = ?
+                   AND source_dir_key = ?
+                   AND (session_id = ? OR session_id LIKE ? ESCAPE '\\')",
+                params![
+                    COPILOT_APP_SOURCE_KIND,
+                    source_key,
+                    session_id,
+                    format!("{}\\__%", session_id)
+                ],
+            )
+            .map_err(|e| format!("刪除錯誤 Copilot App 資料失敗: {}", e))?;
+    }
+    Ok(deleted)
+}
+
+fn cleanup_stale_copilot_app_rows(
+    conn: &mut Connection,
+    source_key: &str,
+    session_ids: &[String],
+) -> Result<(), String> {
+    if session_ids.is_empty() {
+        return Ok(());
+    }
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("開啟 Copilot App cleanup transaction 失敗: {}", e))?;
+    let deleted = delete_stale_copilot_app_rows(&tx, source_key, session_ids)?;
+    tx.commit()
+        .map_err(|e| format!("Copilot App cleanup COMMIT 失敗: {}", e))?;
+    if deleted > 0 {
+        println!("✅ Copilot App reconciliation：清除 {} 筆錯誤資料", deleted);
+    }
+    Ok(())
+}
+
+fn parse_copilot_app_cursor(suffix: &str) -> (Option<(String, i64)>, bool) {
+    if let Some((created_at, id)) = suffix.rsplit_once("::") {
+        if !created_at.is_empty() {
+            if let Ok(id) = id.parse::<i64>() {
+                return (Some((created_at.to_string(), id)), false);
+            }
+        }
+    }
+
+    if suffix.is_empty() {
+        (None, false)
+    } else {
+        (Some((suffix.to_string(), i64::MIN)), true)
+    }
+}
+
+fn write_copilot_app_cursor(
+    tx: &rusqlite::Transaction<'_>,
+    cursor_key_prefix: &str,
+    created_at: &str,
+    id: i64,
+) -> Result<(), String> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    tx.execute(
+        "DELETE FROM sync_state WHERE filename LIKE ? ESCAPE '\\'",
+        params![format!("{}%", cursor_key_prefix)],
+    )
+    .map_err(|e| format!("刪除舊 Copilot App cursor 失敗: {}", e))?;
+    let cursor_sentinel = format!("{}{}::{}", cursor_key_prefix, created_at, id);
+    tx.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
+        params![cursor_sentinel, 0i64, now],
+    )
+    .map_err(|e| format!("寫入 Copilot App cursor 失敗: {}", e))?;
+    Ok(())
+}
+
+struct CopilotAppTurnRow {
+    session_id: String,
+    turn_index: i64,
+    ts: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read: u64,
+    cache_write: u64,
+    reasoning: u64,
+    duration_ms: u64,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    /// `agent_id` from `assistant_usage_events`. `None` (NULL) identifies the
+    /// main agent; a non-null value identifies a subagent (e.g. `call_v4b32z66`).
+    agent_id: Option<String>,
+    /// `initiator` of the first event for this agent group, used only to label
+    /// subagent `agent_role` when it is `'sub-agent'`. Never guessed; any other
+    /// value (including NULL) leaves `agent_role` NULL.
+    initiator: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct CopilotAppSessionMeta {
+    title: Option<String>,
+    cwd: Option<String>,
+}
+
+fn resolve_copilot_app_session_meta(
+    data_db: &Connection,
+    session_id: &str,
+) -> CopilotAppSessionMeta {
+    let title: Option<String> = data_db
+        .query_row(
+            "SELECT title FROM sessions WHERE id = ?",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+
+    // Workspace/checkout path resolution is non-trivial across schema versions;
+    // leave cwd empty for now. The frontend can fall back to session-state.
+    CopilotAppSessionMeta { title, cwd: None }
+}
+
+/// Convert Copilot App `created_at` (`YYYY-MM-DD HH:MM:SS` UTC) to ISO 8601.
+fn normalize_copilot_app_timestamp(raw: &str) -> String {
+    // Already ISO-ish; ensure `T` separator and `Z` suffix.
+    if raw.len() >= 19 {
+        format!("{}T{}Z", &raw[..10], &raw[11..19])
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Hex-encode bytes into a lowercase hex string (no external dependency).
+/// Used to build an injective, LIKE-wildcard-free cursor key from a canonical
+/// source directory path.
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{:02x}", byte));
+    }
+    out
+}
+
+/// Aggregated per-agent token row for a CLI session, produced by grouping
+/// `assistant_usage_events` by `(session_id, agent_id, model)`.
+///
+/// `agent_id = None` identifies the main agent; a non-null `agent_id`
+/// identifies a subagent (e.g. `call_f14xiouf`). `model` is taken verbatim
+/// from the events so a subagent never inherits the main agent's model.
+struct CopilotCliAgentRow {
+    session_id: String,
+    /// Earliest event timestamp for this agent group (ISO 8601 normalized).
+    ts: String,
+    model: Option<String>,
+    /// `None` for the main agent, `Some(agent_id)` for a subagent.
+    agent_id: Option<String>,
+    /// `initiator` of the first event for this agent, used only to label
+    /// subagent `agent_role` when it is `'sub-agent'`. Never guessed.
+    initiator: Option<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read: u64,
+    cache_write: u64,
+    reasoning: u64,
+    duration_ms: u64,
+}
+
+/// Reconcile Copilot CLI session usage against the per-API-call attribution in
+/// `~/.copilot/session-store.db.assistant_usage_events`.
+///
+/// The status-line hook writes session-cumulative totals with no `agent_id`,
+/// so subagent usage is folded into the main session row. This collector reads
+/// the shared session-store (the same database the Copilot App collector uses,
+/// but restricted to CLI-classified sessions), aggregates events by
+/// `(session_id, agent_id, model)`, and replaces the merged `copilot-cli` hook
+/// rows for each reconciled session with one main-agent row plus one row per
+/// subagent — preserving the original session total exactly.
+///
+/// ## Session classification
+/// Only sessions classified as [`CopilotAppSessionKind::Cli`] (transcript at
+/// `session-state/<id>/events.jsonl` and NOT in the authoritative App registry
+/// `data.db.sessions`) are processed. App sessions and unclassifiable sessions
+/// are left untouched so the App collector and hook fallback remain
+/// authoritative for them.
+///
+/// ## Token accounting
+/// `assistant_usage_events.input_tokens` already includes cache reads, so to
+/// avoid double-counting cache-read tokens in both `tokens_input` and
+/// `tokens_cache_read` (and again in `tokens_total`), `tokens_input` is stored
+/// as `SUM(input_tokens) - SUM(cache_read_tokens)` (clamped at 0), mirroring
+/// [`normalize_copilot_cli_usage_entry`]. `tokens_total` sums net input +
+/// output + cache_read + cache_write + reasoning, so cache read is counted
+/// once and reasoning is not added twice.
+///
+/// ## Replacing hook rows
+/// For each reconciled session, the merged `copilot-cli` hook rows for that
+/// session (the main session id and any `__`-suffixed synthetic subagent ids)
+/// are deleted and the new split rows are inserted in the same transaction.
+/// The transaction commits only after the sum of per-agent `tokens_total`
+/// equals the hook session total; on any mismatch or failure it rolls back and
+/// the hook rows are preserved.
+///
+/// ## Cursor & backfill
+/// Incremental sync is tracked by a `(created_at, id)` high-water mark scoped
+/// by the canonical Copilot directory, stored under
+/// [`COPILOT_CLI_AGENT_CURSOR_PREFIX`]. Touched sessions are re-aggregated from
+/// their FULL event history (not just post-cursor) so turns straddling the
+/// cursor are written with complete totals. A versioned migration
+/// ([`COPILOT_CLI_AGENT_MIGRATION_KEY`]) performs the first backfill of all
+/// existing CLI sessions. Both the cursor and the migration key are
+/// independent of the Copilot App collector's state.
+fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String> {
+    let copilot_dir = get_copilot_dir();
+    let session_store_path = copilot_dir.join("session-store.db");
+
+    // Canonicalize for a stable, per-COPILOT_DIR cursor key (mirrors the App
+    // collector). Hex-encode raw OS bytes so the key is injective and free of
+    // LIKE wildcards.
+    let canonical_copilot_dir = copilot_dir
+        .canonicalize()
+        .unwrap_or_else(|_| copilot_dir.clone());
+    let source_key = encode_hex(canonical_copilot_dir.as_os_str().as_encoded_bytes());
+    let cursor_key_prefix = format!("{}{}::", COPILOT_CLI_AGENT_CURSOR_PREFIX, source_key);
+
+    // CLI reconciliation must not touch App sessions. The App registry
+    // (`data.db.sessions`) is authoritative; without it we cannot safely
+    // classify any session as CLI, so fall back to hook rows.
+    let data_db_path = copilot_dir.join("data.db");
+    let app_session_ids: HashSet<String> = match load_copilot_app_session_registry(&data_db_path) {
+        Ok(ids) => ids,
+        Err(message) => {
+            // Missing data.db / sessions table is a normal state for CLI-only
+            // users; fall back silently. Other errors are surfaced.
+            eprintln!("⚠️ Copilot CLI agent reconciliation 跳過：{}", message);
+            return Ok(());
+        }
+    };
+
+    if !session_store_path.exists() {
+        // No session-store: keep hook rows for all CLI sessions.
+        return Ok(());
+    }
+
+    let session_store = match Connection::open_with_flags(
+        &session_store_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "⚠️ 無法開啟 Copilot CLI session-store.db ({}): {}",
+                session_store_path.display(),
+                e
+            );
+            return Ok(());
+        }
+    };
+    let _ = session_store.busy_timeout(std::time::Duration::from_secs(2));
+
+    let table_exists: bool = session_store
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='assistant_usage_events'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(());
+    }
+
+    // Determine the set of CLI sessions to process. On the first run (no
+    // migration marker) scan every session in the store that classifies as
+    // CLI; subsequently use the cursor to find newly-touched sessions and
+    // re-aggregate them from full history.
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![COPILOT_CLI_AGENT_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    let stored_cursor: Option<String> = conn
+        .query_row(
+            "SELECT filename FROM sync_state WHERE filename LIKE ? ESCAPE '\\' LIMIT 1",
+            params![format!("{}%", cursor_key_prefix)],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|f| f.strip_prefix(&cursor_key_prefix).map(|s| s.to_string()));
+    let (last_cursor, _legacy_cursor) = stored_cursor
+        .map(|suffix| parse_copilot_app_cursor(&suffix))
+        .unwrap_or((None, false));
+
+    // Collect candidate session ids and the max event (created_at, id).
+    let touched_query = if last_cursor.is_some() {
+        "SELECT session_id, created_at, id
+         FROM assistant_usage_events
+         WHERE created_at > ?
+            OR (created_at = ? AND id > ?)
+         ORDER BY created_at ASC, id ASC"
+    } else {
+        "SELECT session_id, created_at, id
+         FROM assistant_usage_events
+         ORDER BY created_at ASC, id ASC"
+    };
+    let mut touched_stmt = session_store
+        .prepare(touched_query)
+        .map_err(|e| format!("準備 Copilot CLI touched-sessions 查詢失敗: {}", e))?;
+    let map_touched = |row: &rusqlite::Row| -> rusqlite::Result<(String, String, i64)> {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    };
+    let touched_iter = if let Some(ref cursor) = last_cursor {
+        touched_stmt
+            .query_map(
+                params![cursor.0.as_str(), cursor.0.as_str(), cursor.1],
+                map_touched,
+            )
+            .map_err(|e| format!("執行 Copilot CLI touched-sessions 查詢失敗: {}", e))?
+    } else {
+        touched_stmt
+            .query_map([], map_touched)
+            .map_err(|e| format!("執行 Copilot CLI touched-sessions 查詢失敗: {}", e))?
+    };
+
+    let mut touched_cli_sessions: HashSet<String> = HashSet::new();
+    let mut max_event_cursor: Option<(String, i64)> = None;
+    let mut scan_failed = false;
+    for row_res in touched_iter {
+        match row_res {
+            Ok((session_id, created_at, id)) => {
+                max_event_cursor = Some((created_at, id));
+                if matches!(
+                    classify_copilot_app_session(&copilot_dir, &app_session_ids, &session_id),
+                    CopilotAppSessionKind::Cli
+                ) {
+                    touched_cli_sessions.insert(session_id);
+                }
+            }
+            Err(e) => {
+                eprintln!("⚠️ 讀取 Copilot CLI touched-session 失敗: {}", e);
+                scan_failed = true;
+            }
+        }
+    }
+    if scan_failed {
+        return Ok(());
+    }
+
+    // First-run backfill: scan every CLI-classified session in the store, not
+    // just those after the cursor. This converts existing hook merged rows
+    // into per-agent rows. Idempotent: the migration marker is set only after
+    // a successful commit, and the cursor prevents re-scanning on retry.
+    if !migration_done {
+        let mut all_sessions_stmt = session_store
+            .prepare("SELECT DISTINCT session_id FROM assistant_usage_events")
+            .map_err(|e| format!("準備 Copilot CLI backfill 查詢失敗: {}", e))?;
+        let all_sessions = all_sessions_stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("執行 Copilot CLI backfill 查詢失敗: {}", e))?;
+        for sid_res in all_sessions {
+            match sid_res {
+                Ok(sid) => {
+                    if matches!(
+                        classify_copilot_app_session(&copilot_dir, &app_session_ids, &sid),
+                        CopilotAppSessionKind::Cli
+                    ) {
+                        touched_cli_sessions.insert(sid);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("⚠️ 讀取 Copilot CLI backfill session 失敗: {}", e);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    if touched_cli_sessions.is_empty() && max_event_cursor.is_none() {
+        // Nothing to do. Still record the migration marker on first run so the
+        // backfill scan is not repeated.
+        if !migration_done {
+            let tx = conn.transaction().map_err(|e| {
+                format!("開啟 Copilot CLI migration marker transaction 失敗: {}", e)
+            })?;
+            tx.execute(
+                "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+                 VALUES (?, 1, 0)",
+                params![COPILOT_CLI_AGENT_MIGRATION_KEY],
+            )
+            .map_err(|e| format!("寫入 Copilot CLI migration marker 失敗: {}", e))?;
+            if let Some((created_at, id)) = max_event_cursor {
+                write_copilot_cli_agent_cursor(&tx, &cursor_key_prefix, &created_at, id)?;
+            }
+            tx.commit()
+                .map_err(|e| format!("Copilot CLI migration marker COMMIT 失敗: {}", e))?;
+        }
+        return Ok(());
+    }
+
+    // Aggregate each touched CLI session from its FULL event history, grouped
+    // by (agent_id, model). turn_index is unreliable for CLI (often all 0), so
+    // we aggregate across all turns for a stable, non-duplicated per-agent row.
+    // `MIN(model)` is safe because the group key already includes model.
+    let aggregate_query = "SELECT MIN(created_at) AS ts,
+                MIN(model) AS model,
+                agent_id,
+                MIN(initiator) AS initiator,
+                SUM(input_tokens), SUM(output_tokens),
+                SUM(cache_read_tokens), SUM(cache_write_tokens),
+                SUM(reasoning_tokens), SUM(duration_ms)
+         FROM assistant_usage_events
+         WHERE session_id = ?
+         GROUP BY agent_id, model";
+    let mut agg_stmt = session_store
+        .prepare(aggregate_query)
+        .map_err(|e| format!("準備 Copilot CLI 聚合查詢失敗: {}", e))?;
+
+    let mut all_session_rows: HashMap<String, Vec<CopilotCliAgentRow>> = HashMap::new();
+    for session_id in &touched_cli_sessions {
+        let rows_res = agg_stmt.query_map(params![session_id], |row| {
+            let raw_input: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0);
+            let cache_read: i64 = row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0);
+            // Net non-cached input; clamp at 0 in case of schema drift.
+            let net_input = (raw_input - cache_read).max(0) as u64;
+            Ok(CopilotCliAgentRow {
+                session_id: session_id.clone(),
+                ts: row.get::<_, String>(0)?,
+                model: row.get::<_, Option<String>>(1)?,
+                agent_id: row.get::<_, Option<String>>(2)?,
+                initiator: row.get::<_, Option<String>>(3)?,
+                input_tokens: net_input,
+                output_tokens: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as u64,
+                cache_read: cache_read as u64,
+                cache_write: row.get::<_, Option<i64>>(7)?.unwrap_or(0).max(0) as u64,
+                reasoning: row.get::<_, Option<i64>>(8)?.unwrap_or(0).max(0) as u64,
+                duration_ms: row.get::<_, Option<i64>>(9)?.unwrap_or(0).max(0) as u64,
+            })
+        });
+        match rows_res {
+            Ok(rows) => {
+                let mut agent_rows = Vec::new();
+                for row in rows {
+                    match row {
+                        Ok(r) => agent_rows.push(r),
+                        Err(e) => {
+                            eprintln!(
+                                "⚠️ 讀取 Copilot CLI 聚合結果 (session {}) 失敗: {}",
+                                session_id, e
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                if agent_rows.is_empty() {
+                    // No agent events for this session: keep hook rows.
+                    continue;
+                }
+                all_session_rows.insert(session_id.clone(), agent_rows);
+            }
+            Err(e) => {
+                eprintln!("⚠️ 聚合 Copilot CLI session {} 失敗: {}", session_id, e);
+                return Ok(());
+            }
+        }
+    }
+
+    if all_session_rows.is_empty() && max_event_cursor.is_none() {
+        return Ok(());
+    }
+
+    let tx = conn.transaction().map_err(|e| {
+        format!(
+            "開啟 Copilot CLI agent reconciliation transaction 失敗: {}",
+            e
+        )
+    })?;
+
+    let mut upserted = 0usize;
+    let mut hook_replaced = 0usize;
+
+    for (session_id, agent_rows) in &all_session_rows {
+        // Validate the per-agent total against the existing hook session total
+        // BEFORE deleting anything. The Copilot CLI hook records cumulative
+        // session totals where `tokens.total = net_input + output` (cache_read
+        // is normalized out of input, and reasoning/cache_write are tracked in
+        // separate columns but NOT included in the accounting total — see
+        // `separate_copilot_cli_cached_input` which checks
+        // `total == input + output`). The reconciled per-agent totals must
+        // follow the same semantics and sum to the hook session total exactly;
+        // otherwise we keep the hook rows and skip this session.
+        let agent_total: u64 = agent_rows
+            .iter()
+            .map(|r| r.input_tokens + r.output_tokens)
+            .sum();
+
+        let hook_total: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(tokens_total)
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot'
+                   AND source_kind = ?
+                   AND (session_id = ? OR session_id LIKE ? ESCAPE '\\')
+                   AND parent_session_id IS NULL",
+                params![
+                    COPILOT_CLI_SOURCE_KIND,
+                    session_id,
+                    format!("{}\\__%", session_id)
+                ],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten();
+
+        // If hook rows exist, the reconciled total must match the hook session
+        // total. If there are no hook rows yet (e.g. events arrived before the
+        // hook wrote), accept the reconciled total as authoritative.
+        if let Some(hook_total) = hook_total {
+            if hook_total != agent_total as i64 {
+                eprintln!(
+                    "⚠️ Copilot CLI session {} 總量不符（hook={} agent={}），保留 hook rows",
+                    session_id, hook_total, agent_total
+                );
+                // The hook may be written after assistant_usage_events. Do
+                // not advance the global cursor or migration marker when the
+                // totals are temporarily inconsistent; rolling back the
+                // whole reconciliation guarantees this session is retried
+                // even when no new event arrives.
+                let _ = tx.rollback();
+                return Ok(());
+            }
+        }
+
+        // Delete the merged hook rows for this session: the main session id
+        // and any synthetic subagent ids. Scoped precisely to copilot-cli so
+        // copilot-app, vscode-chat, codex, claude, cursor and antigravity rows
+        // are never touched.
+        let deleted = tx
+            .execute(
+                "DELETE FROM usage_entries
+                 WHERE assistant_type = 'copilot'
+                   AND source_kind = ?
+                   AND (session_id = ? OR session_id LIKE ? ESCAPE '\\')",
+                params![
+                    COPILOT_CLI_SOURCE_KIND,
+                    session_id,
+                    format!("{}\\__%", session_id)
+                ],
+            )
+            .map_err(|e| {
+                format!(
+                    "刪除 Copilot CLI hook rows 失敗 (session {}): {}",
+                    session_id, e
+                )
+            })?;
+        hook_replaced += deleted;
+
+        // Insert the split per-agent rows.
+        for row in agent_rows {
+            let timestamp = normalize_copilot_app_timestamp(&row.ts);
+            let date_str = timestamp.get(..10).unwrap_or(&row.ts).to_string();
+            // CLI accounting total mirrors the hook semantics: net_input +
+            // output only. reasoning, cache_read and cache_write are stored in
+            // their own columns but NOT added to tokens_total, so the per-agent
+            // rows sum to the original hook session total without double
+            // counting reasoning or cache.
+            let total = row.input_tokens + row.output_tokens;
+
+            let (row_session_id, parent_session_id, agent_nickname, agent_id_segment, agent_role) =
+                match &row.agent_id {
+                    Some(agent) if !agent.is_empty() => {
+                        let synthetic = format!("{}__{}", row.session_id, agent);
+                        // Only surface agent_role when the source explicitly
+                        // marked the agent as a sub-agent; never guess.
+                        let role = if row.initiator.as_deref() == Some("sub-agent") {
+                            Some("sub-agent".to_string())
+                        } else {
+                            None
+                        };
+                        (
+                            synthetic,
+                            Some(row.session_id.clone()),
+                            Some(agent.clone()),
+                            agent.clone(),
+                            role,
+                        )
+                    }
+                    _ => (row.session_id.clone(), None, None, "main".to_string(), None),
+                };
+
+            let session_name = get_copilot_session_name(&row.session_id);
+            let session_name = match (&row.agent_id, &session_name) {
+                (Some(agent), Some(name)) if !agent.is_empty() => {
+                    Some(format!("{} (subagent {})", name, agent))
+                }
+                (Some(agent), None) if !agent.is_empty() => Some(format!("Subagent {}", agent)),
+                _ => session_name,
+            };
+
+            // import_source_id namespace is distinct from copilot-app, the
+            // hook's FNV hash, and vscode-chat. Includes the canonical source
+            // directory, session, agent and model so re-runs upsert the same
+            // row instead of duplicating.
+            let model_identity = encode_hex(row.model.as_deref().unwrap_or("").as_bytes());
+            let usage_identity = format!(
+                "agent={};model={}",
+                encode_hex(agent_id_segment.as_bytes()),
+                model_identity
+            );
+            let import_source_id = format!(
+                "copilot-cli-agents:{}:{}:{}:{}",
+                source_key, row.session_id, agent_id_segment, model_identity
+            );
+
+            let insert_res = tx.execute(
+                "INSERT OR REPLACE INTO usage_entries (
+                    assistant_type, source_kind, usage_identity, timestamp, date, session_id, session_name,
+                    transcript_path, cwd, version, turn_no, model, model_id,
+                    tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
+                    tokens_reasoning, tokens_total,
+                    delta_input, delta_output, delta_cache_read, delta_cache_write,
+                    delta_reasoning, delta_total,
+                    duration_ms, premium_requests, import_source_id, reasoning_effort,
+                    parent_session_id, agent_nickname, agent_role
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?,
+                    NULL, NULL, NULL, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, NULL, ?, NULL,
+                    ?, ?, ?
+                )",
+                params![
+                    "copilot",
+                    COPILOT_CLI_SOURCE_KIND,
+                    usage_identity,
+                    timestamp,
+                    date_str,
+                    row_session_id,
+                    session_name,
+                    // CLI sessions aggregate across all turns into a single
+                    // row per agent, so turn_no is fixed at 1.
+                    1i64,
+                    row.model,
+                    row.model,
+                    row.input_tokens as i64,
+                    row.output_tokens as i64,
+                    row.cache_read as i64,
+                    row.cache_write as i64,
+                    row.reasoning as i64,
+                    total as i64,
+                    row.input_tokens as i64,
+                    row.output_tokens as i64,
+                    row.cache_read as i64,
+                    row.cache_write as i64,
+                    row.reasoning as i64,
+                    total as i64,
+                    row.duration_ms as i64,
+                    import_source_id,
+                    parent_session_id,
+                    agent_nickname,
+                    agent_role,
+                ],
+            );
+            match insert_res {
+                Ok(_) => upserted += 1,
+                Err(e) => {
+                    eprintln!(
+                        "⚠️ 寫入 Copilot CLI agent usage 失敗 (session {}): {}",
+                        row.session_id, e
+                    );
+                    let _ = tx.rollback();
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Advance the cursor to the max event tuple seen. Only commit after all
+    // sessions are written successfully; on any earlier rollback the cursor
+    // stays put so failed sessions are retried.
+    if let Some((created_at, id)) = max_event_cursor {
+        if let Err(e) = write_copilot_cli_agent_cursor(&tx, &cursor_key_prefix, &created_at, id) {
+            eprintln!("⚠️ 寫入 Copilot CLI agent cursor 失敗: {}", e);
+            let _ = tx.rollback();
+            return Ok(());
+        }
+    }
+
+    // Record the migration marker now that the backfill has committed.
+    if !migration_done {
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![COPILOT_CLI_AGENT_MIGRATION_KEY],
+        )
+        .map_err(|e| format!("寫入 Copilot CLI migration marker 失敗: {}", e))?;
+    }
+
+    tx.commit()
+        .map_err(|e| format!("Copilot CLI agent reconciliation COMMIT 失敗: {}", e))?;
+
+    if upserted > 0 {
+        println!(
+            "✅ 同步 Copilot CLI agent：{} 筆 per-agent row（upsert）",
+            upserted
+        );
+    }
+    if hook_replaced > 0 {
+        println!(
+            "✅ Copilot CLI agent reconciliation：替換 {} 筆 hook merged row",
+            hook_replaced
+        );
+    }
+    Ok(())
+}
+
+/// Load the authoritative Copilot App session registry (`data.db.sessions`).
+/// Returns an empty set if `data.db` or the `sessions` table is missing (a
+/// normal state for CLI-only users); returns an error string for genuine I/O
+/// or schema failures so the caller can decide whether to fall back.
+fn load_copilot_app_session_registry(data_db_path: &Path) -> Result<HashSet<String>, String> {
+    if !data_db_path.exists() {
+        return Err(format!("找不到 data.db ({})", data_db_path.display()));
+    }
+    let data_db = Connection::open_with_flags(
+        data_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("無法開啟 data.db ({}): {}", data_db_path.display(), e))?;
+    let _ = data_db.busy_timeout(std::time::Duration::from_secs(2));
+
+    let table_exists: bool = data_db
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !table_exists {
+        return Err(format!(
+            "data.db 缺少 sessions table ({})",
+            data_db_path.display()
+        ));
+    }
+
+    let mut stmt = data_db
+        .prepare("SELECT id FROM sessions")
+        .map_err(|e| format!("讀取 data.db.sessions 失敗: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("讀取 data.db.sessions 失敗: {}", e))?;
+    let mut ids = HashSet::new();
+    for row in rows {
+        ids.insert(row.map_err(|e| format!("讀取 data.db.sessions 失敗: {}", e))?);
+    }
+    Ok(ids)
+}
+
+fn write_copilot_cli_agent_cursor(
+    tx: &rusqlite::Transaction<'_>,
+    cursor_key_prefix: &str,
+    created_at: &str,
+    id: i64,
+) -> Result<(), String> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    tx.execute(
+        "DELETE FROM sync_state WHERE filename LIKE ? ESCAPE '\\'",
+        params![format!("{}%", cursor_key_prefix)],
+    )
+    .map_err(|e| format!("刪除舊 Copilot CLI agent cursor 失敗: {}", e))?;
+    let cursor_sentinel = format!("{}{}::{}", cursor_key_prefix, created_at, id);
+    tx.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
+        params![cursor_sentinel, 0i64, now],
+    )
+    .map_err(|e| format!("寫入 Copilot CLI agent cursor 失敗: {}", e))?;
+    Ok(())
 }
 
 fn codex_transcript_path_key_for_platform(path: &str, is_windows: bool) -> String {
@@ -2291,6 +3889,7 @@ fn parse_claude_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
             context: None,
             cost: None,
             source_kind: None,
+            source_dir_key: None,
             parent_session_id: None,
             agent_nickname: None,
             agent_role: None,
@@ -3442,6 +5041,7 @@ fn parse_cursor_session_file(
                     context: None,
                     cost: None,
                     source_kind: source_kind.clone(),
+                    source_dir_key: None,
                     parent_session_id: None,
                     agent_nickname: None,
                     agent_role: None,
@@ -3671,7 +5271,21 @@ pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
         eprintln!("❌ 同步 VS Code Copilot 失敗: {}", e);
     }
 
-    // 4. Sync Codex CLI and Desktop
+    // 4. Sync GitHub Copilot App (Tauri desktop) usage
+    if let Err(e) = sync_copilot_app_usage_logs(conn) {
+        eprintln!("❌ 同步 Copilot App 失敗: {}", e);
+    }
+
+    // 5. Reconcile Copilot CLI subagent usage against session-store.db. Runs
+    // after the hook and App collectors so CLI sessions are classified against
+    // the authoritative App registry and the hook merged rows are available
+    // for total validation. Falls back to hook rows when session-store is
+    // missing, unclassifiable, or fails total validation.
+    if let Err(e) = sync_copilot_cli_agent_usage_logs(conn) {
+        eprintln!("❌ 同步 Copilot CLI agent reconciliation 失敗: {}", e);
+    }
+
+    // 6. Sync Codex CLI and Desktop
     if let Err(e) = sync_codex_usage_logs(conn) {
         eprintln!("❌ 同步 Codex 失敗: {}", e);
     }
@@ -3759,7 +5373,7 @@ fn migrate_records(
     }
 
     let mut stmt = src_conn.prepare(
-        "SELECT 
+        "SELECT
             timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
@@ -3973,11 +5587,11 @@ pub fn get_usage_entries_by_date(
     date: &str,
     assistant: &str,
 ) -> Result<Vec<(UsageDayExportRecord, String)>, String> {
-    let mut query = "SELECT 
+    let mut query = "SELECT
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
-            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort, import_source_id, source_kind
+            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort, import_source_id, source_kind, source_dir_key
          FROM usage_entries WHERE date = ?".to_string();
     let mut params_vec = Vec::new();
     params_vec.push(rusqlite::types::Value::Text(date.to_string()));
@@ -4144,6 +5758,7 @@ pub fn get_usage_entries_by_date(
                 context: None,
                 cost,
                 source_kind: row.get(33).ok(),
+                source_dir_key: row.get(34).ok(),
                 parent_session_id: row.get(27).ok(),
                 agent_nickname: row.get(28).ok(),
                 agent_role: row.get(29).ok(),
@@ -4430,26 +6045,184 @@ pub fn rollback_usage_import_batch(
     })
 }
 
+/// Session identity tuple returned by [`get_session_assistant_and_transcript`]:
+/// `(assistant_type, transcript_path, source_kind, source_dir_key,
+/// parent_session_id, agent_nickname)`.
+pub type SessionIdentity = (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Resolves the single `source_kind` used by the legacy `source_kind = None`
+/// fallback. All four session-lookup helpers
+/// ([`get_session_assistant_and_transcript`], [`get_session_cwd`],
+/// [`get_session_model`], [`get_session_turns_token_stats`]) MUST call this
+/// helper when invoked with `source_kind = None` so that the identity, CWD,
+/// model, and turn-stats lookups always pick rows from the same source — even
+/// when a single session id has rows from multiple collectors
+/// (e.g. `copilot-cli` turn 1 + `vscode-chat` turn 2, both with
+/// `source_dir_key IS NULL`).
+///
+/// Behaviour:
+///
+/// * `source_kind = Some(kind)` — returns `Some(kind.to_string())` directly,
+///   without touching the database. Mirrors the explicit production-handler
+///   call sites that always pass a concrete `source_kind`.
+/// * `source_kind = None` — runs a single, parameter-bound query against
+///   `usage_entries` matching `(assistant_type, session_id, source_dir_key
+///   predicate)`, ordered by the canonical tie-break:
+///   1. main agent rows first — `(parent_session_id IS NULL) DESC`,
+///   2. `source_kind ASC`,
+///   3. `turn_no ASC`,
+///   4. `id ASC` (final stable tie-breaker).
+///
+/// Returns the `source_kind` of the first row, or `None` if the query produced
+/// no rows. Never panics on empty result sets — it just returns `None`, so the
+/// downstream helper can still surface a clean "session not found" / empty
+/// result to the caller.
+///
+/// `source_dir_key` follows the same semantics as the four helpers: `Some(k)`
+/// filters by `source_dir_key = k`, `None` filters by `source_dir_key IS NULL`.
+/// `None` therefore means "non-App rows only" and never "any source".
+fn resolve_session_source_kind(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+    session_id: &str,
+    source_kind: Option<&str>,
+    source_dir_key: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(kind) = source_kind {
+        return Ok(Some(kind.to_string()));
+    }
+
+    let mut sql = String::from(
+        "SELECT source_kind FROM usage_entries
+         WHERE assistant_type = ? AND session_id = ?",
+    );
+    let mut params_vec: Vec<rusqlite::types::Value> = vec![
+        rusqlite::types::Value::Text(assistant.to_string()),
+        rusqlite::types::Value::Text(session_id.to_string()),
+    ];
+    if let Some(key) = source_dir_key {
+        sql.push_str(" AND source_dir_key = ?");
+        params_vec.push(rusqlite::types::Value::Text(key.to_string()));
+    } else {
+        sql.push_str(" AND source_dir_key IS NULL");
+    }
+    // Main agent rows first (parent_session_id IS NULL → 1; DESC puts them
+    // ahead of subagent rows which evaluate to 0). Then `source_kind ASC`
+    // for a deterministic tie-break between equally-scoped sources, then
+    // `turn_no ASC`, then `id ASC` as the final stable tie-breaker.
+    sql.push_str(
+        " ORDER BY (parent_session_id IS NULL) DESC, source_kind ASC, turn_no ASC, id ASC LIMIT 1",
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(params_vec))
+        .map_err(|e| e.to_string())?;
+    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let resolved: Option<String> = row.get(0).ok().flatten();
+        // The column is TEXT NOT NULL DEFAULT 'legacy' so this should always
+        // be Some, but fall back to the column default if a NULL sneaks in
+        // (e.g. via a future migration). This keeps the helper panic-free.
+        Ok(resolved.or_else(|| Some("legacy".to_string())))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Returns `(assistant_type, transcript_path, source_kind, source_dir_key,
+/// parent_session_id, agent_nickname)` for a given session id.
+///
+/// `source_kind` and `source_dir_key` narrow the query so that sessions with the
+/// same `session_id` from different sources (e.g. Copilot CLI vs. Copilot App,
+/// or two different Copilot App directories) are unambiguously identified.
+/// When either is `None`, the corresponding predicate is still applied
+/// explicitly (`source_dir_key IS NULL` when `source_dir_key` is `None`, no
+/// `source_kind` filter when `source_kind` is `None`) so the result is never
+/// derived from an arbitrary row.
+///
+/// For the legacy `source_kind = None` fallback the deterministic tie-break
+/// is: rows with `parent_session_id IS NULL` first (main agent rows before
+/// subagent synthetic rows), then `source_kind ASC`, then `turn_no ASC`, and
+/// finally the smallest `id` as a final stable tie-breaker. Callers that
+/// also query [`get_session_cwd`], [`get_session_model`], and
+/// [`get_session_turns_token_stats`] with the same `None` arguments MUST
+/// observe the same tie-break so identity, CWD, model, and turn stats
+/// always select the same source row (otherwise a request could pick
+/// identity from Copilot CLI while CWD/model/turn stats come from VS Code
+/// Chat for the same session id).
+///
+/// `parent_session_id` and `agent_nickname` are populated for Copilot App
+/// subagent synthetic rows (`<main>__<agent_id>`); they are `None` for main
+/// agent rows and for non-Copilot-App sessions. The session detail handler uses
+/// them to locate the shared `events.jsonl` under the parent session
+/// directory and to filter events by agent id, so it must NOT derive the
+/// parent/agent from string-splitting the synthetic id.
 pub fn get_session_assistant_and_transcript(
     conn: &rusqlite::Connection,
     assistant: &str,
     session_id: &str,
     source_kind: Option<&str>,
-) -> Result<(String, Option<String>, String), String> {
+    source_dir_key: Option<&str>,
+) -> Result<SessionIdentity, String> {
+    // Build a deterministic query:
+    // - When source_kind is provided, filter by it exactly.
+    // - When source_dir_key is Some, filter by source_dir_key = ?.
+    // - When source_dir_key is None, filter by source_dir_key IS NULL.
+    //   This ensures None means "no source directory" (non-App), not "any".
+    // - When source_kind is None (legacy), resolve a single source_kind via
+    //   `resolve_session_source_kind` and then filter by it. This keeps the
+    //   legacy `None` fallback consistent with the other three session
+    //   helpers (`get_session_cwd`, `get_session_model`,
+    //   `get_session_turns_token_stats`) so identity, CWD, model, and turn
+    //   stats always observe the same source row even when the same
+    //   session_id has rows from multiple collectors (e.g. `copilot-cli`
+    //   turn 1 + `vscode-chat` turn 2, both with `source_dir_key IS NULL`).
+    let resolved_source_kind =
+        resolve_session_source_kind(conn, assistant, session_id, source_kind, source_dir_key)?;
+    // No matching row exists; mirror the previous "Session not found" error
+    // so callers see the same behaviour when the legacy lookup has nothing
+    // to fall back on.
+    let resolved_source_kind = match resolved_source_kind {
+        Some(k) => k,
+        None => return Err("Session not found".to_string()),
+    };
+
     let mut sql = String::from(
-        "SELECT assistant_type, transcript_path, source_kind
+        "SELECT assistant_type, transcript_path, source_kind, source_dir_key,
+                parent_session_id, agent_nickname
          FROM usage_entries
-         WHERE session_id = ? AND assistant_type = ?",
+         WHERE session_id = ? AND assistant_type = ? AND source_kind = ?",
     );
-    let mut params_vec = vec![
+    let mut params_vec: Vec<rusqlite::types::Value> = vec![
         rusqlite::types::Value::Text(session_id.to_string()),
         rusqlite::types::Value::Text(assistant.to_string()),
+        rusqlite::types::Value::Text(resolved_source_kind),
     ];
-    if let Some(source_kind) = source_kind {
-        sql.push_str(" AND source_kind = ?");
-        params_vec.push(rusqlite::types::Value::Text(source_kind.to_string()));
+
+    if let Some(key) = source_dir_key {
+        sql.push_str(" AND source_dir_key = ?");
+        params_vec.push(rusqlite::types::Value::Text(key.to_string()));
+    } else {
+        // None means source_dir_key IS NULL (non-App rows only).
+        sql.push_str(" AND source_dir_key IS NULL");
     }
-    sql.push_str(" ORDER BY source_kind ASC, id ASC LIMIT 1");
+
+    // Deterministic ordering: main agent rows first
+    // (`(parent_session_id IS NULL) DESC` puts NULL/main rows ahead of
+    // NOT NULL/subagent rows), then `source_kind ASC`, then the earliest
+    // turn, then the smallest row `id` as a final tie-breaker so the choice
+    // is stable even when multiple rows share the same (source_kind,
+    // turn_no).
+    sql.push_str(
+        " ORDER BY (parent_session_id IS NULL) DESC, source_kind ASC, turn_no ASC, id ASC LIMIT 1",
+    );
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let mut rows = stmt
         .query(rusqlite::params_from_iter(params_vec))
@@ -4462,7 +6235,25 @@ pub fn get_session_assistant_and_transcript(
             .ok()
             .flatten()
             .unwrap_or_else(|| "legacy".to_string());
-        Ok((ast, path, source_kind))
+        let source_dir_key: Option<String> = row.get(3).ok().flatten();
+        let parent_session_id = row
+            .get::<_, Option<String>>(4)
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty());
+        let agent_nickname = row
+            .get::<_, Option<String>>(5)
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty());
+        Ok((
+            ast,
+            path,
+            source_kind,
+            source_dir_key,
+            parent_session_id,
+            agent_nickname,
+        ))
     } else {
         Err("Session not found".to_string())
     }
@@ -4473,20 +6264,41 @@ pub fn get_session_cwd(
     assistant: &str,
     session_id: &str,
     source_kind: Option<&str>,
+    source_dir_key: Option<&str>,
 ) -> Result<Option<String>, String> {
+    // None means source_dir_key IS NULL (non-App rows only), not "any source".
+    // The legacy `source_kind = None` path MUST resolve a single
+    // `source_kind` via `resolve_session_source_kind` so the CWD lookup
+    // always observes the same source row as identity / model / turn
+    // stats; otherwise a session_id with rows from multiple collectors
+    // (e.g. `copilot-cli` turn 1 + `vscode-chat` turn 2, both
+    // `source_dir_key IS NULL`) could leak CWD from a different source.
+    let resolved_source_kind =
+        resolve_session_source_kind(conn, assistant, session_id, source_kind, source_dir_key)?;
+    let resolved_source_kind = match resolved_source_kind {
+        Some(k) => k,
+        None => return Ok(None),
+    };
+
     let mut sql = String::from(
         "SELECT cwd FROM usage_entries
-         WHERE assistant_type = ? AND session_id = ? AND cwd IS NOT NULL",
+         WHERE assistant_type = ? AND session_id = ? AND source_kind = ?
+           AND cwd IS NOT NULL",
     );
-    let mut params_vec = vec![
+    let mut params_vec: Vec<rusqlite::types::Value> = vec![
         rusqlite::types::Value::Text(assistant.to_string()),
         rusqlite::types::Value::Text(session_id.to_string()),
+        rusqlite::types::Value::Text(resolved_source_kind),
     ];
-    if let Some(source_kind) = source_kind {
-        sql.push_str(" AND source_kind = ?");
-        params_vec.push(rusqlite::types::Value::Text(source_kind.to_string()));
+    if let Some(key) = source_dir_key {
+        sql.push_str(" AND source_dir_key = ?");
+        params_vec.push(rusqlite::types::Value::Text(key.to_string()));
+    } else {
+        sql.push_str(" AND source_dir_key IS NULL");
     }
-    sql.push_str(" ORDER BY source_kind ASC, id ASC LIMIT 1");
+    sql.push_str(
+        " ORDER BY (parent_session_id IS NULL) DESC, source_kind ASC, turn_no ASC, id ASC LIMIT 1",
+    );
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let mut rows = stmt
         .query(rusqlite::params_from_iter(params_vec))
@@ -4498,26 +6310,128 @@ pub fn get_session_cwd(
     }
 }
 
+/// Returns the canonical model for a session row from the database.
+///
+/// For Copilot App / CLI subagent synthetic rows (`<main>__<agent_id>`), this
+/// returns the child session's own model (the one written by the collector for
+/// the subagent's usage), NOT the parent session's model. The session detail
+/// handler uses this to seed the timeline parser so the subagent drawer's
+/// `metadata.selected_model` and `AgentReply.model` reflect the child model
+/// even when the shared `events.jsonl` only carries the parent's
+/// `session.start.selectedModel`.
+///
+/// `source_dir_key` mirrors the same scoping as [`get_session_cwd`] and
+/// [`get_session_turns_token_stats`]. Returns `None` when the session has no
+/// model column populated (caller then falls back to the parser default).
+pub fn get_session_model(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+    session_id: &str,
+    source_kind: Option<&str>,
+    source_dir_key: Option<&str>,
+) -> Result<Option<String>, String> {
+    // None means source_dir_key IS NULL (non-App rows only), not "any source".
+    // The legacy `source_kind = None` path MUST resolve a single
+    // `source_kind` via `resolve_session_source_kind` so the model lookup
+    // always observes the same source row as identity / CWD / turn stats;
+    // otherwise a session_id with rows from multiple collectors could leak
+    // the model from a different source.
+    let resolved_source_kind =
+        resolve_session_source_kind(conn, assistant, session_id, source_kind, source_dir_key)?;
+    let resolved_source_kind = match resolved_source_kind {
+        Some(k) => k,
+        None => return Ok(None),
+    };
+
+    let mut sql = String::from(
+        "SELECT model FROM usage_entries
+         WHERE assistant_type = ? AND session_id = ? AND source_kind = ?
+           AND model IS NOT NULL AND model != ''",
+    );
+    let mut params_vec: Vec<rusqlite::types::Value> = vec![
+        rusqlite::types::Value::Text(assistant.to_string()),
+        rusqlite::types::Value::Text(session_id.to_string()),
+        rusqlite::types::Value::Text(resolved_source_kind),
+    ];
+    if let Some(key) = source_dir_key {
+        sql.push_str(" AND source_dir_key = ?");
+        params_vec.push(rusqlite::types::Value::Text(key.to_string()));
+    } else {
+        sql.push_str(" AND source_dir_key IS NULL");
+    }
+    sql.push_str(
+        " ORDER BY (parent_session_id IS NULL) DESC, source_kind ASC, turn_no ASC, id ASC LIMIT 1",
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(params_vec))
+        .map_err(|e| e.to_string())?;
+    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        Ok(row.get::<_, Option<String>>(0).ok().flatten())
+    } else {
+        Ok(None)
+    }
+}
+
+fn add_optional_token_total(current: &mut Option<u64>, incoming: Option<u64>) {
+    if let Some(value) = incoming {
+        *current = Some(current.unwrap_or(0).saturating_add(value));
+    }
+}
+
 pub fn get_session_turns_token_stats(
     conn: &rusqlite::Connection,
     assistant: &str,
     session_id: &str,
     source_kind: Option<&str>,
+    source_dir_key: Option<&str>,
 ) -> Result<HashMap<u32, (TokenStats, String)>, String> {
-    let mut map = HashMap::new();
+    let mut map: HashMap<u32, (TokenStats, String)> = HashMap::new();
+    // None means source_dir_key IS NULL (non-App rows only), not "any source".
+    // The legacy `source_kind = None` path MUST resolve a single
+    // `source_kind` via `resolve_session_source_kind` so the turn-stats
+    // lookup always observes the same source row as identity / CWD / model
+    // AND so all returned turns come from a single collector. Without
+    // resolving first, the previous per-turn "first row encountered" rule
+    // could mix rows from different sources (e.g. `copilot-cli` turn 1 +
+    // `vscode-chat` turn 2, both `source_dir_key IS NULL`) into a single
+    // map, violating the "legacy fallback must pick a single source"
+    // contract.
+    let resolved_source_kind =
+        resolve_session_source_kind(conn, assistant, session_id, source_kind, source_dir_key)?;
+    let resolved_source_kind = match resolved_source_kind {
+        Some(k) => k,
+        None => return Ok(map),
+    };
+
     let mut sql = String::from(
         "SELECT turn_no, delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total, model
-         FROM usage_entries WHERE assistant_type = ? AND session_id = ?",
+         FROM usage_entries
+         WHERE assistant_type = ? AND session_id = ? AND source_kind = ?",
     );
-    let mut params_vec = vec![
+    let mut params_vec: Vec<rusqlite::types::Value> = vec![
         rusqlite::types::Value::Text(assistant.to_string()),
         rusqlite::types::Value::Text(session_id.to_string()),
+        rusqlite::types::Value::Text(resolved_source_kind),
     ];
-    if let Some(source_kind) = source_kind {
-        sql.push_str(" AND source_kind = ?");
-        params_vec.push(rusqlite::types::Value::Text(source_kind.to_string()));
+    if let Some(key) = source_dir_key {
+        sql.push_str(" AND source_dir_key = ?");
+        params_vec.push(rusqlite::types::Value::Text(key.to_string()));
+    } else {
+        sql.push_str(" AND source_dir_key IS NULL");
     }
-    sql.push_str(" ORDER BY turn_no ASC, id ASC");
+    // Order by turn_no first so the per-turn map mirrors natural turn order.
+    // Within the same turn_no, prefer main agent rows
+    // (`(parent_session_id IS NULL) DESC` puts NULL/main rows ahead of
+    // NOT NULL/subagent rows) so turn stats never mix main and subagent
+    // synthetic rows; then `source_kind ASC` (deterministic) and finally
+    // `id ASC` as the stable final tie-breaker. After resolving the
+    // source_kind above, every row in the result set already comes from
+    // the same source, so this ORDER BY only matters for tie-breaks
+    // within that source.
+    sql.push_str(
+        " ORDER BY turn_no ASC, (parent_session_id IS NULL) DESC, source_kind ASC, id ASC",
+    );
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let mut rows = stmt
         .query(rusqlite::params_from_iter(params_vec))
@@ -4561,22 +6475,41 @@ pub fn get_session_turns_token_stats(
                     .get::<_, Option<String>>(9)
                     .unwrap_or(None)
                     .unwrap_or_else(|| "Gemini".to_string());
-                map.insert(
-                    turn_no as u32,
-                    (
-                        TokenStats {
-                            input: input as u64,
-                            output: output as u64,
-                            cache_read,
-                            cache_write,
-                            cache_write_5m,
-                            cache_write_1h,
-                            reasoning,
-                            total: total as u64,
-                        },
-                        model,
-                    ),
-                );
+                let turn_no = turn_no as u32;
+                if let Some((existing, existing_models)) = map.get_mut(&turn_no) {
+                    existing.input = existing.input.saturating_add(input as u64);
+                    existing.output = existing.output.saturating_add(output as u64);
+                    add_optional_token_total(&mut existing.cache_read, cache_read);
+                    add_optional_token_total(&mut existing.cache_write, cache_write);
+                    add_optional_token_total(&mut existing.cache_write_5m, cache_write_5m);
+                    add_optional_token_total(&mut existing.cache_write_1h, cache_write_1h);
+                    add_optional_token_total(&mut existing.reasoning, reasoning);
+                    existing.total = existing.total.saturating_add(total as u64);
+                    if !existing_models
+                        .split(" + ")
+                        .any(|existing_model| existing_model == model)
+                    {
+                        existing_models.push_str(" + ");
+                        existing_models.push_str(&model);
+                    }
+                } else {
+                    map.insert(
+                        turn_no,
+                        (
+                            TokenStats {
+                                input: input as u64,
+                                output: output as u64,
+                                cache_read,
+                                cache_write,
+                                cache_write_5m,
+                                cache_write_1h,
+                                reasoning,
+                                total: total as u64,
+                            },
+                            model,
+                        ),
+                    );
+                }
             }
         }
     }
@@ -4629,12 +6562,12 @@ pub fn get_usage_entries_by_month(
     assistant: &str,
 ) -> Result<Vec<(UsageEntry, String, String)>, String> {
     let query_month = format!("{}-%", year_month);
-    let mut query = "SELECT 
+    let mut query = "SELECT
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
-            date, source_kind
+            date, source_kind, source_dir_key
          FROM usage_entries WHERE date LIKE ?".to_string();
     let mut params_vec = Vec::new();
     params_vec.push(rusqlite::types::Value::Text(query_month));
@@ -4798,6 +6731,7 @@ pub fn get_usage_entries_by_month(
                 context: None,
                 cost,
                 source_kind: row.get(33).ok(),
+                source_dir_key: row.get(34).ok(),
                 parent_session_id: row.get(27).ok(),
                 agent_nickname: row.get(28).ok(),
                 agent_role: row.get(29).ok(),
@@ -4856,12 +6790,12 @@ pub fn get_usage_entries_by_year(
     assistant: &str,
 ) -> Result<Vec<(UsageEntry, String, String)>, String> {
     let query_year = format!("{}-%", year);
-    let mut query = "SELECT 
+    let mut query = "SELECT
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
-            date, source_kind
+            date, source_kind, source_dir_key
          FROM usage_entries WHERE date LIKE ?".to_string();
     let mut params_vec = Vec::new();
     params_vec.push(rusqlite::types::Value::Text(query_year));
@@ -5025,6 +6959,7 @@ pub fn get_usage_entries_by_year(
                 context: None,
                 cost,
                 source_kind: row.get(33).ok(),
+                source_dir_key: row.get(34).ok(),
                 parent_session_id: row.get(27).ok(),
                 agent_nickname: row.get(28).ok(),
                 agent_role: row.get(29).ok(),
@@ -5063,6 +6998,110 @@ mod tests {
             unique
         ));
         path
+    }
+
+    fn create_copilot_app_registry_from_events(app_dir: &Path) {
+        let store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        let session_ids: Vec<String> = store
+            .prepare("SELECT DISTINCT session_id FROM assistant_usage_events")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        drop(store);
+
+        let data_db = Connection::open(app_dir.join("data.db")).unwrap();
+        data_db
+            .execute(
+                "CREATE TABLE IF NOT EXISTS sessions (
+                    id TEXT PRIMARY KEY,
+                    title TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+        for session_id in session_ids {
+            data_db
+                .execute(
+                    "INSERT OR IGNORE INTO sessions (id, title) VALUES (?, NULL)",
+                    params![session_id],
+                )
+                .unwrap();
+        }
+    }
+
+    fn create_copilot_app_registry(app_dir: &Path, session_ids: &[&str]) {
+        let data_db = Connection::open(app_dir.join("data.db")).unwrap();
+        data_db
+            .execute(
+                "CREATE TABLE IF NOT EXISTS sessions (
+                    id TEXT PRIMARY KEY,
+                    title TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+        for session_id in session_ids {
+            data_db
+                .execute(
+                    "INSERT OR IGNORE INTO sessions (id, title) VALUES (?, NULL)",
+                    params![session_id],
+                )
+                .unwrap();
+        }
+    }
+
+    fn create_test_copilot_session_store(app_dir: &Path) -> Connection {
+        let store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+        store
+    }
+
+    fn insert_test_copilot_event(
+        store: &Connection,
+        id: i64,
+        session_id: &str,
+        turn_index: i64,
+        created_at: &str,
+    ) {
+        store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (?, ?, ?, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', ?)",
+                params![id, session_id, turn_index, created_at],
+            )
+            .unwrap();
+    }
+
+    fn test_copilot_source_key(app_dir: &Path) -> String {
+        let canonical = app_dir.canonicalize().unwrap();
+        encode_hex(canonical.as_os_str().as_encoded_bytes())
     }
 
     fn sample_import_record() -> UsageDayExportRecord {
@@ -5104,6 +7143,7 @@ mod tests {
                     total_premium_requests: Some(1.0),
                 }),
                 source_kind: None,
+                source_dir_key: None,
                 parent_session_id: Some("parent-session".to_string()),
                 agent_nickname: Some("worker".to_string()),
                 agent_role: Some("analysis".to_string()),
@@ -5668,7 +7708,8 @@ mod tests {
         let month_entries = get_usage_entries_by_month(&conn, "2026-07", "claude").unwrap();
         let year_entries = get_usage_entries_by_year(&conn, "2026", "claude").unwrap();
         let turn_entries =
-            get_session_turns_token_stats(&conn, "claude", "claude-cache-write-ttl", None).unwrap();
+            get_session_turns_token_stats(&conn, "claude", "claude-cache-write-ttl", None, None)
+                .unwrap();
         let entries = [
             &day_entries[0].0.entry,
             &month_entries[0].0,
@@ -5729,17 +7770,23 @@ mod tests {
             .unwrap();
         }
 
-        let (_, transcript_path, source_kind) =
-            get_session_assistant_and_transcript(&conn, "copilot", "shared", Some("vscode-chat"))
-                .unwrap();
+        let (_, transcript_path, source_kind, _, _, _) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            "shared",
+            Some("vscode-chat"),
+            None,
+        )
+        .unwrap();
         assert_eq!(source_kind, "vscode-chat");
         assert_eq!(transcript_path.as_deref(), Some("/tmp/vscode/session.json"));
 
-        let cwd = get_session_cwd(&conn, "copilot", "shared", Some("vscode-chat")).unwrap();
+        let cwd = get_session_cwd(&conn, "copilot", "shared", Some("vscode-chat"), None).unwrap();
         assert_eq!(cwd.as_deref(), Some("/tmp/vscode"));
 
         let turns =
-            get_session_turns_token_stats(&conn, "copilot", "shared", Some("vscode-chat")).unwrap();
+            get_session_turns_token_stats(&conn, "copilot", "shared", Some("vscode-chat"), None)
+                .unwrap();
         let (tokens, model) = turns.get(&1).unwrap();
         assert_eq!(tokens.input, 20);
         assert_eq!(tokens.output, 1);
@@ -7612,5 +9659,5389 @@ mod tests {
             )
             .unwrap();
         assert_eq!(migrated, 2);
+    }
+
+    #[test]
+    fn sync_copilot_app_usage_logs_inserts_per_turn_rows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-sync").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        // Build session-store.db with two sessions, 3 turns each.
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let session_a = "app-session-a";
+        let session_b = "app-session-b";
+        for turn in 0..3i64 {
+            for session_id in [session_a, session_b] {
+                let id = turn * 2 + if session_id == session_a { 1 } else { 2 };
+                let ts = format!("2026-07-20 10:0{}:00", turn);
+                session_store
+                    .execute(
+                        "INSERT INTO assistant_usage_events
+                            (id, session_id, turn_index, model,
+                             input_tokens, output_tokens,
+                             cache_read_tokens, cache_write_tokens,
+                             reasoning_tokens, duration_ms,
+                             reasoning_effort, created_at)
+                         VALUES (?, ?, ?, 'gpt-5', ?, ?, 0, 0, 0, 100, 'medium', ?)",
+                        params![id, session_id, turn, (turn + 1) * 100, (turn + 1) * 10, ts,],
+                    )
+                    .unwrap();
+            }
+        }
+
+        // Build data.db with session titles.
+        let data_db = Connection::open(app_dir.join("data.db")).unwrap();
+        data_db
+            .execute(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    title TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+        data_db
+            .execute(
+                "INSERT INTO sessions (id, title) VALUES (?, 'Session A'), (?, 'Session B')",
+                params![session_a, session_b],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let total: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 6, "expected 6 per-turn rows (2 sessions x 3 turns)");
+
+        // Delta tokens equal per-turn totals (source is per-API-call usage,
+        // not cumulative session totals, so no differencing is performed).
+        let turn0: (i64, i64) = conn
+            .query_row(
+                "SELECT tokens_input, delta_input
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ? AND turn_no = 1",
+                params![session_a],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            turn0,
+            (100, 100),
+            "turn 0 delta should equal per-turn total"
+        );
+
+        let turn1: (i64, i64) = conn
+            .query_row(
+                "SELECT tokens_input, delta_input
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ? AND turn_no = 2",
+                params![session_a],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            turn1,
+            (200, 200),
+            "turn 1 delta should equal per-turn total"
+        );
+
+        let turn2: (i64, i64) = conn
+            .query_row(
+                "SELECT tokens_input, delta_input
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ? AND turn_no = 3",
+                params![session_a],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            turn2,
+            (300, 300),
+            "turn 2 delta should equal per-turn total"
+        );
+
+        // Verify session title resolved from data.db.
+        let title: Option<String> = conn
+            .query_row(
+                "SELECT session_name FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ? LIMIT 1",
+                params![session_b],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title.as_deref(), Some("Session B"));
+
+        // Verify the cursor was written and is scoped by the canonical source path.
+        let cursor_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor_count, 1);
+
+        let snapshot_before_second: Vec<(String, i64, i64, i64)> = conn
+            .prepare(
+                "SELECT session_id, turn_no, tokens_input, tokens_total
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                 ORDER BY session_id, turn_no",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+
+        // Second run has no new events: it must be quiet and perform zero
+        // upserts, leaving all persisted turn data unchanged.
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let total_after: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total_after, 6, "second sync should not duplicate rows");
+        let snapshot_after_second: Vec<(String, i64, i64, i64)> = conn
+            .prepare(
+                "SELECT session_id, turn_no, tokens_input, tokens_total
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                 ORDER BY session_id, turn_no",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(snapshot_after_second, snapshot_before_second);
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify that a turn which receives additional API calls after the first
+    /// sync is re-aggregated from the full event history and upserted, rather
+    /// than being silently dropped by INSERT OR IGNORE.
+    #[test]
+    fn sync_copilot_app_usage_logs_upserts_turns_with_new_events() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-upsert").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let session_a = "app-session-a";
+        // First API call for turn 0, early timestamp.
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (1, ?, 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                params![session_a],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        create_copilot_app_registry_from_events(&app_dir);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let turn0_total: i64 = conn
+            .query_row(
+                "SELECT tokens_input FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ? AND turn_no = 1",
+                params![session_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(turn0_total, 100, "initial turn 0 total should be 100");
+
+        // Second API call for the SAME turn 0, later timestamp.
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (2, ?, 0, 'gpt-5', 250, 20, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:05')",
+                params![session_a],
+            )
+            .unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let turn0_total_after: i64 = conn
+            .query_row(
+                "SELECT tokens_input FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ? AND turn_no = 1",
+                params![session_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            turn0_total_after, 350,
+            "turn 0 must be re-aggregated to 100 + 250 after upsert"
+        );
+
+        let row_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ?",
+                params![session_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "no duplicate rows should be created");
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify that switching COPILOT_APP_DIR uses an independent cursor and
+    /// does not skip earlier events in the new source directory.
+    #[test]
+    fn sync_copilot_app_usage_logs_cursor_is_scoped_by_source_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-cursor-scope").with_extension("");
+        let app_dir_a = base_dir.join("app-a");
+        let app_dir_b = base_dir.join("app-b");
+        fs::create_dir_all(&app_dir_a).unwrap();
+        fs::create_dir_all(&app_dir_b).unwrap();
+
+        let build_store = |dir: &Path| {
+            let store = Connection::open(dir.join("session-store.db")).unwrap();
+            store
+                .execute(
+                    "CREATE TABLE assistant_usage_events (
+                        id INTEGER PRIMARY KEY,
+                        session_id TEXT,
+                        turn_index INTEGER,
+                        model TEXT,
+                        agent_id TEXT,
+                        initiator TEXT,
+                        input_tokens INTEGER,
+                        output_tokens INTEGER,
+                        cache_read_tokens INTEGER,
+                        cache_write_tokens INTEGER,
+                        reasoning_tokens INTEGER,
+                        duration_ms INTEGER,
+                        reasoning_effort TEXT,
+                        created_at TEXT
+                     )",
+                    [],
+                )
+                .unwrap();
+            store
+        };
+
+        let store_a = build_store(&app_dir_a);
+        let store_b = build_store(&app_dir_b);
+
+        // Directory A: one turn at 2026-07-20 10:00:00.
+        store_a
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (1, 'sess-a', 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                [],
+            )
+            .unwrap();
+
+        // Directory B: one turn at an EARLIER timestamp than A's cursor would be.
+        store_b
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (1, 'sess-b', 0, 'gpt-5', 50, 5, 0, 0, 0, 100, 'medium', '2026-07-19 09:00:00')",
+                [],
+            )
+            .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        create_copilot_app_registry_from_events(&app_dir_a);
+        // Sync from A first; this establishes a cursor at 2026-07-20 10:00:00.
+        std::env::set_var("COPILOT_APP_DIR", &app_dir_a);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        // Switch to B. A correct scoped cursor must NOT reuse A's cursor; B's
+        // earlier event must still be ingested.
+        create_copilot_app_registry_from_events(&app_dir_b);
+        std::env::set_var("COPILOT_APP_DIR", &app_dir_b);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let b_total: i64 = conn
+            .query_row(
+                "SELECT tokens_input FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = 'sess-b'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_total, 50, "directory B's earlier event must be ingested");
+
+        // Both cursors should coexist (one per source directory).
+        let cursor_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cursor_count, 2,
+            "each source directory must have its own cursor"
+        );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Events can share a timestamp, so the event id must be part of both the
+    /// ordering and the high-water mark.
+    #[test]
+    fn sync_copilot_app_usage_logs_imports_same_timestamp_events_once() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-same-timestamp").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        for (id, session_id, turn_index, input) in [
+            (1i64, "same-ts", 0i64, 10i64),
+            (2, "same-ts", 1, 20),
+            (3, "same-ts", 0, 30),
+        ] {
+            session_store
+                .execute(
+                    "INSERT INTO assistant_usage_events
+                        (id, session_id, turn_index, model, input_tokens,
+                         output_tokens, cache_read_tokens, cache_write_tokens,
+                         reasoning_tokens, duration_ms, reasoning_effort, created_at)
+                     VALUES (?, ?, ?, 'gpt-5', ?, 1, 0, 0, 0, 100, 'medium',
+                             '2026-07-20 10:00:00')",
+                    params![id, session_id, turn_index, input],
+                )
+                .unwrap();
+        }
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        create_copilot_app_registry_from_events(&app_dir);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let cursor: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cursor.ends_with("::2026-07-20 10:00:00::3"));
+
+        let first_snapshot: Vec<(i64, i64)> = conn
+            .prepare(
+                "SELECT turn_no, tokens_input FROM usage_entries
+                 WHERE source_kind = 'copilot-app' ORDER BY turn_no",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(first_snapshot, vec![(1, 40), (2, 20)]);
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let second_snapshot: Vec<(i64, i64)> = conn
+            .prepare(
+                "SELECT turn_no, tokens_input FROM usage_entries
+                 WHERE source_kind = 'copilot-app' ORDER BY turn_no",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(second_snapshot, first_snapshot);
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// A timestamp-only cursor must re-scan its timestamp boundary once and
+    /// then persist the upgraded tuple cursor without recurring re-syncs.
+    #[test]
+    fn sync_copilot_app_usage_logs_upgrades_legacy_timestamp_cursor() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-legacy-cursor").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, input_tokens,
+                     output_tokens, cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms, reasoning_effort, created_at)
+                 VALUES (1, 'legacy-sess', 0, 'gpt-5', 10, 1, 0, 0, 0, 100,
+                         'medium', '2026-07-20 10:00:00'),
+                        (2, 'legacy-sess', 1, 'gpt-5', 20, 2, 0, 0, 0, 100,
+                         'medium', '2026-07-20 10:00:00'),
+                        (3, 'legacy-sess', 0, 'gpt-5', 30, 3, 0, 0, 0, 100,
+                         'medium', '2026-07-20 10:05:00')",
+                [],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+        let canonical_app_dir = app_dir.canonicalize().unwrap();
+        let source_key = encode_hex(canonical_app_dir.as_os_str().as_encoded_bytes());
+        let cursor_prefix = format!("{}{}::", COPILOT_APP_CURSOR_PREFIX, source_key);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        create_copilot_app_registry_from_events(&app_dir);
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 0, 0)",
+            params![format!("{}2026-07-20 10:00:00", cursor_prefix)],
+        )
+        .unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let cursor: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cursor.ends_with("::2026-07-20 10:05:00::3"));
+
+        let totals: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        (SELECT tokens_input FROM usage_entries WHERE turn_no = 1),
+                        (SELECT tokens_input FROM usage_entries WHERE turn_no = 2)
+                 FROM usage_entries WHERE source_kind = 'copilot-app'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(totals, (2, 40, 20));
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let count_after_second: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE source_kind = 'copilot-app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_after_second, 2);
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify that cache-read tokens are not double-counted.
+    /// `assistant_usage_events.input_tokens` already includes cache reads, so
+    /// `tokens_input` must be normalized to `input - cache_read`, and
+    /// `tokens_total` must count `cache_read` only once (via its own column).
+    #[test]
+    fn sync_copilot_app_usage_logs_separates_cached_input() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-cache").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        // One turn with input=443_554 (includes 401_024 cache reads),
+        // output=1_370, reasoning=384. Mirror the Copilot CLI normalization
+        // fixture: net input should be 42_530, total should be 444_924.
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (1, 'sess-c', 0, 'gpt-5', 443554, 1370, 401024, 0, 384, 100, 'medium', '2026-07-20 10:00:00')",
+                [],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        create_copilot_app_registry_from_events(&app_dir);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let row: (i64, i64, i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT tokens_input, tokens_cache_read, tokens_output, tokens_reasoning,
+                        tokens_total, delta_input, delta_total
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = 'sess-c' AND turn_no = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(row.0, 42_530, "tokens_input must exclude cache_read");
+        assert_eq!(
+            row.1, 401_024,
+            "tokens_cache_read keeps the raw cache total"
+        );
+        assert_eq!(row.2, 1_370, "tokens_output");
+        assert_eq!(row.3, 384, "tokens_reasoning");
+        // total = net_input + cache_read + output + reasoning = 42_530 + 401_024 + 1_370 + 384
+        assert_eq!(row.4, 445_308, "tokens_total counts cache_read once");
+        assert_eq!(row.5, 42_530, "delta_input must also exclude cache_read");
+        assert_eq!(row.6, 445_308, "delta_total must match tokens_total");
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify the cursor advances to the max raw event `(created_at, id)`, not
+    /// the per-turn MIN, so a turn whose events straddle the cursor does not
+    /// get re-aggregated forever on subsequent syncs.
+    #[test]
+    fn sync_copilot_app_usage_logs_cursor_advances_to_max_event_ts() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-cursor-max").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let session_a = "sess-a";
+        // Turn 0 has two events at 10:00 and 10:05.
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (1, ?, 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                params![session_a],
+            )
+            .unwrap();
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (2, ?, 0, 'gpt-5', 200, 20, 0, 0, 0, 100, 'medium', '2026-07-20 10:05:00')",
+                params![session_a],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        create_copilot_app_registry_from_events(&app_dir);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        // The cursor must be at the max raw event tuple, not the per-turn MIN.
+        let cursor: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert!(
+            cursor.ends_with("::2026-07-20 10:05:00::2"),
+            "cursor must advance to max raw event tuple, got: {}",
+            cursor
+        );
+
+        // A second sync with NO new events is quiet: the turn straddling the
+        // old timestamp is not re-aggregated, so the total stays at 300.
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let row_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ?",
+                params![session_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "no duplicate rows after idempotent re-sync");
+        let total_input: i64 = conn
+            .query_row(
+                "SELECT tokens_input FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ? AND turn_no = 1",
+                params![session_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            total_input, 300,
+            "turn 0 total should remain 300 after idempotent re-sync"
+        );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify the cursor and usage rows do NOT change when a turn fails to write, so the
+    /// failed turn is retried on the next sync instead of being permanently
+    /// skipped. We simulate a write failure by installing a trigger on
+    /// `usage_entries` that rejects inserts for `copilot-app` source_kind.
+    #[test]
+    fn sync_copilot_app_usage_logs_cursor_rollback_on_write_failure() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-cursor-rollback").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let session_a = "sess-a";
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (1, ?, 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                params![session_a],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        create_copilot_app_registry_from_events(&app_dir);
+        // First sync succeeds and establishes a cursor at 10:00:00.
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let cursor_after_first: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert!(
+            cursor_after_first.ends_with("::2026-07-20 10:00:00::1"),
+            "cursor should be at 10:00:00 after first sync, got: {}",
+            cursor_after_first
+        );
+
+        // Install a trigger that rejects new inserts for copilot-app rows,
+        // simulating a persistent write failure (e.g. schema drift, disk).
+        conn.execute(
+            "CREATE TRIGGER reject_copilot_app_insert
+             BEFORE INSERT ON usage_entries
+             WHEN NEW.source_kind = 'copilot-app'
+             BEGIN
+                 SELECT RAFAIL('simulated write failure');
+             END",
+            [],
+        )
+        .unwrap();
+
+        // Add a new event at 10:05 so the touched-turns query returns a row that
+        // will fail to upsert.
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (2, ?, 1, 'gpt-5', 200, 20, 0, 0, 0, 100, 'medium', '2026-07-20 10:05:00')",
+                params![session_a],
+            )
+            .unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        // Cursor must NOT have advanced to 10:05 because the upsert failed; it
+        // must remain at 10:00:00 so the turn is retried next sync.
+        let usage_count_after_failure: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(usage_count_after_failure, 1, "failed upsert must rollback");
+        let cursor_after_failure: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert!(
+            cursor_after_failure.ends_with("::2026-07-20 10:00:00::1"),
+            "cursor must not advance on write failure, got: {}",
+            cursor_after_failure
+        );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify import_source_id includes the source directory key so turns from
+    /// different COPILOT_APP_DIR with the same (session_id, turn_index) do not
+    /// share a dedup key.
+    #[test]
+    fn sync_copilot_app_usage_logs_import_source_id_includes_source_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-import-src").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (1, 'sess-x', 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                [],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        create_copilot_app_registry_from_events(&app_dir);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let import_source_id: String = conn
+            .query_row(
+                "SELECT import_source_id FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = 'sess-x' AND turn_no = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // import_source_id must include source, session, turn, agent, and model.
+        assert!(
+            import_source_id.starts_with("copilot-app:"),
+            "import_source_id must start with copilot-app: prefix, got: {}",
+            import_source_id
+        );
+        let rest = &import_source_id["copilot-app:".len()..];
+        // The source key is the first colon-delimited component after the
+        // prefix and must be non-empty hex.
+        let hex_segment = rest.split(':').next().unwrap_or("");
+        assert!(
+            !hex_segment.is_empty() && hex_segment.chars().all(|c| c.is_ascii_hexdigit()),
+            "import_source_id must include a non-empty hex source key, got: {}",
+            import_source_id
+        );
+        let expected_suffix = format!(":sess-x:0:main:{}", encode_hex(b"gpt-5"));
+        assert!(
+            import_source_id.ends_with(&expected_suffix),
+            "import_source_id must end with session, turn, agent and model identity, got: {}",
+            import_source_id
+        );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify that a Copilot App turn with both a main agent (NULL agent_id,
+    /// DP4F) and a subagent (non-null agent_id, K2.7) produces two distinct
+    /// usage rows, each with its own model and token totals, and that their
+    /// token sums equal the raw event totals.
+    #[test]
+    fn sync_copilot_app_usage_logs_splits_main_agent_and_subagent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-subagent-split").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let session_id = "74b6d236-d311-4675-9855-fee91bc508e5";
+        let agent_id = "call_v4b32z66";
+        // Main agent: 2 events, DP4F.
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES
+                    (1, ?, 0, 'DP4F', NULL, NULL, 100000, 800, 0, 0, 1500, 500, 'medium', '2026-07-21 02:59:16'),
+                    (2, ?, 0, 'DP4F', NULL, NULL, 1261894, 17622, 0, 0, 88, 1500, 'medium', '2026-07-21 03:01:00')",
+                params![session_id, session_id],
+            )
+            .unwrap();
+        // Subagent: 2 events, K2.7.
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES
+                    (3, ?, 0, 'K2.7', ?, 'sub-agent', 2000000, 20000, 0, 0, 100, 2000, NULL, '2026-07-21 02:59:20'),
+                    (4, ?, 0, 'K2.7', ?, 'sub-agent', 1156615, 8069, 0, 0, 97, 2000, NULL, '2026-07-21 03:05:00')",
+                params![session_id, agent_id, session_id, agent_id],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        create_copilot_app_registry(&app_dir, &[session_id]);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let main_row: (i64, i64, Option<String>, Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT tokens_total, delta_total, model, parent_session_id, agent_nickname, agent_role
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ? AND turn_no = 1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            main_row.2.as_deref(),
+            Some("DP4F"),
+            "main agent model must be DP4F"
+        );
+        assert!(
+            main_row.3.is_none(),
+            "main agent must have no parent_session_id"
+        );
+        assert!(
+            main_row.4.is_none(),
+            "main agent must have no agent_nickname"
+        );
+        assert!(
+            main_row.5.is_none(),
+            "main agent agent_role must be NULL (initiator is NULL)"
+        );
+        // DP4F events: input 100000+1261894=1361894, output 800+17622=18422, reasoning 1500+88=1588
+        let dp4f_total = 1361894 + 18422 + 1588;
+        assert_eq!(
+            main_row.0, dp4f_total,
+            "main agent total must match DP4F event sum"
+        );
+        assert_eq!(
+            main_row.1, dp4f_total,
+            "main agent delta_total must match DP4F event sum"
+        );
+
+        let synthetic_id = format!("{}__{}", session_id, agent_id);
+        let sub_row: (i64, i64, Option<String>, Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT tokens_total, delta_total, model, parent_session_id, agent_nickname, agent_role
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ? AND turn_no = 1",
+                params![synthetic_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            sub_row.2.as_deref(),
+            Some("K2.7"),
+            "subagent model must be K2.7"
+        );
+        assert_eq!(
+            sub_row.3.as_deref(),
+            Some(session_id),
+            "subagent parent_session_id must be the main session id"
+        );
+        assert_eq!(
+            sub_row.4.as_deref(),
+            Some(agent_id),
+            "subagent agent_nickname must be the agent_id"
+        );
+        assert_eq!(
+            sub_row.5.as_deref(),
+            Some("sub-agent"),
+            "subagent agent_role must be 'sub-agent' when initiator is 'sub-agent'"
+        );
+        // K2.7 events: input 2000000+1156615=3156615, output 20000+8069=28069, reasoning 100+97=197
+        let k27_total = 3156615 + 28069 + 197;
+        assert_eq!(
+            sub_row.0, k27_total,
+            "subagent total must match K2.7 event sum"
+        );
+        assert_eq!(
+            sub_row.1, k27_total,
+            "subagent delta_total must match K2.7 event sum"
+        );
+
+        // Sum of the two rows equals the raw event total (no double counting).
+        assert_eq!(
+            main_row.0 + sub_row.0,
+            dp4f_total + k27_total,
+            "split row totals must sum to raw event totals"
+        );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn sync_copilot_app_usage_logs_preserves_multiple_models_for_same_agent_turn() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-multi-model").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "app-multi-model-session";
+        let store = create_test_copilot_session_store(&app_dir);
+        for (id, model, input, output) in [(1i64, "gpt-5", 100i64, 10i64), (2, "claude-4", 200, 20)]
+        {
+            store
+                .execute(
+                    "INSERT INTO assistant_usage_events (
+                        id, session_id, turn_index, model, agent_id, initiator,
+                        input_tokens, output_tokens, cache_read_tokens,
+                        cache_write_tokens, reasoning_tokens, duration_ms,
+                        reasoning_effort, created_at
+                     ) VALUES (?, ?, 0, ?, 'call_same', 'sub-agent', ?, ?, 0, 0, 0, 10, NULL, ?)",
+                    params![
+                        id,
+                        session_id,
+                        model,
+                        input,
+                        output,
+                        format!("2026-07-22T10:00:0{id}")
+                    ],
+                )
+                .unwrap();
+        }
+        create_copilot_app_registry(&app_dir, &[session_id]);
+        drop(store);
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let rows: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT model, tokens_total
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot'
+                   AND source_kind = 'copilot-app'
+                   AND session_id = ?
+                 ORDER BY model",
+            )
+            .unwrap()
+            .query_map([format!("{session_id}__call_same")], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("claude-4".to_string(), 220), ("gpt-5".to_string(), 110)],
+            "同一 App Agent／Turn 的每個模型都必須保留獨立用量"
+        );
+        let source_key = test_copilot_source_key(&app_dir);
+        let timeline_rows = get_session_turns_token_stats(
+            &conn,
+            "copilot",
+            &format!("{session_id}__call_same"),
+            Some("copilot-app"),
+            Some(&source_key),
+        )
+        .unwrap();
+        let (timeline_tokens, timeline_models) = timeline_rows.get(&1).unwrap();
+        assert_eq!(
+            timeline_tokens.total, 330,
+            "timeline 必須彙總同回合的所有模型"
+        );
+        assert!(timeline_models.contains("gpt-5"));
+        assert!(timeline_models.contains("claude-4"));
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify re-syncing the same events does not duplicate rows (idempotency)
+    /// and that adding new events for an existing turn upserts correctly.
+    #[test]
+    fn sync_copilot_app_usage_logs_subagent_idempotent_and_upserts() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-subagent-idem").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let session_id = "split-sess";
+        let agent_id = "call_abc";
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES
+                    (1, ?, 0, 'DP4F', NULL, NULL, 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00'),
+                    (2, ?, 0, 'K2.7', ?, 'sub-agent', 200, 20, 0, 0, 0, 200, NULL, '2026-07-20 10:00:05')",
+                params![session_id, session_id, agent_id],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        create_copilot_app_registry(&app_dir, &[session_id]);
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let count_after_first: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count_after_first, 2,
+            "first sync must produce 2 rows (main + subagent)"
+        );
+
+        // Re-sync: no new events → no new rows.
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let count_after_second: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count_after_second, 2,
+            "re-sync without new events must not duplicate rows"
+        );
+
+        // Add a new event to the subagent (same turn) → upsert should update
+        // the subagent row's totals, not create a third row.
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (3, ?, 0, 'K2.7', ?, 'sub-agent', 50, 5, 0, 0, 0, 50, NULL, '2026-07-20 10:00:10')",
+                params![session_id, agent_id],
+            )
+            .unwrap();
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let count_after_add: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count_after_add, 2,
+            "adding subagent events must upsert, not add a row"
+        );
+
+        let synthetic_id = format!("{}__{}", session_id, agent_id);
+        let sub_total: i64 = conn
+            .query_row(
+                "SELECT tokens_total FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ?",
+                params![synthetic_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // 200+20 + 50+5 = 275
+        assert_eq!(sub_total, 275, "subagent totals must reflect added events");
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify that Copilot App subagent rows whose `initiator` is NULL or an
+    /// unknown value get `agent_role = NULL` (never guessed), while a subagent
+    /// with `initiator = 'sub-agent'` gets `agent_role = 'sub-agent'`. The main
+    /// agent row always has `agent_role = NULL`. This matches the Copilot CLI
+    /// collector semantics so the same subagent produces identical metadata
+    /// across App and CLI.
+    #[test]
+    fn sync_copilot_app_usage_logs_agent_role_follows_initiator() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-agent-role").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let session_id = "role-sess";
+        // Main agent: initiator NULL → agent_role NULL.
+        // Subagent A: initiator 'sub-agent' → agent_role 'sub-agent'.
+        // Subagent B: initiator NULL → agent_role NULL (do not guess).
+        // Subagent C: initiator 'worker' (unknown) → agent_role NULL (do not guess).
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES
+                    (1, ?, 0, 'DP4F', NULL, NULL, 100, 10, 0, 0, 0, 100, 'medium', '2026-07-22 10:00:00'),
+                    (2, ?, 0, 'K2.7', ?, 'sub-agent', 200, 20, 0, 0, 0, 200, NULL, '2026-07-22 10:00:01'),
+                    (3, ?, 0, 'K2.7', ?, NULL, 300, 30, 0, 0, 0, 300, NULL, '2026-07-22 10:00:02'),
+                    (4, ?, 0, 'K2.7', ?, 'worker', 400, 40, 0, 0, 0, 400, NULL, '2026-07-22 10:00:03')",
+                params![
+                    session_id,
+                    session_id, "call_sub",
+                    session_id, "call_null",
+                    session_id, "call_worker"
+                ],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        create_copilot_app_registry(&app_dir, &[session_id]);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let role_of = |agent: &str| -> Option<String> {
+            let synthetic = format!("{}__{}", session_id, agent);
+            conn.query_row(
+                "SELECT agent_role FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ? AND turn_no = 1",
+                params![synthetic],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let main_role: Option<String> = conn
+            .query_row(
+                "SELECT agent_role FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ? AND turn_no = 1 AND parent_session_id IS NULL",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(main_role.is_none(), "main agent agent_role must be NULL");
+
+        assert_eq!(
+            role_of("call_sub").as_deref(),
+            Some("sub-agent"),
+            "subagent with initiator='sub-agent' must get agent_role='sub-agent'"
+        );
+        assert_eq!(
+            role_of("call_null"),
+            None::<String>,
+            "subagent with NULL initiator must keep agent_role NULL (no guessing)"
+        );
+        assert_eq!(
+            role_of("call_worker"),
+            None::<String>,
+            "subagent with unknown initiator='worker' must keep agent_role NULL (no guessing)"
+        );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify that Copilot App and Copilot CLI produce identical subagent
+    /// metadata semantics: parent_session_id = main session id,
+    /// agent_nickname = agent_id, agent_role = 'sub-agent' only when the source
+    /// explicitly provides initiator='sub-agent'. Both collectors must not
+    /// guess a role (e.g. 'worker') for Copilot subagents.
+    #[test]
+    fn copilot_app_and_cli_subagent_metadata_consistent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-cli-consistency").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        // CLI fixture: a CLI-classified session with one main + one subagent.
+        let cli_session = "consistency-cli-sess";
+        let cli_agent = "call_cli_sub";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[cli_session]);
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id: cli_session,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:00",
+        );
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 2,
+                session_id: cli_session,
+                model: "DP4P",
+                agent_id: Some(cli_agent),
+                initiator: Some("sub-agent"),
+            },
+            CliEventTokens {
+                input: 200,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 60,
+            },
+            "2026-07-22T10:00:01",
+        );
+
+        // App fixture: an App-registry session with one main + one subagent.
+        let app_session = "consistency-app-sess";
+        let app_agent = "call_app_sub";
+        create_copilot_app_registry(&app_dir, &[app_session]);
+        store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES
+                    (3, ?, 0, 'DP4F', NULL, NULL, 100, 10, 0, 0, 0, 100, 'medium', '2026-07-22 10:00:00'),
+                    (4, ?, 0, 'K2.7', ?, 'sub-agent', 200, 20, 0, 0, 0, 200, NULL, '2026-07-22 10:00:01')",
+                params![app_session, app_session, app_agent],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, cli_session, 330);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let read_subagent = |session: &str,
+                             agent: &str,
+                             source_kind: &str|
+         -> (String, Option<String>, Option<String>, Option<String>) {
+            let synthetic = format!("{}__{}", session, agent);
+            conn.query_row(
+                "SELECT session_id, parent_session_id, agent_nickname, agent_role
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = ?
+                   AND session_id = ? AND turn_no = 1",
+                params![source_kind, synthetic],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+        };
+
+        let cli_sub = read_subagent(cli_session, cli_agent, "copilot-cli");
+        let app_sub = read_subagent(app_session, app_agent, "copilot-app");
+
+        // Synthetic session id format must match across collectors.
+        assert_eq!(
+            cli_sub.0,
+            format!("{}__{}", cli_session, cli_agent),
+            "CLI synthetic session id format"
+        );
+        assert_eq!(
+            app_sub.0,
+            format!("{}__{}", app_session, app_agent),
+            "App synthetic session id format"
+        );
+        // parent_session_id = main session id.
+        assert_eq!(cli_sub.1.as_deref(), Some(cli_session));
+        assert_eq!(app_sub.1.as_deref(), Some(app_session));
+        // agent_nickname = agent_id.
+        assert_eq!(cli_sub.2.as_deref(), Some(cli_agent));
+        assert_eq!(app_sub.2.as_deref(), Some(app_agent));
+        // agent_role = 'sub-agent' only when initiator='sub-agent'; never 'worker'.
+        assert_eq!(cli_sub.3.as_deref(), Some("sub-agent"));
+        assert_eq!(app_sub.3.as_deref(), Some("sub-agent"));
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify that re-syncing an existing Copilot App session whose subagent
+    /// rows were previously written with agent_role=NULL upgrades them to
+    /// agent_role='sub-agent' when the source events carry
+    /// initiator='sub-agent'. This is the one-time backfill path for existing
+    /// App rows, exercised by the normal INSERT OR REPLACE upsert: no duplicate
+    /// rows are created.
+    #[test]
+    fn sync_copilot_app_usage_logs_backfills_null_agent_role_on_resync() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-role-backfill").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let session_id = "backfill-sess";
+        let agent_id = "call_backfill";
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES
+                    (1, ?, 0, 'DP4F', NULL, NULL, 100, 10, 0, 0, 0, 100, 'medium', '2026-07-22 10:00:00'),
+                    (2, ?, 0, 'K2.7', ?, 'sub-agent', 200, 20, 0, 0, 0, 200, NULL, '2026-07-22 10:00:01')",
+                params![session_id, session_id, agent_id],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let source_key = test_copilot_source_key(&app_dir);
+        create_copilot_app_registry(&app_dir, &[session_id]);
+
+        // Simulate a pre-existing App subagent row written by the old collector
+        // with agent_role=NULL (the regression we are fixing). Same
+        // import_source_id as the new collector would produce so the upsert
+        // targets the same row instead of creating a duplicate.
+        let synthetic_id = format!("{}__{}", session_id, agent_id);
+        let import_source_id = format!("copilot-app:{}:{}:0:{}", source_key, session_id, agent_id);
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, import_source_id, model,
+                tokens_total, tokens_input, tokens_output, delta_total, delta_input, delta_output,
+                parent_session_id, agent_nickname, agent_role
+             ) VALUES (
+                'copilot', 'copilot-app', ?, '2026-07-22T10:00:01Z', '2026-07-22',
+                ?, 1, ?, 'K2.7',
+                220, 200, 20, 220, 200, 20,
+                ?, ?, NULL
+             )",
+            params![
+                source_key,
+                synthetic_id,
+                import_source_id,
+                session_id,
+                agent_id
+            ],
+        )
+        .unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        // No duplicate rows: exactly one subagent row for this synthetic id.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ?",
+                params![synthetic_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "resync must upsert, not duplicate the subagent row"
+        );
+
+        // The upserted row now carries agent_role='sub-agent'.
+        let role: Option<String> = conn
+            .query_row(
+                "SELECT agent_role FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ?",
+                params![synthetic_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            role.as_deref(),
+            Some("sub-agent"),
+            "backfilled subagent row must carry agent_role='sub-agent'"
+        );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify that a legacy merged Copilot App row (old 3-segment
+    /// import_source_id) is removed when the same session is re-synced by the
+    /// new collector, and that keyed rows for other sessions are not
+    /// touched. The cleanup happens during `sync_copilot_app_usage_logs`, not
+    /// in `init_db`, so it runs whenever a session is re-aggregated.
+    #[test]
+    fn sync_copilot_app_usage_logs_cleans_legacy_merged_rows_on_resync() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-legacy-cleanup").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        // Build a session-store with one event for `reconcile-sess`.
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (1, 'reconcile-sess', 0, 'DP4F', NULL, NULL, 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                [],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let source_key = test_copilot_source_key(&app_dir);
+
+        // Pre-seed a legacy merged row (3-segment import_source_id) for the
+        // session that will be re-synced, plus a keyed row for a
+        // different session that must NOT be touched.
+        let legacy_id = format!("copilot-app:{}:reconcile-sess:0", source_key);
+        let other_id = format!("copilot-app:{}:other-sess:0:main", source_key);
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, import_source_id, model, tokens_total, tokens_input, tokens_output, delta_total, delta_input, delta_output
+             ) VALUES (
+                'copilot', 'copilot-app', ?, '2026-07-20T10:00:00Z', '2026-07-20',
+                'reconcile-sess', 1, ?, 'DP4F', 110, 100, 10, 110, 100, 10
+             )",
+            params![source_key, legacy_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, import_source_id, model, tokens_total, tokens_input, tokens_output, delta_total, delta_input, delta_output
+             ) VALUES (
+                'copilot', 'copilot-app', ?, '2026-07-20T10:00:00Z', '2026-07-20',
+                'other-sess', 1, ?, 'DP4F', 110, 100, 10, 110, 100, 10
+             )",
+            params![source_key, other_id],
+        )
+        .unwrap();
+
+        create_copilot_app_registry(&app_dir, &["reconcile-sess", "other-sess"]);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        // Legacy merged row for the synced session must be gone.
+        let legacy_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE source_kind = 'copilot-app' AND source_dir_key = ?
+                   AND session_id = 'reconcile-sess'
+                   AND import_source_id = ?",
+                params![source_key, legacy_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy_count, 0,
+            "legacy merged 3-segment row must be deleted on re-sync"
+        );
+
+        // The new agent-and-model keyed row for the synced session must exist.
+        let expected_new_id = format!(
+            "copilot-app:{}:reconcile-sess:0:main:{}",
+            source_key,
+            encode_hex(b"DP4F")
+        );
+        let new_row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE source_kind = 'copilot-app' AND source_dir_key = ?
+                   AND session_id = 'reconcile-sess'
+                   AND import_source_id = ?",
+                params![source_key, expected_new_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            new_row_count, 1,
+            "new agent-and-model keyed row must be written for the synced session"
+        );
+
+        // The other session's keyed row must NOT be deleted.
+        let other_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE source_kind = 'copilot-app' AND source_dir_key = ?
+                   AND session_id = 'other-sess'",
+                params![source_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(other_count, 1, "other session's new row must be untouched");
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify that Copilot CLI rows and other source kinds are not affected by
+    /// the subagent split cleanup (which only targets copilot-app rows with a
+    /// non-null source_dir_key and a 3-segment import_source_id during sync).
+    #[test]
+    fn sync_copilot_app_usage_logs_subagent_cleanup_preserves_other_sources() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-preserve").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (1, 'app-sess', 0, 'DP4F', NULL, NULL, 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                [],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Pre-seed cross-source rows that must survive the Copilot App sync.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, import_source_id, model, tokens_total, tokens_input, tokens_output, delta_total, delta_input, delta_output
+             ) VALUES (
+                'copilot', 'copilot-cli', NULL, '2026-07-01T10:00:00Z', '2026-07-01',
+                'cli-sess', 1, 'copilot-cli:cli-sess:0', 'gpt-5', 110, 100, 10, 110, 100, 10
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, import_source_id, model, tokens_total, tokens_input, tokens_output, delta_total, delta_input, delta_output
+             ) VALUES (
+                'codex', 'legacy', 'abc123', '2026-07-01T10:00:00Z', '2026-07-01',
+                'codex-sess', 1, 'copilot-app:abc123:codex-sess:0', 'gpt-5', 110, 100, 10, 110, 100, 10
+             )",
+            [],
+        )
+        .unwrap();
+
+        create_copilot_app_registry(&app_dir, &["app-sess"]);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let cli_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'cli-sess'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cli_count, 1, "Copilot CLI row must survive");
+
+        let codex_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'codex-sess'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            codex_count, 1,
+            "Codex row must survive even with a copilot-app-looking id"
+        );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify that two different COPILOT_APP_DIR with the same (session_id,
+    /// turn_index) do not overwrite each other. The unique index now includes
+    /// source_dir_key, so each directory keeps its own row.
+    #[test]
+    fn sync_copilot_app_usage_logs_isolates_rows_by_source_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-isolate").with_extension("");
+        let app_dir_a = base_dir.join("app-a");
+        let app_dir_b = base_dir.join("app-b");
+        fs::create_dir_all(&app_dir_a).unwrap();
+        fs::create_dir_all(&app_dir_b).unwrap();
+
+        let build_store = |dir: &Path| {
+            let store = Connection::open(dir.join("session-store.db")).unwrap();
+            store
+                .execute(
+                    "CREATE TABLE assistant_usage_events (
+                        id INTEGER PRIMARY KEY,
+                        session_id TEXT,
+                        turn_index INTEGER,
+                        model TEXT,
+                        agent_id TEXT,
+                        initiator TEXT,
+                        input_tokens INTEGER,
+                        output_tokens INTEGER,
+                        cache_read_tokens INTEGER,
+                        cache_write_tokens INTEGER,
+                        reasoning_tokens INTEGER,
+                        duration_ms INTEGER,
+                        reasoning_effort TEXT,
+                        created_at TEXT
+                     )",
+                    [],
+                )
+                .unwrap();
+            store
+        };
+
+        let store_a = build_store(&app_dir_a);
+        let store_b = build_store(&app_dir_b);
+
+        // Both directories have the SAME session_id and turn_index, but
+        // different token counts so we can tell them apart.
+        store_a
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (1, 'shared-sess', 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                [],
+            )
+            .unwrap();
+        store_b
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (1, 'shared-sess', 0, 'gpt-5', 200, 20, 0, 0, 0, 100, 'medium', '2026-07-20 09:00:00')",
+                [],
+            )
+            .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        create_copilot_app_registry_from_events(&app_dir_a);
+        // Sync A first.
+        std::env::set_var("COPILOT_APP_DIR", &app_dir_a);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        // Sync B (same session_id, same turn). Must NOT overwrite A's row.
+        create_copilot_app_registry_from_events(&app_dir_b);
+        std::env::set_var("COPILOT_APP_DIR", &app_dir_b);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        // Both rows must coexist.
+        let row_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = 'shared-sess' AND turn_no = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            row_count, 2,
+            "two source dirs with same session/turn must each keep their own row"
+        );
+
+        // Verify token totals are distinct (A=100, B=200) and not overwritten.
+        let totals: Vec<i64> = conn
+            .prepare(
+                "SELECT tokens_input FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = 'shared-sess' AND turn_no = 1
+                 ORDER BY tokens_input",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            totals,
+            vec![100, 200],
+            "both directories' rows must be present with their own totals"
+        );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn copilot_app_registry_excludes_cli_and_unknown_events_without_stalling_cursor() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+        let base_dir = temp_jsonl_path("copilot-app-registry-classification").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(app_dir.join("session-state").join("cli-session")).unwrap();
+        let store = create_test_copilot_session_store(&app_dir);
+        insert_test_copilot_event(&store, 1, "app-session", 0, "2026-07-20 10:00:00");
+        insert_test_copilot_event(&store, 2, "cli-session", 0, "2026-07-20 10:00:01");
+        insert_test_copilot_event(&store, 3, "unknown-session", 0, "2026-07-20 10:00:02");
+        fs::write(
+            app_dir
+                .join("session-state")
+                .join("cli-session")
+                .join("events.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+        create_copilot_app_registry(&app_dir, &["app-session"]);
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, turn_no,
+                tokens_input, tokens_output, tokens_total
+             ) VALUES ('copilot', 'copilot-cli', '2026-07-20T10:00:01Z', '2026-07-20',
+                       'cli-session', 1, 100, 10, 110)",
+            [],
+        )
+        .unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let app_sessions: Vec<String> = conn
+            .prepare(
+                "SELECT session_id FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(app_sessions, vec!["app-session"]);
+        let cli_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND session_id = 'cli-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cli_rows, 1);
+        let cursor: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cursor.ends_with("::2026-07-20 10:00:02::3"));
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn copilot_app_reconciliation_removes_stale_rows_but_keeps_cli_rows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+        let base_dir = temp_jsonl_path("copilot-app-reconciliation-cleanup").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let store = create_test_copilot_session_store(&app_dir);
+        insert_test_copilot_event(&store, 1, "valid-app", 0, "2026-07-20 10:00:00");
+        create_copilot_app_registry(&app_dir, &["valid-app"]);
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let source_key = test_copilot_source_key(&app_dir);
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, tokens_input, tokens_output, tokens_total,
+                import_source_id
+             ) VALUES
+                ('copilot', 'copilot-app', ?, '2026-07-20T09:00:00Z', '2026-07-20',
+                 'stale-session', 1, 20, 2, 22, 'stale-app-row'),
+                ('copilot', 'copilot-cli', NULL, '2026-07-20T09:00:00Z', '2026-07-20',
+                 'stale-session', 1, 30, 3, 33, 'stale-cli-row')",
+            params![source_key],
+        )
+        .unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let stale_app_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE source_kind = 'copilot-app' AND source_dir_key = ?
+                   AND session_id = 'stale-session'",
+                params![source_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stale_cli_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE source_kind = 'copilot-cli' AND session_id = 'stale-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let valid_app_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE source_kind = 'copilot-app' AND session_id = 'valid-app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_app_rows, 0);
+        assert_eq!(stale_cli_rows, 1);
+        assert_eq!(valid_app_rows, 1);
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn copilot_app_reconciliation_imports_history_after_registry_arrives() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+        let base_dir = temp_jsonl_path("copilot-app-registry-late").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let store = create_test_copilot_session_store(&app_dir);
+        insert_test_copilot_event(&store, 1, "late-app", 0, "2026-07-20 10:00:00");
+        create_copilot_app_registry(&app_dir, &[]);
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let cursor_before: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE source_kind = 'copilot-app'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+
+        create_copilot_app_registry(&app_dir, &["late-app"]);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE source_kind = 'copilot-app' AND session_id = 'late-app'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        let cursor_after: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor_after, cursor_before);
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn copilot_app_sync_skips_when_data_db_is_invalid() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+        let base_dir = temp_jsonl_path("copilot-app-invalid-data-db").with_extension("");
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        for (name, data_db_kind) in [
+            ("missing", 0u8),
+            ("missing-table", 1u8),
+            ("unopenable", 2u8),
+        ] {
+            let app_dir = base_dir.join(name);
+            fs::create_dir_all(&app_dir).unwrap();
+            let store = create_test_copilot_session_store(&app_dir);
+            insert_test_copilot_event(&store, 1, "unsafe-session", 0, "2026-07-20 10:00:00");
+            drop(store);
+            let data_db_path = app_dir.join("data.db");
+            match data_db_kind {
+                0 => {}
+                1 => {
+                    Connection::open(&data_db_path).unwrap();
+                }
+                2 => {
+                    fs::create_dir(&data_db_path).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            std::env::set_var("COPILOT_APP_DIR", &app_dir);
+            sync_copilot_app_usage_logs(&mut conn).unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM usage_entries WHERE source_kind = 'copilot-app'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sync_state
+                     WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0
+            );
+        }
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn copilot_app_noop_sync_preserves_row_identity_content_and_cursor() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+        let base_dir = temp_jsonl_path("copilot-app-noop").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let store = create_test_copilot_session_store(&app_dir);
+        insert_test_copilot_event(&store, 1, "stable-session", 0, "2026-07-20 10:00:00");
+        create_copilot_app_registry(&app_dir, &["stable-session"]);
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let first_row: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT id, tokens_input, tokens_total FROM usage_entries
+                 WHERE source_kind = 'copilot-app' AND session_id = 'stable-session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let first_cursor: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let second_row: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT id, tokens_input, tokens_total FROM usage_entries
+                 WHERE source_kind = 'copilot-app' AND session_id = 'stable-session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let second_cursor: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(second_row, first_row);
+        assert_eq!(second_cursor, first_cursor);
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify init_db migrates legacy copilot-app rows (old import_source_id
+    /// format, NULL source_dir_key) by deleting them so they do not coexist
+    /// with new rows and cause double-counting.
+    #[test]
+    fn init_db_migrates_legacy_copilot_app_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Insert a legacy copilot-app row (old import_source_id format, no
+        // source_dir_key).
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, import_source_id
+             ) VALUES (
+                'copilot', 'copilot-app', NULL, '2026-07-01T10:00:00Z', '2026-07-01',
+                'legacy-sess', 1, 'copilot-app:legacy-sess:0'
+             )",
+            [],
+        )
+        .unwrap();
+
+        // Insert a non-copilot-app row to ensure it is NOT deleted.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, import_source_id
+             ) VALUES (
+                'codex', 'legacy', NULL, '2026-07-01T10:00:00Z', '2026-07-01',
+                'codex-sess', 1, 'codex-import-1'
+             )",
+            [],
+        )
+        .unwrap();
+
+        // Re-run init_db to trigger migration.
+        init_db(&conn).unwrap();
+
+        let legacy_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE source_kind = 'copilot-app' AND source_dir_key IS NULL
+                   AND import_source_id = 'copilot-app:legacy-sess:0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_count, 0, "legacy copilot-app row must be deleted");
+
+        let codex_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'codex-sess'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(codex_count, 1, "non-copilot-app row must be preserved");
+    }
+
+    /// Verify that non-copilot-app collectors (codex, claude, cursor) retain
+    /// their uniqueness after the partial index change. Two identical
+    /// (assistant_type, source_kind, session_id, turn_no) rows with NULL
+    /// source_dir_key must not coexist.
+    #[test]
+    fn init_db_partial_index_preserves_non_copilot_uniqueness() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Insert a codex row.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no
+             ) VALUES ('codex', 'legacy', NULL, '2026-07-01T10:00:00Z', '2026-07-01', 'codex-sess', 1)",
+            [],
+        )
+        .unwrap();
+
+        // Attempt to insert a duplicate codex row with the same identity. This
+        // should fail (or be a no-op via INSERT OR IGNORE) because the partial
+        // unique index WHERE source_dir_key IS NULL enforces uniqueness.
+        let dup_result = conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no
+             ) VALUES ('codex', 'legacy', NULL, '2026-07-01T11:00:00Z', '2026-07-01', 'codex-sess', 1)",
+            [],
+        );
+
+        assert!(
+            dup_result.is_err(),
+            "duplicate non-copilot-app row must be rejected by partial unique index"
+        );
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'codex-sess'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "only one codex row should exist");
+    }
+
+    /// Verify that two copilot-app sources with the same session_id are not
+    /// merged in the daily summary aggregation. Each source should appear as
+    /// a separate session.
+    #[test]
+    fn daily_summary_separates_same_session_id_across_source_dirs() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-daily-merge").with_extension("");
+        let app_dir_a = base_dir.join("app-a");
+        let app_dir_b = base_dir.join("app-b");
+        fs::create_dir_all(&app_dir_a).unwrap();
+        fs::create_dir_all(&app_dir_b).unwrap();
+
+        let build_store = |dir: &Path| {
+            let store = Connection::open(dir.join("session-store.db")).unwrap();
+            store
+                .execute(
+                    "CREATE TABLE assistant_usage_events (
+                        id INTEGER PRIMARY KEY,
+                        session_id TEXT,
+                        turn_index INTEGER,
+                        model TEXT,
+                        agent_id TEXT,
+                        initiator TEXT,
+                        input_tokens INTEGER,
+                        output_tokens INTEGER,
+                        cache_read_tokens INTEGER,
+                        cache_write_tokens INTEGER,
+                        reasoning_tokens INTEGER,
+                        duration_ms INTEGER,
+                        reasoning_effort TEXT,
+                        created_at TEXT
+                     )",
+                    [],
+                )
+                .unwrap();
+            store
+        };
+
+        let store_a = build_store(&app_dir_a);
+        let store_b = build_store(&app_dir_b);
+
+        // Both directories use the SAME session_id but different token counts.
+        store_a
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (1, 'shared-sess', 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                [],
+            )
+            .unwrap();
+        store_b
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (1, 'shared-sess', 0, 'gpt-5', 200, 20, 0, 0, 0, 100, 'medium', '2026-07-20 09:00:00')",
+                [],
+            )
+            .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        create_copilot_app_registry_from_events(&app_dir_a);
+        create_copilot_app_registry_from_events(&app_dir_b);
+        std::env::set_var("COPILOT_APP_DIR", &app_dir_a);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        std::env::set_var("COPILOT_APP_DIR", &app_dir_b);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        // Fetch entries for the date and verify the two sources are NOT merged.
+        let entries = get_usage_entries_by_date(&conn, "2026-07-20", "copilot").unwrap();
+
+        // Group by (session_id, source_dir_key) to simulate daily summary logic.
+        let mut sessions: HashMap<(String, Option<String>), Vec<i64>> = HashMap::new();
+        for (record, _ast) in &entries {
+            let e = &record.entry;
+            let key = (e.session_id.clone(), e.source_dir_key.clone());
+            sessions
+                .entry(key)
+                .or_default()
+                .push(e.tokens.as_ref().map(|t| t.input as i64).unwrap_or(0));
+        }
+
+        // There must be 2 separate sessions (one per source dir), not 1 merged.
+        assert_eq!(
+            sessions.len(),
+            2,
+            "two source dirs with same session_id must be 2 separate sessions, not merged"
+        );
+
+        // Verify the token totals are distinct (100 and 200, not 300 merged).
+        let mut all_totals: Vec<i64> = sessions.values().map(|v| v[0]).collect();
+        all_totals.sort();
+        assert_eq!(
+            all_totals,
+            vec![100, 200],
+            "each session keeps its own tokens"
+        );
+
+        // Verify source_kind is "copilot-app" for all entries so the frontend
+        // renders the App badge, not the CLI fallback.
+        for (record, _ast) in &entries {
+            let e = &record.entry;
+            assert_eq!(
+                e.source_kind.as_deref(),
+                Some("copilot-app"),
+                "copilot-app entries must have source_kind = 'copilot-app' for correct frontend badge"
+            );
+        }
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    // =========================================================================
+    // Copilot CLI agent reconciliation tests
+    // =========================================================================
+    //
+    // The CLI reconciler reads `~/.copilot/session-store.db` (resolved via
+    // `get_copilot_dir()` / `COPILOT_DIR`) and splits merged `copilot-cli`
+    // hook rows into per-agent rows. These fixtures build a temp copilot dir,
+    // a session-store.db with `assistant_usage_events`, a `data.db` App
+    // registry (to classify sessions as CLI), an `events.jsonl` transcript (to
+    // satisfy `CopilotAppSessionKind::Cli`), and seed hook rows for total
+    // validation. They never touch the real `~/.copilot`.
+
+    /// Build a CLI reconciliation fixture: a temp copilot dir with
+    /// `session-store.db` (assistant_usage_events), `data.db` (sessions
+    /// registry listing only `app_session_ids`), and `events.jsonl`
+    /// transcripts for each `cli_session_id` so they classify as CLI.
+    fn build_cli_reconciler_fixture(
+        app_dir: &Path,
+        app_session_ids: &[&str],
+        cli_session_ids: &[&str],
+    ) -> Connection {
+        let session_store = create_test_copilot_session_store(app_dir);
+        // App registry: only App sessions are listed. CLI sessions are absent,
+        // so they classify as CLI (transcript exists) — not App.
+        create_copilot_app_registry(app_dir, app_session_ids);
+        // Create CLI transcripts so classify_copilot_app_session returns Cli.
+        for sid in cli_session_ids {
+            let dir = app_dir.join("session-state").join(sid);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("events.jsonl"), "").unwrap();
+        }
+        session_store
+    }
+
+    /// Token + duration parameters for a CLI assistant_usage_event fixture row.
+    struct CliEventTokens {
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_write: i64,
+        reasoning: i64,
+        duration_ms: i64,
+    }
+
+    /// Identity parameters for a CLI assistant_usage_event fixture row.
+    struct CliEventIdentity<'a> {
+        id: i64,
+        session_id: &'a str,
+        model: &'a str,
+        agent_id: Option<&'a str>,
+        initiator: Option<&'a str>,
+    }
+
+    /// Insert a CLI assistant_usage_event row.
+    fn insert_cli_event(
+        store: &Connection,
+        identity: CliEventIdentity,
+        tokens: CliEventTokens,
+        created_at: &str,
+    ) {
+        store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+                params![
+                    identity.id,
+                    identity.session_id,
+                    identity.model,
+                    identity.agent_id,
+                    identity.initiator,
+                    tokens.input,
+                    tokens.output,
+                    tokens.cache_read,
+                    tokens.cache_write,
+                    tokens.reasoning,
+                    tokens.duration_ms,
+                    created_at
+                ],
+            )
+            .unwrap();
+    }
+
+    /// Seed a merged `copilot-cli` hook row for a session with a cumulative
+    /// total, mirroring what `sync_hook_usage_logs` would have written.
+    fn seed_cli_hook_row(conn: &Connection, session_id: &str, tokens_total: i64) {
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, session_name,
+                turn_no, model, tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-cli', '2026-07-22T10:00:00Z', '2026-07-22', ?,
+                'Test Session', 1, 'DP4P', 0, 0, ?, 0, 0, ?
+             )",
+            params![session_id, tokens_total, tokens_total],
+        )
+        .unwrap();
+    }
+
+    /// Per-agent CLI row read from `usage_entries` for assertion.
+    struct CliAgentRow {
+        session_id: String,
+        model: Option<String>,
+        parent_session_id: Option<String>,
+        tokens_total: i64,
+        agent_nickname: Option<String>,
+        agent_role: Option<String>,
+        tokens_input: i64,
+        tokens_output: i64,
+        tokens_reasoning: i64,
+        tokens_cache_read: i64,
+    }
+
+    /// Read the per-agent rows for a CLI session.
+    fn read_cli_agent_rows(conn: &Connection, session_id: &str) -> Vec<CliAgentRow> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id, model, parent_session_id, tokens_total,
+                        agent_nickname, agent_role,
+                        tokens_input, tokens_output, tokens_reasoning,
+                        tokens_cache_read
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND (session_id = ? OR session_id LIKE ? ESCAPE '\\')
+                 ORDER BY session_id ASC",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(params![session_id, format!("{}\\__%", session_id)], |row| {
+                Ok(CliAgentRow {
+                    session_id: row.get(0)?,
+                    model: row.get(1)?,
+                    parent_session_id: row.get(2)?,
+                    tokens_total: row.get(3)?,
+                    agent_nickname: row.get(4)?,
+                    agent_role: row.get(5)?,
+                    tokens_input: row.get(6)?,
+                    tokens_output: row.get(7)?,
+                    tokens_reasoning: row.get(8)?,
+                    tokens_cache_read: row.get(9)?,
+                })
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// Returns (main_total, sub1_total, sub2_total) for the validation session
+    /// fixture described in the task: main DP4P total 281490, subagent
+    /// call_f14xiouf DP4P total 398911, subagent call_2y5obibr DP4P total
+    /// 314861, combined 995262. `with_reasoning` controls whether reasoning
+    /// tokens are included (they must NOT alter the totals).
+    fn build_validation_fixture_events(store: &Connection, session_id: &str) {
+        // Main agent: 11 calls, DP4P. input 271753, output 9737, reasoning
+        // 1272 -> total 281490 (input includes cache read; use cache_read 0 so
+        // net input = raw input, total invariant preserved).
+        insert_cli_event(
+            store,
+            CliEventIdentity {
+                id: 1,
+                session_id,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 271753,
+                output: 9737,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 1272,
+                duration_ms: 100,
+            },
+            "2026-07-22T10:00:00",
+        );
+        // Subagent call_f14xiouf: 13 calls, DP4P. input 383928, output 14983,
+        // reasoning 11060 -> total 398911.
+        insert_cli_event(
+            store,
+            CliEventIdentity {
+                id: 2,
+                session_id,
+                model: "DP4P",
+                agent_id: Some("call_f14xiouf"),
+                initiator: Some("sub-agent"),
+            },
+            CliEventTokens {
+                input: 383928,
+                output: 14983,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 11060,
+                duration_ms: 200,
+            },
+            "2026-07-22T10:00:01",
+        );
+        // Subagent call_2y5obibr: 11 calls, DP4P. input 305638, output 9223,
+        // reasoning 660 -> total 314861.
+        insert_cli_event(
+            store,
+            CliEventIdentity {
+                id: 3,
+                session_id,
+                model: "DP4P",
+                agent_id: Some("call_2y5obibr"),
+                initiator: Some("sub-agent"),
+            },
+            CliEventTokens {
+                input: 305638,
+                output: 9223,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 660,
+                duration_ms: 150,
+            },
+            "2026-07-22T10:00:02",
+        );
+    }
+
+    #[test]
+    fn cli_reconciler_splits_main_and_two_subagents() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-split").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "f33b0404-e2dc-48ff-aa55-25a700b8fa7e";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[session_id]);
+        build_validation_fixture_events(&store, session_id);
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // Seed hook row with the combined total so validation passes.
+        seed_cli_hook_row(&conn, session_id, 995262);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        let rows = read_cli_agent_rows(&conn, session_id);
+        // Exactly 3 rows: main + 2 subagents.
+        assert_eq!(rows.len(), 3, "must produce 1 main + 2 subagent rows");
+
+        let main = rows
+            .iter()
+            .find(|r| r.model.as_deref() == Some("DP4P") && r.agent_nickname.is_none())
+            .expect("main agent row exists");
+        assert_eq!(main.session_id, session_id);
+        assert!(
+            main.parent_session_id.is_none(),
+            "main parent_session_id must be NULL"
+        );
+        assert!(
+            main.agent_nickname.is_none(),
+            "main agent_nickname must be NULL"
+        );
+        assert_eq!(main.tokens_total, 281490, "main agent total must be 281490");
+
+        let sub1 = rows
+            .iter()
+            .find(|r| r.agent_nickname.as_deref() == Some("call_f14xiouf"))
+            .expect("subagent call_f14xiouf row exists");
+        assert_eq!(sub1.session_id, format!("{}__call_f14xiouf", session_id));
+        assert_eq!(
+            sub1.parent_session_id.as_deref(),
+            Some(session_id),
+            "parent_session_id"
+        );
+        assert_eq!(
+            sub1.agent_nickname.as_deref(),
+            Some("call_f14xiouf"),
+            "agent_nickname"
+        );
+        assert_eq!(sub1.agent_role.as_deref(), Some("sub-agent"), "agent_role");
+        assert_eq!(sub1.model.as_deref(), Some("DP4P"), "model from event");
+        assert_eq!(sub1.tokens_total, 398911, "subagent total 398911");
+
+        let sub2 = rows
+            .iter()
+            .find(|r| r.agent_nickname.as_deref() == Some("call_2y5obibr"))
+            .expect("subagent call_2y5obibr row exists");
+        assert_eq!(sub2.session_id, format!("{}__call_2y5obibr", session_id));
+        assert_eq!(sub2.parent_session_id.as_deref(), Some(session_id));
+        assert_eq!(sub2.agent_nickname.as_deref(), Some("call_2y5obibr"));
+        assert_eq!(sub2.tokens_total, 314861, "subagent total 314861");
+
+        // Combined total invariant.
+        assert_eq!(
+            main.tokens_total + sub1.tokens_total + sub2.tokens_total,
+            995262,
+            "combined per-agent total must equal hook session total"
+        );
+
+        // Per-agent token breakdown: input, output, reasoning, cache_read,
+        // cache_write are preserved in their own columns. cache_read is netted
+        // out of input (CLI normalization), and reasoning is stored but NOT
+        // included in tokens_total.
+        assert_eq!(main.tokens_input, 271753);
+        assert_eq!(main.tokens_output, 9737);
+        assert_eq!(main.tokens_reasoning, 1272);
+        assert_eq!(main.tokens_cache_read, 0);
+
+        assert_eq!(sub1.tokens_input, 383928);
+        assert_eq!(sub1.tokens_output, 14983);
+        assert_eq!(sub1.tokens_reasoning, 11060);
+        assert_eq!(sub1.tokens_cache_read, 0);
+
+        assert_eq!(sub2.tokens_input, 305638);
+        assert_eq!(sub2.tokens_output, 9223);
+        assert_eq!(sub2.tokens_reasoning, 660);
+        assert_eq!(sub2.tokens_cache_read, 0);
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_reasoning_not_double_counted() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-reasoning").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "reasoning-session";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[session_id]);
+        // input 1000, output 200, reasoning 100, cache_read 0. CLI accounting
+        // total = net_input + output = 1200. reasoning is stored in its own
+        // column but NOT added to tokens_total (matching the hook semantics),
+        // so it is never double-counted.
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 1000,
+                output: 200,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 100,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:00",
+        );
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, session_id, 1200);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        let row: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT tokens_total, tokens_input, tokens_output, tokens_reasoning
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND session_id = ? AND parent_session_id IS NULL",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row.0, 1200,
+            "total must be net_input + output, reasoning not added"
+        );
+        assert_eq!(row.1, 1000, "net input preserved");
+        assert_eq!(row.2, 200);
+        assert_eq!(row.3, 100, "reasoning stored separately");
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_different_models_not_merged() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-models").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "multi-model-session";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[session_id]);
+        // Main agent DP4P; subagent K2.7 (different model). Even though the
+        // prompt might have asked for K2.7, the subagent actually used DP4P per
+        // the event — but here we test that distinct event models stay distinct
+        // rows and the subagent does NOT inherit the main model.
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:00",
+        );
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 2,
+                session_id,
+                model: "K2.7",
+                agent_id: Some("call_diff"),
+                initiator: Some("sub-agent"),
+            },
+            CliEventTokens {
+                input: 200,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 60,
+            },
+            "2026-07-22T10:00:01",
+        );
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, session_id, 330);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        let models: Vec<(Option<String>, Option<String>)> = conn
+            .prepare(
+                "SELECT model, agent_nickname FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND (session_id = ? OR session_id LIKE ? ESCAPE '\\')",
+            )
+            .unwrap()
+            .query_map(params![session_id, format!("{}\\__%", session_id)], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let main_model = models
+            .iter()
+            .find(|m| m.1.is_none())
+            .map(|m| m.0.clone().unwrap())
+            .unwrap();
+        let sub_model = models
+            .iter()
+            .find(|m| m.1.as_deref() == Some("call_diff"))
+            .map(|m| m.0.clone().unwrap())
+            .unwrap();
+        assert_eq!(main_model, "DP4P");
+        assert_eq!(
+            sub_model, "K2.7",
+            "subagent model must come from its event, not inherited"
+        );
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_preserves_multiple_models_for_same_agent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-same-agent-models").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "cli-same-agent-multi-model";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[session_id]);
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id,
+                model: "DP4P",
+                agent_id: Some("call_same"),
+                initiator: Some("sub-agent"),
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:00",
+        );
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 2,
+                session_id,
+                model: "K2.7",
+                agent_id: Some("call_same"),
+                initiator: Some("sub-agent"),
+            },
+            CliEventTokens {
+                input: 200,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 60,
+            },
+            "2026-07-22T10:00:01",
+        );
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, session_id, 330);
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        let rows = read_cli_agent_rows(&conn, session_id);
+        assert_eq!(rows.len(), 2, "同一 CLI Agent 的兩個模型都必須保留");
+        assert_eq!(
+            rows.iter().map(|row| row.tokens_total).sum::<i64>(),
+            330,
+            "模型拆分後的 Token 總量必須維持不變"
+        );
+        let models: HashSet<&str> = rows.iter().filter_map(|row| row.model.as_deref()).collect();
+        assert_eq!(models, HashSet::from(["DP4P", "K2.7"]));
+        let timeline_rows = get_session_turns_token_stats(
+            &conn,
+            "copilot",
+            &format!("{session_id}__call_same"),
+            Some("copilot-cli"),
+            None,
+        )
+        .unwrap();
+        let (timeline_tokens, timeline_models) = timeline_rows.get(&1).unwrap();
+        assert_eq!(
+            timeline_tokens.total, 330,
+            "timeline 必須彙總同一 CLI Agent 的多模型用量"
+        );
+        assert!(timeline_models.contains("DP4P"));
+        assert!(timeline_models.contains("K2.7"));
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_retries_total_mismatch_without_new_event() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-mismatch-retry").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "cli-total-mismatch-retry";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[session_id]);
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:00",
+        );
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 2,
+                session_id,
+                model: "K2.7",
+                agent_id: Some("call_retry"),
+                initiator: Some("sub-agent"),
+            },
+            CliEventTokens {
+                input: 200,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 60,
+            },
+            "2026-07-22T10:00:01",
+        );
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, session_id, 999);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot'
+                   AND source_kind = 'copilot-cli'
+                   AND (session_id = ? OR session_id LIKE ? ESCAPE '\\')",
+                params![session_id, format!("{}\\__%", session_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "第一次總量不符時必須保留原 hook row");
+
+        conn.execute(
+            "UPDATE usage_entries
+             SET tokens_total = 330, delta_total = 330
+             WHERE assistant_type = 'copilot'
+               AND source_kind = 'copilot-cli'
+               AND session_id = ?",
+            [session_id],
+        )
+        .unwrap();
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        let (rows, total): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(tokens_total), 0)
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot'
+                   AND source_kind = 'copilot-cli'
+                   AND (session_id = ? OR session_id LIKE ? ESCAPE '\\')",
+                params![session_id, format!("{}\\__%", session_id)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 2, "只修正 hook、沒有新增 event 時仍必須重新處理");
+        assert_eq!(total, 330);
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_idempotent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-idem").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "idempotent-session";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[session_id]);
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:00",
+        );
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 2,
+                session_id,
+                model: "DP4P",
+                agent_id: Some("call_idem"),
+                initiator: Some("sub-agent"),
+            },
+            CliEventTokens {
+                input: 200,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 60,
+            },
+            "2026-07-22T10:00:01",
+        );
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, session_id, 330);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+        let count_after_first: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND (session_id = ? OR session_id LIKE ? ESCAPE '\\')",
+                params![session_id, format!("{}\\__%", session_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_after_first, 2);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+        let count_after_second: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND (session_id = ? OR session_id LIKE ? ESCAPE '\\')",
+                params![session_id, format!("{}\\__%", session_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_after_second, 2, "second sync must not duplicate rows");
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_upserts_on_new_events() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-upsert").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "upsert-session";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[session_id]);
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:00",
+        );
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, session_id, 110);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+        let main_total: i64 = conn
+            .query_row(
+                "SELECT tokens_total FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND session_id = ? AND parent_session_id IS NULL",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(main_total, 110);
+
+        // Add a new event for the same session (new API call).
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 2,
+                session_id,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 500,
+                output: 50,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 80,
+            },
+            "2026-07-22T11:00:00",
+        );
+        // Update the hook row total to match the new combined total so
+        // validation passes on the next sync.
+        conn.execute(
+            "UPDATE usage_entries SET tokens_total = ?, delta_total = ?
+             WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+               AND session_id = ? AND parent_session_id IS NULL",
+            params![660, 660, session_id],
+        )
+        .unwrap();
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+        let new_main_total: i64 = conn
+            .query_row(
+                "SELECT tokens_total FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND session_id = ? AND parent_session_id IS NULL",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            new_main_total, 660,
+            "must re-aggregate from full history and upsert"
+        );
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_replaces_hook_rows_no_double_count() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-replace").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "replace-session";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[session_id]);
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:00",
+        );
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 2,
+                session_id,
+                model: "DP4P",
+                agent_id: Some("call_replace"),
+                initiator: Some("sub-agent"),
+            },
+            CliEventTokens {
+                input: 200,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 60,
+            },
+            "2026-07-22T10:00:01",
+        );
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, session_id, 330);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        // Only the 2 split rows remain; the original merged hook row is gone.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND session_id = ? AND parent_session_id IS NULL",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "exactly one main row (hook merged row replaced)");
+
+        let total_sum: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(tokens_total), 0) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND (session_id = ? OR session_id LIKE ? ESCAPE '\\')",
+                params![session_id, format!("{}\\__%", session_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            total_sum, 330,
+            "split rows sum to original hook total, no double count"
+        );
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_rollback_on_total_mismatch() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-rollback").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "mismatch-session";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[session_id]);
+        // Agent events sum to 330.
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:00",
+        );
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 2,
+                session_id,
+                model: "DP4P",
+                agent_id: Some("call_mismatch"),
+                initiator: Some("sub-agent"),
+            },
+            CliEventTokens {
+                input: 200,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 60,
+            },
+            "2026-07-22T10:00:01",
+        );
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // Hook row has a WRONG total (999) that does not match the agent sum
+        // (330). Reconciliation must roll back and preserve the hook row.
+        seed_cli_hook_row(&conn, session_id, 999);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        let hook_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND session_id = ? AND parent_session_id IS NULL",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hook_rows, 1,
+            "hook row must be preserved on validation failure"
+        );
+
+        let hook_total: i64 = conn
+            .query_row(
+                "SELECT tokens_total FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND session_id = ? AND parent_session_id IS NULL",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hook_total, 999, "original hook total preserved");
+
+        let subagent_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND session_id LIKE ? ESCAPE '\\'",
+                params![format!("{}\\__%", session_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            subagent_rows, 0,
+            "no half-split subagent rows after rollback"
+        );
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_falls_back_when_session_store_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-no-store").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        // No session-store.db created; only a data.db registry + transcript.
+        create_copilot_app_registry(&app_dir, &[]);
+        let dir = app_dir.join("session-state").join("no-store-session");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("events.jsonl"), "").unwrap();
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, "no-store-session", 500);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        // Hook row untouched.
+        let total: i64 = conn
+            .query_row(
+                "SELECT tokens_total FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND session_id = 'no-store-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            total, 500,
+            "hook fallback preserved when session-store missing"
+        );
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_skips_app_registry_sessions() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-app-skip").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let app_session = "app-owned-session";
+        // Register the session in the App registry so it classifies as App,
+        // not CLI — even though a transcript exists.
+        let store = build_cli_reconciler_fixture(&app_dir, &[app_session], &[]);
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id: app_session,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:00",
+        );
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, app_session, 110);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        // App session not processed by CLI reconciler: hook row preserved, no
+        // split rows.
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND session_id = ?",
+                params![app_session],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "App registry session must not be touched by CLI reconciler"
+        );
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_preserves_other_collectors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-preserve").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let cli_session = "cli-preserve-sess";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[cli_session]);
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id: cli_session,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:00",
+        );
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, cli_session, 110);
+
+        // Pre-seed cross-source rows that must survive CLI reconciliation.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, import_source_id, model, tokens_total, tokens_input, tokens_output, delta_total, delta_input, delta_output
+             ) VALUES (
+                'copilot', 'copilot-app', 'abc123', '2026-07-01T10:00:00Z', '2026-07-01',
+                'app-sess', 1, 'copilot-app:abc123:app-sess:0', 'DP4P', 110, 100, 10, 110, 100, 10
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date,
+                session_id, turn_no, import_source_id, model, tokens_total, tokens_input, tokens_output, delta_total, delta_input, delta_output
+             ) VALUES (
+                'codex', 'legacy', '2026-07-01T10:00:00Z', '2026-07-01',
+                'codex-sess', 1, 'codex-import', 'gpt-5', 110, 100, 10, 110, 100, 10
+             )",
+            [],
+        )
+        .unwrap();
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        let app_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'app-sess'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(app_count, 1, "copilot-app row must survive");
+        let codex_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'codex-sess'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(codex_count, 1, "codex row must survive");
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_cursor_isolated_from_app_cursor() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-cursor").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let cli_session = "cursor-cli-sess";
+        let app_session = "cursor-app-sess";
+        let store = build_cli_reconciler_fixture(&app_dir, &[app_session], &[cli_session]);
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id: cli_session,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:00",
+        );
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 2,
+                session_id: app_session,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:01",
+        );
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, cli_session, 110);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        // Both cursor namespaces must coexist independently.
+        let cli_cursor_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'sync:copilot_cli_agents:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cli_cursor_count >= 1, "CLI agent cursor written");
+
+        // Run the App collector too; it must not overwrite the CLI cursor.
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let cli_cursor_after_app: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'sync:copilot_cli_agents:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cli_cursor_after_app, cli_cursor_count,
+            "App collector must not touch CLI cursor"
+        );
+
+        let app_cursor_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(app_cursor_count >= 1, "App cursor written");
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_backfills_historical_hook_session() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-backfill").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "historical-cli-sess";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[session_id]);
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:00",
+        );
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 2,
+                session_id,
+                model: "DP4P",
+                agent_id: Some("call_hist"),
+                initiator: Some("sub-agent"),
+            },
+            CliEventTokens {
+                input: 200,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 60,
+            },
+            "2026-07-22T10:00:01",
+        );
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // Simulate a historical hook row that predates the reconciler.
+        seed_cli_hook_row(&conn, session_id, 330);
+
+        // First sync performs the backfill migration.
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+        let migration_done: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+                params![COPILOT_CLI_AGENT_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(migration_done, "migration marker recorded after backfill");
+
+        let split_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND (session_id = ? OR session_id LIKE ? ESCAPE '\\')",
+                params![session_id, format!("{}\\__%", session_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            split_count, 2,
+            "historical session backfilled into split rows"
+        );
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Regression: `get_session_model` must return the child session's own
+    /// model for a Copilot App subagent synthetic row (`<main>__<agent_id>`),
+    /// NOT the parent's model. The drawer parser relies on this so the
+    /// subagent drawer shows the child model and never the parent's
+    /// `session.start.selectedModel`.
+    #[test]
+    fn get_session_model_returns_child_model_for_subagent_synthetic_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let parent = "74b6d236-d311-4675-9855-fee91bc508e5";
+        let agent = "call_v4b32z66";
+        let synthetic = format!("{parent}__{agent}");
+
+        // Parent (main agent) row uses a different model.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', 'abcdef00', '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GLM5.2-medium',
+                50, 5, 55,
+                50, 5, 55
+             )",
+            params![parent],
+        )
+        .unwrap();
+
+        // Subagent synthetic row uses K2.7.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total,
+                parent_session_id, agent_nickname
+             ) VALUES (
+                'copilot', 'copilot-app', 'abcdef00', '2026-07-20T10:00:30Z', '2026-07-20',
+                ?, 1, 'K2.7',
+                100, 10, 110,
+                100, 10, 110,
+                ?, ?
+             )",
+            params![synthetic, parent, agent],
+        )
+        .unwrap();
+
+        // The subagent synthetic row must resolve to K2.7 (its own model),
+        // not the parent's GLM5.2-medium.
+        let child_model = get_session_model(
+            &conn,
+            "copilot",
+            &synthetic,
+            Some("copilot-app"),
+            Some("abcdef00"),
+        )
+        .unwrap();
+        assert_eq!(child_model.as_deref(), Some("K2.7"));
+
+        // The main session must resolve to its own model.
+        let main_model = get_session_model(
+            &conn,
+            "copilot",
+            parent,
+            Some("copilot-app"),
+            Some("abcdef00"),
+        )
+        .unwrap();
+        assert_eq!(main_model.as_deref(), Some("GLM5.2-medium"));
+
+        // No source_dir_key (None) means source_dir_key IS NULL — App rows
+        // are excluded, so the synthetic App session is not found.
+        let unscoped = get_session_model(&conn, "copilot", &synthetic, None, None).unwrap();
+        assert_eq!(unscoped, None);
+    }
+
+    /// Regression: `get_session_model` returns `None` when the session has no
+    /// populated model column (caller falls back to the parser default).
+    #[test]
+    fn get_session_model_returns_none_when_model_column_is_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                'no-model-sess', 1,
+                10, 1, 11,
+                10, 1, 11
+             )",
+            [],
+        )
+        .unwrap();
+        let model = get_session_model(&conn, "copilot", "no-model-sess", Some("copilot-cli"), None)
+            .unwrap();
+        assert!(
+            model.is_none(),
+            "expected None for model-less session, got {:?}",
+            model
+        );
+    }
+
+    /// Regression: two Copilot App sessions with the same `session_id` but
+    /// different `source_dir_key` values must be isolated by
+    /// `get_session_assistant_and_transcript`, `get_session_cwd`,
+    /// `get_session_model`, and `get_session_turns_token_stats`.
+    #[test]
+    fn session_queries_isolate_copilot_app_by_source_dir_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "shared-app-session";
+        let dir_a = "aaaa00";
+        let dir_b = "bbbb00";
+
+        // Insert App row from directory A.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', ?, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GLM5.2-high', '/home/dirA',
+                100, 10, 110,
+                100, 10, 110
+             )",
+            params![dir_a, session_id],
+        )
+        .unwrap();
+
+        // Insert App row from directory B with same session_id.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', ?, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'K2.7-code', '/home/dirB',
+                200, 20, 220,
+                200, 20, 220
+             )",
+            params![dir_b, session_id],
+        )
+        .unwrap();
+
+        // get_session_assistant_and_transcript must return the correct
+        // source_dir_key when queried with explicit source_kind + source_dir_key.
+        let (_, _, sk_a, sdk_a, _, _) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_a),
+        )
+        .unwrap();
+        assert_eq!(sk_a, "copilot-app");
+        assert_eq!(sdk_a.as_deref(), Some(dir_a));
+
+        let (_, _, sk_b, sdk_b, _, _) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_b),
+        )
+        .unwrap();
+        assert_eq!(sk_b, "copilot-app");
+        assert_eq!(sdk_b.as_deref(), Some(dir_b));
+
+        // get_session_cwd must return the correct CWD per source_dir_key.
+        let cwd_a = get_session_cwd(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_a),
+        )
+        .unwrap();
+        assert_eq!(cwd_a.as_deref(), Some("/home/dirA"));
+        let cwd_b = get_session_cwd(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_b),
+        )
+        .unwrap();
+        assert_eq!(cwd_b.as_deref(), Some("/home/dirB"));
+
+        // get_session_model must return the correct model per source_dir_key.
+        let model_a = get_session_model(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_a),
+        )
+        .unwrap();
+        assert_eq!(model_a.as_deref(), Some("GLM5.2-high"));
+        let model_b = get_session_model(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_b),
+        )
+        .unwrap();
+        assert_eq!(model_b.as_deref(), Some("K2.7-code"));
+
+        // get_session_turns_token_stats must return the correct tokens.
+        let turns_a = get_session_turns_token_stats(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_a),
+        )
+        .unwrap();
+        let turns_b = get_session_turns_token_stats(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_b),
+        )
+        .unwrap();
+        assert_eq!(turns_a.len(), 1);
+        assert_eq!(turns_b.len(), 1);
+        assert_eq!(turns_a[&1].0.total, 110);
+        assert_eq!(turns_b[&1].0.total, 220);
+    }
+
+    /// Regression: Copilot CLI and Copilot App sessions with the same
+    /// `session_id` must be isolated. CLI rows have `source_dir_key IS NULL`,
+    /// App rows have `source_dir_key = <hex>`. Querying with `None` must
+    /// return only the CLI row, not the App row.
+    #[test]
+    fn session_queries_isolate_copilot_cli_from_app_with_same_session_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "shared-cli-app-session";
+        let dir_app = "dead00";
+
+        // CLI row (source_dir_key IS NULL).
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GPT-5.4', '/home/cli',
+                50, 5, 55,
+                50, 5, 55
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // App row (source_dir_key = hex).
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', ?, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GLM5.2-high', '/home/app',
+                100, 10, 110,
+                100, 10, 110
+             )",
+            params![dir_app, session_id],
+        )
+        .unwrap();
+
+        // Query with source_kind=copilot-cli, source_dir_key=None must find
+        // the CLI row only.
+        let (_, _, sk, _sdk, _, _) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-cli"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(sk, "copilot-cli");
+
+        // Query with source_kind=copilot-app, source_dir_key=hex must find
+        // the App row only.
+        let (_, _, sk_app, sdk_app, _, _) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_app),
+        )
+        .unwrap();
+        assert_eq!(sk_app, "copilot-app");
+        assert_eq!(sdk_app.as_deref(), Some(dir_app));
+
+        // CWD isolation: None -> CLI row; Some(dir) -> App row.
+        let cwd_cli =
+            get_session_cwd(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
+        assert_eq!(cwd_cli.as_deref(), Some("/home/cli"));
+        let cwd_app = get_session_cwd(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_app),
+        )
+        .unwrap();
+        assert_eq!(cwd_app.as_deref(), Some("/home/app"));
+
+        // Model isolation: None -> CLI model; Some(dir) -> App model.
+        let model_cli =
+            get_session_model(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
+        assert_eq!(model_cli.as_deref(), Some("GPT-5.4"));
+        let model_app = get_session_model(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_app),
+        )
+        .unwrap();
+        assert_eq!(model_app.as_deref(), Some("GLM5.2-high"));
+
+        // Turn stats isolation: None -> CLI totals; Some(dir) -> App totals.
+        let turns_cli =
+            get_session_turns_token_stats(&conn, "copilot", session_id, Some("copilot-cli"), None)
+                .unwrap();
+        let turns_app = get_session_turns_token_stats(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-app"),
+            Some(dir_app),
+        )
+        .unwrap();
+        assert_eq!(turns_cli[&1].0.total, 55);
+        assert_eq!(turns_app[&1].0.total, 110);
+    }
+
+    /// Regression: Copilot CLI and VS Code Chat rows both have a NULL
+    /// source_dir_key, so downstream session queries must also filter by
+    /// source_kind to avoid mixing their CWD, model, or turn token stats.
+    #[test]
+    fn session_queries_isolate_null_source_kinds_with_same_session_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "shared-cli-vscode-session";
+
+        for (source_kind, model, cwd, total) in [
+            ("copilot-cli", "GPT-5.4", "/home/cli", 55i64),
+            ("vscode-chat", "GPT-4.1", "/home/vscode", 110i64),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, source_dir_key, timestamp, date,
+                    session_id, turn_no, model, cwd,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total
+                 ) VALUES (
+                    'copilot', ?, NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                    ?, 1, ?, ?,
+                    ?, 5, ?,
+                    ?, 5, ?
+                 )",
+                params![
+                    source_kind,
+                    session_id,
+                    model,
+                    cwd,
+                    total - 5,
+                    total,
+                    total - 5,
+                    total,
+                ],
+            )
+            .unwrap();
+        }
+
+        // A different assistant may also reuse the same session_id; the
+        // assistant_type predicate must keep it out of Copilot queries.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'codex', 'codex-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'o3', '/home/codex',
+                28, 5, 33,
+                28, 5, 33
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        let (_, _, cli_kind, cli_dir, _, _) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-cli"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cli_kind, "copilot-cli");
+        assert_eq!(cli_dir, None);
+
+        let cli_cwd =
+            get_session_cwd(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
+        let vscode_cwd =
+            get_session_cwd(&conn, "copilot", session_id, Some("vscode-chat"), None).unwrap();
+        assert_eq!(cli_cwd.as_deref(), Some("/home/cli"));
+        assert_eq!(vscode_cwd.as_deref(), Some("/home/vscode"));
+
+        let cli_model =
+            get_session_model(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
+        let vscode_model =
+            get_session_model(&conn, "copilot", session_id, Some("vscode-chat"), None).unwrap();
+        assert_eq!(cli_model.as_deref(), Some("GPT-5.4"));
+        assert_eq!(vscode_model.as_deref(), Some("GPT-4.1"));
+
+        let cli_turns =
+            get_session_turns_token_stats(&conn, "copilot", session_id, Some("copilot-cli"), None)
+                .unwrap();
+        let vscode_turns =
+            get_session_turns_token_stats(&conn, "copilot", session_id, Some("vscode-chat"), None)
+                .unwrap();
+        assert_eq!(cli_turns[&1].0.total, 55);
+        assert_eq!(vscode_turns[&1].0.total, 110);
+
+        let codex_cwd =
+            get_session_cwd(&conn, "codex", session_id, Some("codex-cli"), None).unwrap();
+        let codex_model =
+            get_session_model(&conn, "codex", session_id, Some("codex-cli"), None).unwrap();
+        let codex_turns =
+            get_session_turns_token_stats(&conn, "codex", session_id, Some("codex-cli"), None)
+                .unwrap();
+        assert_eq!(codex_cwd.as_deref(), Some("/home/codex"));
+        assert_eq!(codex_model.as_deref(), Some("o3"));
+        assert_eq!(codex_turns[&1].0.total, 33);
+    }
+
+    /// Regression: when no source_kind or source_dir_key is provided (legacy
+    /// caller), the query must deterministically return the non-App row
+    /// (source_dir_key IS NULL), not an arbitrary row.
+    #[test]
+    fn session_queries_legacy_none_is_deterministic_and_prefers_non_app() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "ambiguous-session";
+
+        // Insert an App row first (lower turn_no to test ordering is not
+        // by insertion or turn_no).
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', 'dead00', '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GLM5.2-high', '/home/app',
+                100, 10, 110,
+                100, 10, 110
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Insert a CLI row (source_dir_key IS NULL) after the App row.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 2, 'GPT-5.4', '/home/cli',
+                50, 5, 55,
+                50, 5, 55
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Legacy query (both source_kind and source_dir_key are None) must
+        // return the CLI row because source_dir_key IS NULL is the filter.
+        let (_, _, sk, _sdk, _, _) =
+            get_session_assistant_and_transcript(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(sk, "copilot-cli");
+
+        // CWD with None must be the CLI CWD.
+        let cwd = get_session_cwd(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(cwd.as_deref(), Some("/home/cli"));
+
+        // Model with None must be the CLI model.
+        let model = get_session_model(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(model.as_deref(), Some("GPT-5.4"));
+
+        // Turn stats with None must be the CLI totals.
+        let turns =
+            get_session_turns_token_stats(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[&2].0.total, 55);
+    }
+
+    /// Regression: Copilot CLI and VS Code Chat sessions share a NULL
+    /// `source_dir_key` (they are non-App collectors) and may collide on the
+    /// same `session_id`. Querying with an explicit `source_kind` must keep
+    /// identity, CWD, model, and turn stats strictly isolated.
+    ///
+    /// Coverage:
+    /// - same `assistant_type`
+    /// - same `session_id`
+    /// - same `turn_no` (so `get_session_turns_token_stats` cannot rely on
+    ///   the turn number to distinguish sources)
+    /// - both `source_dir_key IS NULL`
+    /// - different `source_kind` / `cwd` / `model` / token counts
+    /// - explicit `source_kind` → identity, CWD, model, turn stats never
+    ///   mix between CLI and VS Code Chat.
+    #[test]
+    fn session_queries_isolate_copilot_cli_vs_vscode_chat_with_same_session_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "iso-cli-vscode-chat";
+
+        // Same assistant, same session_id, same turn_no, both source_dir_key
+        // IS NULL, different source_kind / CWD / model / token totals.
+        for (source_kind, model, cwd, total) in [
+            ("copilot-cli", "GPT-5.4", "/home/cli", 55i64),
+            ("vscode-chat", "GPT-4.1", "/home/vscode", 110i64),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, source_dir_key, timestamp, date,
+                    session_id, turn_no, model, cwd,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total
+                 ) VALUES (
+                    'copilot', ?, NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                    ?, 1, ?, ?,
+                    ?, 5, ?,
+                    ?, 5, ?
+                 )",
+                params![
+                    source_kind,
+                    session_id,
+                    model,
+                    cwd,
+                    total - 5,
+                    total,
+                    total - 5,
+                    total,
+                ],
+            )
+            .unwrap();
+        }
+
+        // Identity must select the matching source_kind and report
+        // source_dir_key as None for both.
+        let (_, _, sk_cli, sdk_cli, _, _) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            session_id,
+            Some("copilot-cli"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(sk_cli, "copilot-cli");
+        assert_eq!(sdk_cli, None);
+
+        let (_, _, sk_vscode, sdk_vscode, _, _) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            session_id,
+            Some("vscode-chat"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(sk_vscode, "vscode-chat");
+        assert_eq!(sdk_vscode, None);
+
+        // CWD isolation per source_kind.
+        let cwd_cli =
+            get_session_cwd(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
+        let cwd_vscode =
+            get_session_cwd(&conn, "copilot", session_id, Some("vscode-chat"), None).unwrap();
+        assert_eq!(cwd_cli.as_deref(), Some("/home/cli"));
+        assert_eq!(cwd_vscode.as_deref(), Some("/home/vscode"));
+
+        // Model isolation per source_kind.
+        let model_cli =
+            get_session_model(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
+        let model_vscode =
+            get_session_model(&conn, "copilot", session_id, Some("vscode-chat"), None).unwrap();
+        assert_eq!(model_cli.as_deref(), Some("GPT-5.4"));
+        assert_eq!(model_vscode.as_deref(), Some("GPT-4.1"));
+
+        // Turn stats isolation per source_kind. The map must contain exactly
+        // one entry per source_kind (same turn_no on both sides) and the
+        // totals must not cross-pollinate.
+        let turns_cli =
+            get_session_turns_token_stats(&conn, "copilot", session_id, Some("copilot-cli"), None)
+                .unwrap();
+        let turns_vscode =
+            get_session_turns_token_stats(&conn, "copilot", session_id, Some("vscode-chat"), None)
+                .unwrap();
+        assert_eq!(turns_cli.len(), 1);
+        assert_eq!(turns_vscode.len(), 1);
+        assert_eq!(turns_cli[&1].0.total, 55);
+        assert_eq!(turns_vscode[&1].0.total, 110);
+    }
+
+    /// Regression: different assistant types may share a `session_id` and
+    /// both have `source_dir_key IS NULL` (e.g. Copilot CLI and Codex CLI
+    /// can both use the same hex-looking id). The assistant_type predicate
+    /// must keep downstream CWD / model / turn stats isolated per assistant.
+    ///
+    /// Coverage:
+    /// - different `assistant_type`
+    /// - same `session_id`
+    /// - same `turn_no`
+    /// - both `source_dir_key IS NULL`
+    /// - different CWD / model / token totals per assistant
+    /// - downstream queries (CWD / model / turn stats) must be isolated
+    ///   by assistant_type.
+    #[test]
+    fn session_queries_isolate_cross_assistant_with_same_session_id_and_null_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "iso-cross-assistant";
+
+        // Copilot row.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GPT-5.4', '/home/copilot',
+                50, 5, 55,
+                50, 5, 55
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Codex row with the same session_id, same turn_no, both NULL key.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'codex', 'codex-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'o3', '/home/codex',
+                28, 5, 33,
+                28, 5, 33
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Downstream queries with assistant='copilot' must NOT see codex data.
+        let cwd_copilot =
+            get_session_cwd(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
+        let model_copilot =
+            get_session_model(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
+        let turns_copilot =
+            get_session_turns_token_stats(&conn, "copilot", session_id, Some("copilot-cli"), None)
+                .unwrap();
+        assert_eq!(cwd_copilot.as_deref(), Some("/home/copilot"));
+        assert_eq!(model_copilot.as_deref(), Some("GPT-5.4"));
+        assert_eq!(turns_copilot[&1].0.total, 55);
+
+        // Downstream queries with assistant='codex' must NOT see copilot data.
+        let cwd_codex =
+            get_session_cwd(&conn, "codex", session_id, Some("codex-cli"), None).unwrap();
+        let model_codex =
+            get_session_model(&conn, "codex", session_id, Some("codex-cli"), None).unwrap();
+        let turns_codex =
+            get_session_turns_token_stats(&conn, "codex", session_id, Some("codex-cli"), None)
+                .unwrap();
+        assert_eq!(cwd_codex.as_deref(), Some("/home/codex"));
+        assert_eq!(model_codex.as_deref(), Some("o3"));
+        assert_eq!(turns_codex[&1].0.total, 33);
+    }
+
+    /// Regression: the legacy `source_kind = None` fallback must pick a
+    /// deterministic source even when there are multiple non-App,
+    /// `source_dir_key IS NULL` rows for the same `(assistant, session_id,
+    /// turn_no)`. The test inserts TWO non-App NULL-key sources (Copilot
+    /// CLI and VS Code Chat) sharing the same turn number so the choice
+    /// cannot be justified by a different turn_no alone.
+    ///
+    /// Coverage:
+    /// - at least two non-App, `source_dir_key IS NULL` sources
+    /// - same `turn_no` (so the tie-break is not happening on turn_no)
+    /// - multiple `source_kind = None` calls must all pick the same source
+    /// - identity, CWD, model, and turn stats must all pick the same source
+    ///   for the same `source_kind = None` legacy call.
+    #[test]
+    fn session_queries_legacy_none_is_deterministic_with_multiple_null_key_sources() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "iso-legacy-multi-null";
+
+        // Insert two non-App, source_dir_key = NULL rows with the same
+        // turn_no=1. The deterministic tie-break must pick one consistently.
+        // Insertion order: VS Code Chat first (alphabetically later), then
+        // Copilot CLI (alphabetically earlier). With the deterministic
+        // ORDER BY (source_kind ASC), Copilot CLI must win because
+        // "copilot-cli" sorts before "vscode-chat".
+        for (source_kind, model, cwd, total) in [
+            ("vscode-chat", "GPT-4.1", "/home/vscode", 110i64),
+            ("copilot-cli", "GPT-5.4", "/home/cli", 55i64),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, source_dir_key, timestamp, date,
+                    session_id, turn_no, model, cwd,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total
+                 ) VALUES (
+                    'copilot', ?, NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                    ?, 1, ?, ?,
+                    ?, 5, ?,
+                    ?, 5, ?
+                 )",
+                params![
+                    source_kind,
+                    session_id,
+                    model,
+                    cwd,
+                    total - 5,
+                    total,
+                    total - 5,
+                    total,
+                ],
+            )
+            .unwrap();
+        }
+
+        // Helper closures so we can call each lookup many times and assert
+        // they all observe the same source row.
+        let pick_identity = || {
+            get_session_assistant_and_transcript(&conn, "copilot", session_id, None, None)
+                .map(|(_, _, sk, sdk, _, _)| (sk, sdk))
+        };
+        let pick_cwd = || get_session_cwd(&conn, "copilot", session_id, None, None);
+        let pick_model = || get_session_model(&conn, "copilot", session_id, None, None);
+        let pick_turns = || get_session_turns_token_stats(&conn, "copilot", session_id, None, None);
+
+        // All four lookups must agree on the same source row.
+        let (id_sk_1, id_sdk_1) = pick_identity().unwrap();
+        let cwd_1 = pick_cwd().unwrap();
+        let model_1 = pick_model().unwrap();
+        let turns_1 = pick_turns().unwrap();
+
+        // The tie-break is `source_kind ASC` → "copilot-cli" wins.
+        assert_eq!(id_sk_1, "copilot-cli");
+        assert_eq!(id_sdk_1, None);
+        assert_eq!(cwd_1.as_deref(), Some("/home/cli"));
+        assert_eq!(model_1.as_deref(), Some("GPT-5.4"));
+        assert_eq!(turns_1.len(), 1);
+        assert_eq!(turns_1[&1].0.total, 55);
+
+        // Calling the same legacy lookup several more times must yield the
+        // exact same result. This is the core determinism guarantee: the
+        // choice is never dependent on arbitrary row order, even with two
+        // matching non-App NULL-key sources.
+        for _ in 0..5 {
+            let (id_sk, id_sdk) = pick_identity().unwrap();
+            let cwd = pick_cwd().unwrap();
+            let model = pick_model().unwrap();
+            let turns = pick_turns().unwrap();
+
+            assert_eq!(id_sk, "copilot-cli");
+            assert_eq!(id_sdk, None);
+            assert_eq!(cwd.as_deref(), Some("/home/cli"));
+            assert_eq!(model.as_deref(), Some("GPT-5.4"));
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[&1].0.total, 55);
+        }
+    }
+
+    /// Regression: when an App row (`source_dir_key IS NOT NULL`) and a
+    /// non-App row (`source_dir_key IS NULL`) both exist for the same
+    /// `(assistant, session_id, turn_no)`, the legacy `source_kind = None`
+    /// fallback must prefer the non-App row because the WHERE clause
+    /// explicitly filters by `source_dir_key IS NULL`. The tie-break is
+    /// therefore `source_kind ASC` within the non-App NULL-key rows; the
+    /// App row is invisible to the legacy caller.
+    ///
+    /// This complements the test above by ensuring the App row never leaks
+    /// into a legacy `None` lookup even when the same turn_no exists on
+    /// both sides.
+    #[test]
+    fn session_queries_legacy_none_excludes_app_row_when_null_key_alternative_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "iso-legacy-app-vs-null";
+
+        // App row with same turn_no=1 and a different model / cwd.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', 'dead00', '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GLM5.2-high', '/home/app',
+                100, 10, 110,
+                100, 10, 110
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Non-App NULL-key row (Copilot CLI) with same turn_no=1.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GPT-5.4', '/home/cli',
+                50, 5, 55,
+                50, 5, 55
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Legacy `None` lookup must see only the CLI row, never the App row.
+        let (_, _, sk, sdk, _, _) =
+            get_session_assistant_and_transcript(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(sk, "copilot-cli");
+        assert_eq!(sdk, None);
+
+        let cwd = get_session_cwd(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(cwd.as_deref(), Some("/home/cli"));
+
+        let model = get_session_model(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(model.as_deref(), Some("GPT-5.4"));
+
+        let turns =
+            get_session_turns_token_stats(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[&1].0.total, 55);
+    }
+
+    /// Regression: when a single `session_id` carries rows from two different
+    /// non-App collectors — `copilot-cli` turn 1 and `vscode-chat` turn 2,
+    /// both with `source_dir_key IS NULL` — the legacy `source_kind = None`
+    /// fallback must NOT mix turns from different sources into a single
+    /// turn-stats map. The fallback must first resolve a single
+    /// `source_kind` (deterministically via `source_kind ASC` → `copilot-cli`)
+    /// and then return only the rows for that resolved source. Otherwise
+    /// `get_session_turns_token_stats` would return a map that contains
+    /// CLI turn 1 *and* VS Code Chat turn 2, violating the "legacy
+    /// fallback must pick a single source" contract even though the
+    /// helper would have reported the identity as CLI.
+    ///
+    /// Coverage:
+    /// - same `assistant_type` (`copilot`)
+    /// - same `session_id`
+    /// - two different `source_kind` (`copilot-cli`, `vscode-chat`)
+    /// - both `source_dir_key IS NULL`
+    /// - different `turn_no` (CLI=1, VS Code=2) — the per-turn "first row
+    ///   encountered" rule would otherwise keep BOTH turns when ordered
+    ///   by `turn_no ASC`
+    /// - different `model` / `cwd` / token totals
+    /// - legacy `source_kind = None` must report CLI as the resolved
+    ///   source for identity, CWD, model, and turn stats
+    /// - turn stats must contain only the CLI turn 1 row, never the VS
+    ///   Code Chat turn 2 row
+    #[test]
+    fn session_queries_legacy_none_picks_single_source_for_interleaved_turns() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "iso-legacy-interleaved";
+
+        // Copilot CLI turn 1 (NULL source_dir_key). Inserted first; its
+        // turn_no is the only one that should survive in the turn-stats
+        // map after the legacy fallback.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GPT-5.4', '/home/cli',
+                50, 5, 55,
+                50, 5, 55
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // VS Code Chat turn 2 (also NULL source_dir_key) for the same
+        // session_id. This row must NEVER appear in the legacy
+        // turn-stats map once the resolver has picked `copilot-cli`.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'vscode-chat', NULL, '2026-07-20T10:01:00Z', '2026-07-20',
+                ?, 2, 'GPT-4.1', '/home/vscode',
+                100, 10, 110,
+                100, 10, 110
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Identity, CWD, model all must come from the CLI source.
+        let (_, _, sk, sdk, _, _) =
+            get_session_assistant_and_transcript(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(sk, "copilot-cli");
+        assert_eq!(sdk, None);
+
+        let cwd = get_session_cwd(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(cwd.as_deref(), Some("/home/cli"));
+
+        let model = get_session_model(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(model.as_deref(), Some("GPT-5.4"));
+
+        // Turn stats must contain ONLY the CLI turn 1 row. The VS Code
+        // Chat turn 2 row must not appear in the map at all because
+        // its source_kind differs from the resolved `copilot-cli`.
+        let turns =
+            get_session_turns_token_stats(&conn, "copilot", session_id, None, None).unwrap();
+        assert_eq!(
+            turns.len(),
+            1,
+            "legacy turn stats must not mix turns from different sources"
+        );
+        assert!(turns.contains_key(&1), "CLI turn 1 must be present");
+        assert!(
+            !turns.contains_key(&2),
+            "VS Code Chat turn 2 must be excluded by the resolved source_kind filter"
+        );
+        assert_eq!(turns[&1].0.total, 55);
+        assert_eq!(turns[&1].1, "GPT-5.4");
+    }
+
+    /// Regression: the legacy `source_kind = None` fallback must prefer a
+    /// main agent row (`parent_session_id IS NULL`) over a subagent
+    /// synthetic row (`parent_session_id IS NOT NULL`) for the same
+    /// `(assistant_type, source_kind, source_dir_key, session_id)`, even
+    /// when the subagent row has an earlier `turn_no`. The old
+    /// `ORDER BY (parent_session_id IS NULL) ASC` actually returned
+    /// subagent rows first (because `IS NULL` evaluates to `1` while
+    /// `IS NOT NULL` evaluates to `0` and `ASC` puts `0` first), so the
+    /// subagent row would be picked even when a main row existed.
+    ///
+    /// Coverage:
+    /// - same `assistant_type`, same `session_id`, same `source_kind`,
+    ///   same `source_dir_key`
+    /// - subagent row: `parent_session_id = Some("parent-id")`,
+    ///   `turn_no = 1` (earlier turn)
+    /// - main row: `parent_session_id = NULL`, `turn_no = 2` (later turn)
+    /// - different model / cwd / token totals so the assertions can
+    ///   distinguish which row was selected
+    /// - different `turn_no` keeps the partial unique index
+    ///   `uidx_assistant_source_session_turn` happy (the index is
+    ///   `assistant_type, source_kind, session_id, turn_no`).
+    #[test]
+    fn session_queries_legacy_none_prefers_main_over_subagent_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let session_id = "iso-legacy-main-vs-subagent";
+
+        // Subagent synthetic row: `parent_session_id` is set, turn_no = 1
+        // (earlier turn), with a distinct model and cwd. If the helper
+        // ever picks this row, the assertions below will fail.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, parent_session_id,
+                agent_nickname, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', 'dead00', 'parent-id',
+                'call_sub', '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'K2.7-code', '/home/subagent',
+                30, 3, 33,
+                30, 3, 33
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Main agent row: `parent_session_id` is NULL, turn_no = 2
+        // (later turn), with a distinct model and cwd. This is the row
+        // the helper MUST select.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, parent_session_id,
+                agent_nickname, timestamp, date,
+                session_id, turn_no, model, cwd,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', 'dead00', NULL,
+                NULL, '2026-07-20T10:01:00Z', '2026-07-20',
+                ?, 2, 'GLM5.2-high', '/home/main',
+                100, 10, 110,
+                100, 10, 110
+             )",
+            params![session_id],
+        )
+        .unwrap();
+
+        // Use the legacy `source_kind = None` fallback while scoping the
+        // query to the App directory. The resolver must still prefer the
+        // main row over the subagent row.
+        let (_, path, sk, sdk, parent, agent) = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            session_id,
+            None,
+            Some("dead00"),
+        )
+        .unwrap();
+        assert_eq!(sk, "copilot-app");
+        assert_eq!(sdk.as_deref(), Some("dead00"));
+        assert_eq!(
+            parent, None,
+            "main row must win: parent_session_id must be NULL"
+        );
+        assert_eq!(
+            agent, None,
+            "main row must win: agent_nickname must be None"
+        );
+        // transcript_path can be NULL in this fixture; we only assert
+        // that we got *some* row back (None is acceptable here).
+        let _ = path;
+
+        // CWD must come from the main row (`/home/main`), not the
+        // subagent row (`/home/subagent`).
+        let cwd = get_session_cwd(&conn, "copilot", session_id, None, Some("dead00")).unwrap();
+        assert_eq!(cwd.as_deref(), Some("/home/main"));
+
+        // Model must come from the main row (`GLM5.2-high`), not the
+        // subagent row (`K2.7-code`).
+        let model = get_session_model(&conn, "copilot", session_id, None, Some("dead00")).unwrap();
+        assert_eq!(model.as_deref(), Some("GLM5.2-high"));
+
+        // Turn stats must contain both turns, but the per-turn first-row
+        // rule must pick the main row (`turn_no = 2`, total 110) for
+        // turn 2 and the subagent row (`turn_no = 1`, total 33) for
+        // turn 1 — the only row that exists for turn 1. The critical
+        // assertion is turn 2: it must reflect the main row's totals,
+        // not be missing because of an off-by-one ordering bug.
+        let turns =
+            get_session_turns_token_stats(&conn, "copilot", session_id, None, Some("dead00"))
+                .unwrap();
+        assert_eq!(turns.len(), 2, "must contain both turn 1 and turn 2");
+        assert_eq!(turns[&1].0.total, 33);
+        assert_eq!(turns[&1].1, "K2.7-code");
+        assert_eq!(
+            turns[&2].0.total, 110,
+            "turn 2 must come from the main row, not the subagent row"
+        );
+        assert_eq!(turns[&2].1, "GLM5.2-high");
     }
 }

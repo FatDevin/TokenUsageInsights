@@ -531,6 +531,7 @@ mod tests {
             context: None,
             cost: None,
             source_kind: Some(source_kind.to_string()),
+            source_dir_key: None,
             parent_session_id: None,
             agent_nickname: None,
             agent_role: None,

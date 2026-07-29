@@ -77,6 +77,7 @@ Windows 預設使用下列原生路徑：
 - Cursor 可由本機 `state.vscdb` 的 `agentKv` 記錄歸因至具體模型；無法唯一比對時保留為 `Unknown Model`
 - 專案工作目錄統計
 - 可排序的 Session 清單
+- 自動讀取 GitHub Copilot App（桌面應用）`~/.copilot/data.db` 與 `session-store.db`
 
 ### Session 還原
 
@@ -190,6 +191,24 @@ jq . ~/.copilot/settings.json
 ```
 
 完成後重新進入 Copilot CLI Session，狀態列會開始輸出並累積 Token 資料。
+
+* * *
+
+## GitHub Copilot App（桌面應用）
+
+**Copilot App（Tauri 桌面應用）不需任何設定。** 看板會自動讀取本機 `~/.copilot/data.db` 與 `~/.copilot/session-store.db`，將 App session 的 token 使用量與 CLI / VS Code 合併顯示在 Copilot 頁面；Session 清單以 `App` 標示來源，與 `CLI`、`VS Code` 區分。
+
+- 看板會在每次背景同步（每 5 秒）檢查這兩個 SQLite 並以 `(created_at, id)` 複合游標做增量同步，避免同一時間戳的多筆 event 重複 upsert，同一個 `(session_id, turn_index)` 不會重複寫入。
+- App 的 `assistant_usage_events` 是 per-API-call 顆粒度；看板會依 Session、Turn、Agent 與模型聚合，保留同一回合的多模型歸因，再以 per-turn 統計供時間軸使用。
+- Session 標題取自 `data.db.sessions.title`。
+
+若 App 與 CLI 分家、或使用非預設目錄，可指定環境變數：
+
+```bash
+COPILOT_APP_DIR="/path/to/copilot-app-data" token-usage-insights
+```
+
+`COPILOT_APP_DIR` 會優先於 `COPILOT_DIR`，未設定時 fallback 到 `~/.copilot`。
 
 * * *
 
@@ -357,6 +376,7 @@ cargo build --release --bin token-usage-insights-cli
 | `INSIGHTS_DIR` | Windows: `%LOCALAPPDATA%\TokenUsageInsights`; 其他平台: `~/.token-usage-insights` | SQLite 資料庫目錄 |
 | `ANTIGRAVITY_DIR` | `~/.gemini/antigravity-cli` | Antigravity CLI 資料目錄 |
 | `COPILOT_DIR` | `~/.copilot` | Copilot CLI 資料目錄 |
+| `COPILOT_APP_DIR` | 同 `COPILOT_DIR` | Copilot App（桌面應用）資料目錄，應包含 `data.db` 與 `session-store.db` |
 | `VSCODE_USER_DATA_DIR` | 依平台自動偵測 | VS Code 使用者資料目錄，應包含 `User/workspaceStorage` |
 | `VSCODE_PORTABLE_DATA_DIR` | 未設定 | VS Code Portable Mode 的 `data` 目錄 |
 | `CODEX_DIR` | `~/.codex` | Codex Desktop 與 Codex CLI 共用資料目錄 |
