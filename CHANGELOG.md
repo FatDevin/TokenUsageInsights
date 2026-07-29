@@ -4,9 +4,23 @@
 
 ## [未發行]
 
-### 新增
+### 新增與改善
 
 - 支援 GitHub Copilot App（Tauri 桌面應用）的 Token 使用量同步，自動讀取 `~/.copilot/data.db` 與 `~/.copilot/session-store.db`，依 Session、Turn、Agent 與模型保存 `assistant_usage_events`，並以 `source_kind = "copilot-app"` 與 CLI / VS Code 區分；Session 清單以 `App` 標示來源。新增 `COPILOT_APP_DIR` 環境變數自訂 App 資料目錄。
+- 新增 Grok Build 助理支援，掃描 `~/.grok/sessions` 的 `updates.jsonl`，提供每日、月度、年度統計、Session 清單與時間軸還原。
+- 支援 Grok Build 的 provider usage、model alias、reasoning effort、快取讀取與 context-only snapshot，並在 Session 清單標示 `Usage` 或 `Context` 來源。
+
+### 變更
+
+- Grok Build Session 若包含 provider 回報成本，統計頁面會優先使用該成本；只有 context snapshot 時才依 xAI API pricing 估算。
+
+### 資料影響
+
+- SQLite `usage_entries` 新增 `reported_cost_usd` 欄位，並以一次性 migration 重新解析既有 Grok Build Session；不會刪除其他助理的資料。
+
+### 相容性
+
+- 新增 `GROK_DIR` 環境變數；既有助理識別碼、API 與資料目錄維持相容。
 
 ### 修正
 
@@ -14,6 +28,8 @@
 - 修正 Gemini 3.1 Pro 的快取價格，改用 Google Standard Context caching 的 0.20／0.40 美元費率。
 - 修正模型名稱 contains fallback，優先套用最具體的模型 base，避免 `GPT-5.4-mini-picker` 誤用 `GPT-5.4` 價格。
 - 修正 Copilot App 與 CLI 同一 Agent 使用多個模型時可能合併或覆寫用量，以及 CLI 總量暫時不符時錯誤推進同步游標的問題。
+- 修正 Grok Build provider cost、headless 快取輸入、同回合多模型歸因、未知模型與時間軸 EOF 回合的解析行為。
+- 保留 `grok-build-0.1` 的獨立歷史定價規則，避免誤套 Grok 4.5 定價。
 
 ## [0.6.1] - 2026-07-26
 
