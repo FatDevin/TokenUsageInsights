@@ -4,11 +4,16 @@
 
 ## [未發行]
 
+### 新增
+
+- 支援 GitHub Copilot App（Tauri 桌面應用）的 Token 使用量同步，自動讀取 `~/.copilot/data.db` 與 `~/.copilot/session-store.db`，依 Session、Turn、Agent 與模型保存 `assistant_usage_events`，並以 `source_kind = "copilot-app"` 與 CLI / VS Code 區分；Session 清單以 `App` 標示來源。新增 `COPILOT_APP_DIR` 環境變數自訂 App 資料目錄。
+
 ### 修正
 
 - 修正非 Codex 長上下文模型的計價門檻，改由 `pricing.csv` 動態解析各模型的實際門檻，並將 Gemini 3.1 Pro 與 Claude Opus 4.6 的門檻修正為 200K。
 - 修正 Gemini 3.1 Pro 的快取價格，改用 Google Standard Context caching 的 0.20／0.40 美元費率。
 - 修正模型名稱 contains fallback，優先套用最具體的模型 base，避免 `GPT-5.4-mini-picker` 誤用 `GPT-5.4` 價格。
+- 修正 Copilot App 與 CLI 同一 Agent 使用多個模型時可能合併或覆寫用量，以及 CLI 總量暫時不符時錯誤推進同步游標的問題。
 
 ## [0.6.1] - 2026-07-26
 
