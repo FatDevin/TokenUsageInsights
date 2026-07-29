@@ -17,7 +17,8 @@ use crate::db::{self, TokenStats};
 use crate::pricing::load_pricing_rules;
 use crate::timeline::{
     parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
-    parse_copilot_timeline_filtered, parse_cursor_timeline, parse_vscode_timeline, TimelineItem,
+    parse_copilot_timeline_filtered, parse_cursor_timeline, parse_grok_timeline,
+    parse_vscode_timeline, TimelineItem,
 };
 
 fn add_usage_to_day_summary(summary: &mut DaySummary, usage: &UsageAggregation) {
@@ -138,6 +139,45 @@ fn resolve_cursor_transcript_path(
         .unwrap_or("");
     if !file_name.contains(session_id) {
         return Err("會話日誌路徑與 session id 不一致。".to_string());
+    }
+
+    Ok(canonical_path)
+}
+
+fn resolve_grok_transcript_path(
+    grok_dir: &StdPath,
+    session_id: &str,
+    transcript_path_db: &str,
+) -> Result<PathBuf, String> {
+    let mut path = PathBuf::from(transcript_path_db);
+    if path.is_relative() {
+        path = grok_dir.join(path);
+    }
+
+    if !path.exists() {
+        return Err("找不到該 Grok Build session 的本地日誌檔案。".to_string());
+    }
+
+    let grok_root = grok_dir
+        .canonicalize()
+        .map_err(|_| "無法存取 Grok Build 根目錄。".to_string())?;
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|_| "無法解析 Grok Build session 日誌路徑。".to_string())?;
+
+    if !canonical_path.starts_with(&grok_root) {
+        return Err("Grok Build session 日誌路徑不在預期目錄內。".to_string());
+    }
+    if canonical_path.file_name().and_then(|name| name.to_str()) != Some("updates.jsonl") {
+        return Err("Grok Build session 日誌格式不受支援。".to_string());
+    }
+    if canonical_path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        != Some(session_id)
+    {
+        return Err("Grok Build session 日誌路徑與 session id 不一致。".to_string());
     }
 
     Ok(canonical_path)
@@ -497,6 +537,16 @@ fn resolve_session_file_path(
             resolve_cursor_transcript_path(&db::get_cursor_dir(), session_id, path)
                 .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
         }
+        "grok" => {
+            let path = transcript_path_db.ok_or_else(|| {
+                SessionFileErrorExt::new(
+                    StatusCode::NOT_FOUND,
+                    "找不到 Grok Build session 日誌檔案路徑。".to_string(),
+                )
+            })?;
+            resolve_grok_transcript_path(&db::get_grok_dir(), session_id, path)
+                .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
+        }
         _ => Err(SessionFileErrorExt::new(
             StatusCode::BAD_REQUEST,
             "不支援的助理類型",
@@ -571,6 +621,7 @@ fn parse_session_timeline_file(
         "codex" => parse_codex_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "claude" => parse_claude_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "cursor" => parse_cursor_timeline(reader, db_entries, &mut timeline, &mut metadata),
+        "grok" => parse_grok_timeline(reader, db_entries, &mut timeline, &mut metadata),
         _ => return Err((StatusCode::BAD_REQUEST, "不支援的助理類型".to_string())),
     }
 
@@ -703,6 +754,9 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
     let copilot_app_session_db = copilot_app_dir.join("session-store.db");
     let copilot_app_exists = copilot_app_data_db.exists() || copilot_app_session_db.exists();
 
+    let grok_dir = db::get_grok_dir();
+    let grok_exists = grok_dir.join("sessions").exists();
+
     Json(SetupInfoResponse {
         platform: std::env::consts::OS.to_string(),
         workspace_dir,
@@ -757,6 +811,14 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
             dir_path: cursor_dir.to_string_lossy().into_owned(),
             data_path: cursor_dir.join("projects").to_string_lossy().into_owned(),
             exists: cursor_exists,
+            script_path: "".to_string(),
+            source_script_path: "".to_string(),
+            settings_path: "".to_string(),
+        },
+        grok: AssistantSetupStatus {
+            dir_path: grok_dir.to_string_lossy().into_owned(),
+            data_path: grok_dir.join("sessions").to_string_lossy().into_owned(),
+            exists: grok_exists,
             script_path: "".to_string(),
             source_script_path: "".to_string(),
             settings_path: "".to_string(),
@@ -1538,6 +1600,7 @@ mod tests {
     use rusqlite::Connection;
     use std::collections::HashMap;
     use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn legacy_usage_entry(turn_no: u32, model: &str, tokens: TokenStats) -> UsageEntry {
         UsageEntry {
@@ -1594,6 +1657,70 @@ mod tests {
         ];
 
         assert!(!timeline_matches_user_prompt(&timeline, "secret keyword"));
+    }
+
+    #[test]
+    fn grok_multi_model_jsonl_survives_sqlite_and_timeline() {
+        let root = std::env::temp_dir().join(format!(
+            "token-usage-insights-grok-timeline-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session_id = "grok-multi-model-timeline";
+        let session_dir = root.join("sessions/work").join(session_id);
+        fs::create_dir_all(&session_dir).unwrap();
+        let updates_path = session_dir.join("updates.jsonl");
+        fs::write(
+            &updates_path,
+            concat!(
+                r#"{"timestamp":1710000000,"params":{"update":{"sessionUpdate":"turn_started","turn_number":0}}}"#, "\n",
+                r#"{"timestamp":1710000001,"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"multi model"}}}}"#, "\n",
+                r#"{"timestamp":1710000002,"params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"done"}}}}"#, "\n",
+                r#"{"timestamp":1710000003,"params":{"update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":300,"outputTokens":60,"totalTokens":360,"modelUsage":{"grok-4.5":{"inputTokens":100,"outputTokens":20,"totalTokens":120,"costUSD":0.01},"grok-build-0.1":{"inputTokens":200,"outputTokens":40,"totalTokens":240,"costUSD":0.02}}}}}}"#, "\n"
+            ),
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::init_db(&conn).unwrap();
+        db::sync_grok_usage_logs(&mut conn, &root).unwrap();
+        let db_entries = db::get_session_turns_token_stats(
+            &conn,
+            "grok",
+            session_id,
+            Some(crate::grok::USAGE_SOURCE_KIND),
+            None,
+        )
+        .unwrap();
+
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_grok_timeline(
+            BufReader::new(File::open(&updates_path).unwrap()),
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+        );
+
+        let (tokens, model) = timeline
+            .iter()
+            .find_map(|item| match item {
+                TimelineItem::AgentReply { tokens, model, .. } => {
+                    tokens.as_ref().map(|tokens| (tokens, model))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(tokens.input, 300);
+        assert_eq!(tokens.output, 60);
+        assert_eq!(tokens.total, 360);
+        assert!(model.contains("Grok 4.5"));
+        assert!(model.contains("Grok Build 0.1"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     /// Regression test: same session_id with copilot-cli and copilot-app rows
