@@ -609,16 +609,12 @@ mod tests {
     }
 
     #[test]
-    fn packaged_grok_build_01_pricing_is_distinct_from_grok_45() {
+    fn legacy_grok_build_01_does_not_use_grok_45_pricing() {
         let rules = load_pricing_rules();
 
-        let short_context =
-            calculate_usage_cost(&rules, Some("grok-build-0.1"), 100_000, 0, 100_000, 0, 0)
-                .unwrap();
-        let long_context =
-            calculate_usage_cost(&rules, Some("grok-build-0.1"), 201_000, 0, 0, 0, 0).unwrap();
+        let error = calculate_usage_cost(&rules, Some("grok-build-0.1"), 100_000, 0, 100_000, 0, 0)
+            .unwrap_err();
 
-        assert!((short_context - 0.12).abs() < 1e-12);
-        assert!((long_context - 0.402).abs() < 1e-12);
+        assert_eq!(error, "找不到可用的模型價格規則：grok-build-0.1");
     }
 }

@@ -11,9 +11,6 @@ Grok 4.5 (Medium),xAI API,1M Tokens,2.00,0.30,6.00,N/A
 Grok 4.5 (High) (<200k),xAI API,1M Tokens,2.00,0.30,6.00,N/A
 Grok 4.5 (High) (>200k),xAI API,1M Tokens,4.00,0.60,12.00,N/A
 Grok 4.5 (High),xAI API,1M Tokens,2.00,0.30,6.00,N/A
-Grok Build 0.1 (<200k),xAI API,1M Tokens,1.00,0.20,2.00,N/A
-Grok Build 0.1 (>200k),xAI API,1M Tokens,2.00,0.40,4.00,N/A
-Grok Build 0.1,xAI API,1M Tokens,1.00,0.20,2.00,N/A
 Gemini 3.6 Flash,Google AI,1M Tokens,1.50,0.15,7.50,0.75/0.075/3.75
 Gemini 3.6 Flash (Medium),Google AI,1M Tokens,1.50,0.15,7.50,0.75/0.075/3.75
 Gemini 3.6 Flash (High),Google AI,1M Tokens,1.50,0.15,7.50,0.75/0.075/3.75

@@ -27,7 +27,7 @@
 - 修正 Gemini 3.1 Pro 的快取價格，改用 Google Standard Context caching 的 0.20／0.40 美元費率。
 - 修正模型名稱 contains fallback，優先套用最具體的模型 base，避免 `GPT-5.4-mini-picker` 誤用 `GPT-5.4` 價格。
 - 修正 Grok Build provider cost、模型歸因、未知模型與時間軸 EOF 回合的解析行為。
-- 新增獨立的 `grok-build-0.1` 定價，避免與 Grok 4.5 混用費率。
+- 區分歷史上的 `grok-build-0.1` 模型識別碼，避免已下架模型誤套 Grok 4.5 定價。
 
 ## [0.6.1] - 2026-07-26
 
