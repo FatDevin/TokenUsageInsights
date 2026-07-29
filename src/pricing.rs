@@ -607,4 +607,18 @@ mod tests {
             calculate_cost(&rules, "Gemini 3.1 Pro (Low)", 201_000, 0, 0, 0, 0).unwrap();
         assert!((long_context - 0.804).abs() < 1e-12);
     }
+
+    #[test]
+    fn packaged_grok_build_01_pricing_is_distinct_from_grok_45() {
+        let rules = load_pricing_rules();
+
+        let short_context =
+            calculate_usage_cost(&rules, Some("grok-build-0.1"), 100_000, 0, 100_000, 0, 0)
+                .unwrap();
+        let long_context =
+            calculate_usage_cost(&rules, Some("grok-build-0.1"), 201_000, 0, 0, 0, 0).unwrap();
+
+        assert!((short_context - 0.12).abs() < 1e-12);
+        assert!((long_context - 0.402).abs() < 1e-12);
+    }
 }

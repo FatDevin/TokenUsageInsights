@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const CONTEXT_SOURCE_KIND: &str = "grok-build-context";
 pub(crate) const USAGE_SOURCE_KIND: &str = "grok-build-usage";
+pub(crate) const UNKNOWN_MODEL: &str = "Unknown Model";
 
 #[derive(Debug, Default, Clone)]
 struct SessionMetadata {
@@ -25,8 +26,22 @@ struct TurnAccumulator {
     model: Option<String>,
     reasoning_effort: Option<String>,
     usage: Option<TokenStats>,
+    model_usages: Vec<ModelUsage>,
     context_tokens: u64,
     reported_cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct ModelUsage {
+    model: String,
+    stats: TokenStats,
+    reported_cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedUsage {
+    total: TokenStats,
+    models: Vec<ModelUsage>,
 }
 
 fn value_as_u64(value: Option<&Value>) -> Option<u64> {
@@ -51,24 +66,50 @@ fn float_from_keys(value: &Value, keys: &[&str]) -> Option<f64> {
     })
 }
 
-fn parse_reported_cost(value: &Value) -> Option<f64> {
-    float_from_keys(
-        value,
-        &["total_cost_usd", "totalCostUsd", "costUSD", "costUsd"],
-    )
-    .or_else(|| {
-        float_from_keys(value, &["total_cost_usd_ticks", "totalCostUsdTicks"])
-            .map(|ticks| ticks / 10_000_000_000.0)
-    })
+fn has_true_flag(value: &Value, keys: &[&str]) -> bool {
+    keys.iter()
+        .any(|key| value.get(*key).and_then(Value::as_bool).unwrap_or(false))
 }
 
-fn parse_model_usage_cost(value: &Value) -> Option<f64> {
-    let costs: Vec<f64> = value
-        .as_object()?
-        .values()
-        .filter_map(parse_reported_cost)
-        .collect();
-    (!costs.is_empty()).then(|| costs.into_iter().sum())
+fn costs_are_trusted(value: &Value) -> bool {
+    !has_true_flag(
+        value,
+        &[
+            "costIsPartial",
+            "cost_is_partial",
+            "usageIsIncomplete",
+            "usage_is_incomplete",
+        ],
+    )
+}
+
+fn finite_nonnegative(value: f64) -> Option<f64> {
+    (value.is_finite() && value >= 0.0).then_some(value)
+}
+
+fn parse_reported_cost(value: &Value) -> Option<f64> {
+    if !costs_are_trusted(value) {
+        return None;
+    }
+
+    float_from_keys(
+        value,
+        &[
+            "costUsdTicks",
+            "cost_usd_ticks",
+            "total_cost_usd_ticks",
+            "totalCostUsdTicks",
+        ],
+    )
+    .map(|ticks| ticks / 10_000_000_000.0)
+    .and_then(finite_nonnegative)
+    .or_else(|| {
+        float_from_keys(
+            value,
+            &["total_cost_usd", "totalCostUsd", "costUSD", "costUsd"],
+        )
+        .and_then(finite_nonnegative)
+    })
 }
 
 fn parse_token_stats(value: &Value) -> Option<TokenStats> {
@@ -119,8 +160,26 @@ fn parse_token_stats(value: &Value) -> Option<TokenStats> {
     })
 }
 
-fn parse_model_usage(value: &Value) -> Option<(TokenStats, Option<String>)> {
+fn parse_model_usage(value: &Value, parent_costs_are_trusted: bool) -> Option<Vec<ModelUsage>> {
     let models = value.as_object()?;
+    let model_usages: Vec<ModelUsage> = models
+        .iter()
+        .filter_map(|(model, usage)| {
+            let stats = parse_token_stats(usage)?;
+            Some(ModelUsage {
+                model: model.clone(),
+                stats: normalize_provider_token_stats(stats),
+                reported_cost_usd: parent_costs_are_trusted
+                    .then(|| parse_reported_cost(usage))
+                    .flatten(),
+            })
+        })
+        .collect();
+
+    (!model_usages.is_empty()).then_some(model_usages)
+}
+
+fn sum_token_stats(model_usages: &[ModelUsage]) -> TokenStats {
     let mut total = TokenStats {
         input: 0,
         output: 0,
@@ -131,43 +190,32 @@ fn parse_model_usage(value: &Value) -> Option<(TokenStats, Option<String>)> {
         reasoning: None,
         total: 0,
     };
-    let mut matched_model = None;
-    let mut found = false;
 
-    for (model, usage) in models {
-        let Some(stats) = parse_token_stats(usage) else {
-            continue;
-        };
-        found = true;
-        matched_model.get_or_insert_with(|| model.clone());
-        total.input = total.input.saturating_add(stats.input);
-        total.output = total.output.saturating_add(stats.output);
-        total.total = total.total.saturating_add(stats.total);
+    for usage in model_usages {
+        total.input = total.input.saturating_add(usage.stats.input);
+        total.output = total.output.saturating_add(usage.stats.output);
+        total.total = total.total.saturating_add(usage.stats.total);
         total.cache_read = Some(
             total
                 .cache_read
                 .unwrap_or(0)
-                .saturating_add(stats.cache_read.unwrap_or(0)),
+                .saturating_add(usage.stats.cache_read.unwrap_or(0)),
         );
         total.cache_write = Some(
             total
                 .cache_write
                 .unwrap_or(0)
-                .saturating_add(stats.cache_write.unwrap_or(0)),
+                .saturating_add(usage.stats.cache_write.unwrap_or(0)),
         );
         total.reasoning = Some(
             total
                 .reasoning
                 .unwrap_or(0)
-                .saturating_add(stats.reasoning.unwrap_or(0)),
+                .saturating_add(usage.stats.reasoning.unwrap_or(0)),
         );
     }
 
-    if found {
-        Some((total, matched_model))
-    } else {
-        None
-    }
+    total
 }
 
 /// Grok reports cached reads as a subset of `inputTokens`, while
@@ -182,24 +230,26 @@ fn normalize_provider_token_stats(mut stats: TokenStats) -> TokenStats {
     stats
 }
 
-fn usage_from_container(value: &Value) -> Option<(TokenStats, Option<String>)> {
-    if let Some(usage) = value.get("usage").and_then(parse_token_stats) {
-        return Some((normalize_provider_token_stats(usage), None));
-    }
-    if let Some(usage) = value.get("modelUsage").and_then(parse_model_usage) {
-        return Some((normalize_provider_token_stats(usage.0), usage.1));
-    }
-    if let Some(usage) = value.get("model_usage").and_then(parse_model_usage) {
-        return Some((normalize_provider_token_stats(usage.0), usage.1));
-    }
-    parse_token_stats(value).map(|stats| (normalize_provider_token_stats(stats), None))
+fn usage_from_container(value: &Value) -> Option<ParsedUsage> {
+    let nested_usage = value.get("usage");
+    let usage_value = nested_usage.unwrap_or(value);
+    let parent_costs_are_trusted = costs_are_trusted(value) && costs_are_trusted(usage_value);
+    let model_usage = value
+        .get("modelUsage")
+        .or_else(|| value.get("model_usage"))
+        .or_else(|| nested_usage.and_then(|usage| usage.get("modelUsage")))
+        .or_else(|| nested_usage.and_then(|usage| usage.get("model_usage")));
+    let models = model_usage
+        .and_then(|value| parse_model_usage(value, parent_costs_are_trusted))
+        .unwrap_or_default();
+    let total = parse_token_stats(usage_value)
+        .map(normalize_provider_token_stats)
+        .or_else(|| (!models.is_empty()).then(|| sum_token_stats(&models)))?;
+
+    Some(ParsedUsage { total, models })
 }
 
-fn extract_usage(
-    line: &Value,
-    update: &Value,
-    params: &Value,
-) -> Option<(TokenStats, Option<String>)> {
+fn extract_usage(line: &Value, update: &Value, params: &Value) -> Option<ParsedUsage> {
     [line, update, params]
         .into_iter()
         .find_map(usage_from_container)
@@ -207,19 +257,50 @@ fn extract_usage(
         .or_else(|| update.get("_meta").and_then(usage_from_container))
 }
 
+fn parse_model_usage_cost(value: &Value) -> Option<f64> {
+    let costs: Vec<f64> = parse_model_usage(value, true)?
+        .into_iter()
+        .filter_map(|usage| usage.reported_cost_usd)
+        .collect();
+    (!costs.is_empty()).then(|| costs.into_iter().sum())
+}
+
+fn parse_reported_cost_from_container(value: &Value) -> Option<f64> {
+    if !costs_are_trusted(value) {
+        return None;
+    }
+
+    parse_reported_cost(value)
+        .or_else(|| {
+            value.get("usage").and_then(|usage| {
+                if !costs_are_trusted(usage) {
+                    return None;
+                }
+                parse_reported_cost(usage).or_else(|| {
+                    usage
+                        .get("modelUsage")
+                        .and_then(parse_model_usage_cost)
+                        .or_else(|| usage.get("model_usage").and_then(parse_model_usage_cost))
+                })
+            })
+        })
+        .or_else(|| {
+            value
+                .get("modelUsage")
+                .and_then(parse_model_usage_cost)
+                .or_else(|| value.get("model_usage").and_then(parse_model_usage_cost))
+        })
+        .or_else(|| {
+            value
+                .get("_meta")
+                .and_then(parse_reported_cost_from_container)
+        })
+}
+
 fn extract_reported_cost(line: &Value, update: &Value, params: &Value) -> Option<f64> {
     [line, update, params]
         .into_iter()
-        .find_map(|value| {
-            parse_reported_cost(value).or_else(|| {
-                value
-                    .get("modelUsage")
-                    .and_then(parse_model_usage_cost)
-                    .or_else(|| value.get("model_usage").and_then(parse_model_usage_cost))
-            })
-        })
-        .or_else(|| params.get("_meta").and_then(parse_reported_cost))
-        .or_else(|| update.get("_meta").and_then(parse_reported_cost))
+        .find_map(parse_reported_cost_from_container)
 }
 
 fn extract_model(line: &Value, update: &Value, params: &Value) -> Option<String> {
@@ -288,19 +369,31 @@ fn is_grok45_model_id(model: &str) -> bool {
             | "grok45build"
             | "grokbuildlatest"
             | "grokbuild"
-            | "grokbuild01"
             | "grokcodefast1"
             | "grokcodefast"
             | "grokcodefast10825"
     )
 }
 
-fn display_model_name(model: &str, reasoning_effort: Option<&str>) -> String {
+fn is_grok_build_01_model_id(model: &str) -> bool {
+    matches!(
+        normalize_model_id(model).as_str(),
+        "grokbuild01" | "grokbuild01latest"
+    )
+}
+
+pub(crate) fn display_model_name(model: &str, reasoning_effort: Option<&str>) -> String {
+    if model.trim().is_empty() {
+        return UNKNOWN_MODEL.to_string();
+    }
     if is_grok45_model_id(model) {
         if let Some(effort) = reasoning_effort.and_then(normalize_reasoning_effort) {
             return format!("Grok 4.5 ({effort})");
         }
         return "Grok 4.5".to_string();
+    }
+    if is_grok_build_01_model_id(model) {
+        return "Grok Build 0.1".to_string();
     }
 
     model.trim().to_string()
@@ -352,9 +445,18 @@ fn timestamp_from_seconds(seconds: f64) -> Option<String> {
     if !seconds.is_finite() {
         return None;
     }
-    let whole_seconds = seconds.trunc() as i64;
-    let nanos = ((seconds.fract().abs()) * 1_000_000_000.0).round() as u32;
-    DateTime::<Utc>::from_timestamp(whole_seconds, nanos)
+
+    let total_nanos = (seconds * 1_000_000_000.0).round();
+    if !total_nanos.is_finite() {
+        return None;
+    }
+    let total_nanos = total_nanos as i128;
+    let whole_seconds = total_nanos.div_euclid(1_000_000_000);
+    if whole_seconds < i64::MIN as i128 || whole_seconds > i64::MAX as i128 {
+        return None;
+    }
+    let nanos = total_nanos.rem_euclid(1_000_000_000) as u32;
+    DateTime::<Utc>::from_timestamp(whole_seconds as i64, nanos)
         .map(|date| date.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
@@ -485,9 +587,9 @@ fn finalize_turn(
     metadata: &SessionMetadata,
     turn: TurnAccumulator,
     updates_path: &Path,
-) -> Option<UsageEntry> {
+) -> Vec<UsageEntry> {
     let has_provider_usage = turn.usage.is_some() || turn.reported_cost_usd.is_some();
-    let stats = turn
+    let total_stats = turn
         .usage
         .or_else(|| {
             (turn.context_tokens > 0).then_some(TokenStats {
@@ -512,57 +614,100 @@ fn finalize_turn(
                 reasoning: None,
                 total: 0,
             })
-        })?;
+        });
+    let Some(total_stats) = total_stats.or_else(|| {
+        turn.reported_cost_usd.map(|_| TokenStats {
+            input: 0,
+            output: 0,
+            cache_read: None,
+            cache_write: None,
+            cache_write_5m: None,
+            cache_write_1h: None,
+            reasoning: None,
+            total: 0,
+        })
+    }) else {
+        return Vec::new();
+    };
     let timestamp = if turn.timestamp.is_empty() {
         "1970-01-01T00:00:00.000Z".to_string()
     } else {
         turn.timestamp
     };
-    let model_id = turn
-        .model
-        .or_else(|| metadata.model.clone())
-        .unwrap_or_else(|| "grok-4.5".to_string());
     let reasoning_effort = turn
         .reasoning_effort
         .or_else(|| metadata.reasoning_effort.clone());
-    let model = display_model_name(&model_id, reasoning_effort.as_deref());
     let source_kind = if has_provider_usage {
         USAGE_SOURCE_KIND
     } else {
         CONTEXT_SOURCE_KIND
     };
 
-    Some(UsageEntry {
-        timestamp,
-        session_id: metadata.session_id.clone(),
-        session_name: metadata.session_name.clone(),
-        transcript_path: Some(updates_path.to_string_lossy().into_owned()),
-        cwd: metadata.cwd.clone(),
-        version: metadata.version.clone(),
-        turn_no: turn.turn_no.max(1),
-        model: Some(model),
-        model_id: Some(model_id),
-        tokens: Some(stats.clone()),
-        delta_tokens: Some(stats),
-        context: Some(ContextStats {
-            current_context_tokens: (turn.context_tokens > 0).then_some(turn.context_tokens),
-            displayed_context_limit: None,
-            current_context_used_percentage: None,
-        }),
-        cost: turn
-            .reported_cost_usd
-            .map(|reported_cost_usd| crate::db::CostStats {
-                total_api_duration_ms: None,
-                total_duration_ms: None,
-                total_premium_requests: None,
-                reported_cost_usd: Some(reported_cost_usd),
-            }),
-        source_kind: Some(source_kind.to_string()),
-        parent_session_id: None,
-        agent_nickname: None,
-        agent_role: None,
-        reasoning_effort,
-    })
+    let model_usages = turn.model_usages;
+    let all_model_costs_present = model_usages
+        .iter()
+        .all(|usage| usage.reported_cost_usd.is_some());
+    let model_specs = match model_usages.len() {
+        0 => vec![(
+            turn.model.or_else(|| metadata.model.clone()),
+            total_stats,
+            turn.reported_cost_usd,
+        )],
+        1 => {
+            let usage = model_usages.into_iter().next().expect("length checked");
+            vec![(
+                Some(usage.model),
+                usage.stats,
+                usage.reported_cost_usd.or(turn.reported_cost_usd),
+            )]
+        }
+        _ if turn.reported_cost_usd.is_none() || all_model_costs_present => model_usages
+            .into_iter()
+            .map(|usage| (Some(usage.model), usage.stats, usage.reported_cost_usd))
+            .collect(),
+        _ => vec![(None, total_stats, turn.reported_cost_usd)],
+    };
+
+    model_specs
+        .into_iter()
+        .map(|(model_id, stats, reported_cost_usd)| {
+            let model_id = model_id.filter(|model| !model.trim().is_empty());
+            let model = model_id
+                .as_deref()
+                .map(|model| display_model_name(model, reasoning_effort.as_deref()))
+                .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
+            UsageEntry {
+                timestamp: timestamp.clone(),
+                session_id: metadata.session_id.clone(),
+                session_name: metadata.session_name.clone(),
+                transcript_path: Some(updates_path.to_string_lossy().into_owned()),
+                cwd: metadata.cwd.clone(),
+                version: metadata.version.clone(),
+                turn_no: turn.turn_no.max(1),
+                model: Some(model),
+                model_id,
+                tokens: Some(stats.clone()),
+                delta_tokens: Some(stats),
+                context: Some(ContextStats {
+                    current_context_tokens: (turn.context_tokens > 0)
+                        .then_some(turn.context_tokens),
+                    displayed_context_limit: None,
+                    current_context_used_percentage: None,
+                }),
+                cost: reported_cost_usd.map(|reported_cost_usd| crate::db::CostStats {
+                    total_api_duration_ms: None,
+                    total_duration_ms: None,
+                    total_premium_requests: None,
+                    reported_cost_usd: Some(reported_cost_usd),
+                }),
+                source_kind: Some(source_kind.to_string()),
+                parent_session_id: None,
+                agent_nickname: None,
+                agent_role: None,
+                reasoning_effort: reasoning_effort.clone(),
+            }
+        })
+        .collect()
 }
 
 /// Keep the full context snapshot for display, but only count the increase
@@ -683,10 +828,13 @@ pub(crate) fn parse_session_usage_file(updates_path: &Path) -> Result<Vec<UsageE
             if reasoning_effort.is_some() {
                 current_turn.reasoning_effort = reasoning_effort;
             }
-            if let Some((usage, usage_model)) = extract_usage(&event, update, params) {
-                current_turn.usage = Some(usage);
-                if usage_model.is_some() {
-                    current_turn.model = usage_model;
+            if let Some(usage) = extract_usage(&event, update, params) {
+                current_turn.usage = Some(usage.total);
+                current_turn.model_usages = usage.models;
+                match current_turn.model_usages.as_slice() {
+                    [usage] => current_turn.model = Some(usage.model.clone()),
+                    [] => {}
+                    _ => current_turn.model = None,
                 }
             }
             if let Some(reported_cost_usd) = extract_reported_cost(&event, update, params) {
@@ -714,9 +862,7 @@ pub(crate) fn parse_session_usage_file(updates_path: &Path) -> Result<Vec<UsageE
             if let Some(turn) = current.take() {
                 let mut entry_metadata = metadata.clone();
                 entry_metadata.session_name = session_name.clone();
-                if let Some(entry) = finalize_turn(&entry_metadata, turn, updates_path) {
-                    entries.push(entry);
-                }
+                entries.extend(finalize_turn(&entry_metadata, turn, updates_path));
             }
         }
     }
@@ -724,9 +870,7 @@ pub(crate) fn parse_session_usage_file(updates_path: &Path) -> Result<Vec<UsageE
     if let Some(turn) = current.take() {
         let mut entry_metadata = metadata;
         entry_metadata.session_name = session_name;
-        if let Some(entry) = finalize_turn(&entry_metadata, turn, updates_path) {
-            entries.push(entry);
-        }
+        entries.extend(finalize_turn(&entry_metadata, turn, updates_path));
     }
 
     normalize_context_snapshot_deltas(&mut entries);
@@ -763,7 +907,7 @@ mod tests {
             concat!(
                 r#"{"timestamp":1710000000,"params":{"update":{"sessionUpdate":"turn_started","turn_number":0}}}"#, "\n",
                 r#"{"timestamp":1710000001,"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hello"}}}}"#, "\n",
-                r#"{"timestamp":1710000002,"params":{"update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":100,"cachedReadTokens":20,"outputTokens":30,"reasoningTokens":4,"totalTokens":130},"modelUsage":{"grok-4.5":{"inputTokens":100,"cachedReadTokens":20,"outputTokens":30,"reasoningTokens":4,"costUSD":0.0123}},"total_cost_usd":0.0123}}}"#, "\n"
+                r#"{"timestamp":1710000002,"params":{"update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":100,"cachedReadTokens":20,"outputTokens":30,"reasoningTokens":4,"totalTokens":130,"costUsdTicks":123000000,"costIsPartial":false,"usageIsIncomplete":false,"modelUsage":{"grok-4.5":{"inputTokens":100,"cachedReadTokens":20,"outputTokens":30,"reasoningTokens":4,"costUSD":0.0123}}}}}}"#, "\n"
             ),
         )
         .unwrap();
@@ -807,11 +951,162 @@ mod tests {
             }
         });
 
-        let (stats, model) = usage_from_container(&value).unwrap();
-        assert_eq!(model.as_deref(), Some("grok-4.5"));
-        assert_eq!(stats.input, 80);
-        assert_eq!(stats.cache_read, Some(20));
-        assert_eq!(stats.total, 130);
+        let usage = usage_from_container(&value).unwrap();
+        assert_eq!(usage.models[0].model, "grok-4.5");
+        assert_eq!(usage.total.input, 80);
+        assert_eq!(usage.total.cache_read, Some(20));
+        assert_eq!(usage.total.total, 130);
+    }
+
+    #[test]
+    fn parses_cost_ticks_and_rejects_partial_or_incomplete_costs() {
+        assert_eq!(
+            parse_reported_cost(&serde_json::json!({"costUsdTicks": 10_000_000_000u64})),
+            Some(1.0)
+        );
+        assert_eq!(
+            parse_reported_cost(
+                &serde_json::json!({"costUsdTicks": 10_000_000_000u64, "costIsPartial": true})
+            ),
+            None
+        );
+        assert_eq!(
+            parse_reported_cost(
+                &serde_json::json!({"costUsdTicks": 10_000_000_000u64, "usageIsIncomplete": true})
+            ),
+            None
+        );
+        assert_eq!(
+            extract_reported_cost(
+                &Value::Null,
+                &serde_json::json!({
+                    "usage": {
+                        "costUsdTicks": 10_000_000_000u64,
+                        "usageIsIncomplete": true,
+                        "modelUsage": {
+                            "grok-4.5": {"costUSD": 1.0}
+                        }
+                    }
+                }),
+                &Value::Null,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn preserves_each_model_usage_in_a_multi_model_turn() {
+        let value = serde_json::json!({
+            "usage": {
+                "inputTokens": 300,
+                "outputTokens": 60,
+                "totalTokens": 360,
+                "modelUsage": {
+                    "grok-4.5": {
+                        "inputTokens": 100,
+                        "outputTokens": 20,
+                        "totalTokens": 120,
+                        "costUSD": 0.01
+                    },
+                    "grok-build-0.1": {
+                        "inputTokens": 200,
+                        "outputTokens": 40,
+                        "totalTokens": 240,
+                        "costUSD": 0.02
+                    }
+                }
+            }
+        });
+
+        let usage = usage_from_container(&value).unwrap();
+        let mut models: Vec<&str> = usage
+            .models
+            .iter()
+            .map(|model| model.model.as_str())
+            .collect();
+        models.sort_unstable();
+
+        assert_eq!(models, ["grok-4.5", "grok-build-0.1"]);
+        assert_eq!(usage.total.total, 360);
+        assert_eq!(
+            usage
+                .models
+                .iter()
+                .find(|model| model.model == "grok-4.5")
+                .and_then(|model| model.reported_cost_usd),
+            Some(0.01)
+        );
+        assert_eq!(
+            usage
+                .models
+                .iter()
+                .find(|model| model.model == "grok-build-0.1")
+                .and_then(|model| model.reported_cost_usd),
+            Some(0.02)
+        );
+    }
+
+    #[test]
+    fn parses_multi_model_turn_into_separate_entries() {
+        let root = test_updates_path("multi-model");
+        let session_dir = root.join("sessions/work/session-multi");
+        fs::create_dir_all(&session_dir).unwrap();
+        let events = [
+            serde_json::json!({
+                "timestamp": 1710000000,
+                "params": {"update": {"sessionUpdate": "turn_started", "turn_number": 0}}
+            }),
+            serde_json::json!({
+                "timestamp": 1710000001,
+                "params": {"update": {"sessionUpdate": "user_message_chunk", "content": {"text": "hello"}}}
+            }),
+            serde_json::json!({
+                "timestamp": 1710000002,
+                "params": {"update": {
+                    "sessionUpdate": "turn_completed",
+                    "usage": {
+                        "inputTokens": 300,
+                        "outputTokens": 60,
+                        "totalTokens": 360,
+                        "costUsdTicks": 300_000_000,
+                        "modelUsage": {
+                            "grok-4.5": {"inputTokens": 100, "outputTokens": 20, "totalTokens": 120, "costUSD": 0.01},
+                            "grok-build-0.1": {"inputTokens": 200, "outputTokens": 40, "totalTokens": 240, "costUSD": 0.02}
+                        }
+                    }
+                }}
+            }),
+        ];
+        let content = events
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(session_dir.join("updates.jsonl"), format!("{content}\n")).unwrap();
+
+        let entries = parse_session_usage_file(&session_dir.join("updates.jsonl")).unwrap();
+        let mut models: Vec<(&str, f64)> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.model_id.as_deref().unwrap(),
+                    entry
+                        .cost
+                        .as_ref()
+                        .and_then(|cost| cost.reported_cost_usd)
+                        .unwrap(),
+                )
+            })
+            .collect();
+        models.sort_by(|left, right| left.0.cmp(right.0));
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].0, "grok-4.5");
+        assert!((models[0].1 - 0.01).abs() < 1e-12);
+        assert_eq!(models[1].0, "grok-build-0.1");
+        assert!((models[1].1 - 0.02).abs() < 1e-12);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -843,6 +1138,24 @@ mod tests {
             "Grok 4.5 (Medium)"
         );
         assert_eq!(display_model_name("grok-4.5", None), "Grok 4.5");
+        assert_eq!(
+            display_model_name("grok-build-0.1", Some("high")),
+            "Grok Build 0.1"
+        );
+        assert!(!is_grok45_model_id("grok-build-0.1"));
+        assert!(is_grok_build_01_model_id("grok-build-0.1"));
+    }
+
+    #[test]
+    fn timestamp_normalizes_negative_epochs_and_nanosecond_carry() {
+        assert_eq!(
+            timestamp_from_seconds(-0.5).as_deref(),
+            Some("1969-12-31T23:59:59.500Z")
+        );
+        assert_eq!(
+            timestamp_from_seconds(0.999_999_999_6).as_deref(),
+            Some("1970-01-01T00:00:01.000Z")
+        );
     }
 
     #[test]
@@ -882,6 +1195,10 @@ mod tests {
         assert!(entries
             .iter()
             .all(|entry| entry.source_kind.as_deref() == Some(CONTEXT_SOURCE_KIND)));
+        assert!(entries
+            .iter()
+            .all(|entry| entry.model.as_deref() == Some(UNKNOWN_MODEL)));
+        assert!(entries.iter().all(|entry| entry.model_id.is_none()));
 
         let _ = fs::remove_dir_all(root);
     }

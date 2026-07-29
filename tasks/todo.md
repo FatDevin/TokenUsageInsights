@@ -91,7 +91,7 @@
 
 - [x] 從 `origin/main` 與舊綜合 commit 拆出 Grok 相關檔案與依賴邊界。
 - [x] 移植 Grok parser、timeline 與 SQLite sync，適配主線現有 schema/migration。
-- [x] 接上 handler、CLI、靜態前端與安裝文件，避免修改 #27 的計價門檻邏輯。
+- [x] 接上 handler、CLI、靜態前端與安裝文件，沿用 #27 的動態計價門檻基底。
 - [x] 執行完整驗證與 deterministic fixture smoke check。
 
 ## Risk and rollback
@@ -105,14 +105,26 @@
 - `origin/main` already contains the current cache-write and model-attribution pricing behavior; this branch must preserve it.
 - Provider costs are stored in `usage_entries.reported_cost_usd`; context-only rows use incremental deltas before estimated pricing.
 - Transcript access is constrained to `GROK_DIR/sessions/<session_id>/updates.jsonl`; parser migration resets only `grok:` sync state.
-- `pricing.csv` only adds Grok rows in this branch; dynamic non-Codex pricing thresholds belong to issue #27.
+- `pricing.csv` inherits #27 的動態 threshold rows，並新增 Grok 4.5 與獨立 Grok Build 0.1 定價。
 
 ## Results
 
 - 新增 `src/grok.rs` parser、Grok timeline reconstruction、SQLite sync、parser migration、`reported_cost_usd` round-trip 與來源標記。
 - 接上 daily handler transcript path validation、setup-info、CLI aliases/help、frontend assistant selector/setup modal、雙語翻譯、Grok logo、README 與 CHANGELOG。
-- `pricing.csv` 僅新增 Grok 4.5 API pricing rows；未修改 #27 的既有 threshold rows。
+- `pricing.csv` 保留 #27 的 Gemini/Claude 200K 門檻，並新增 Grok Build 0.1 的 1/0.2/2 與 2/0.4/4 費率。
 - 驗證：`cargo fmt --all -- --check`、`cargo test --locked`（主 binary 83、CLI binary 60）、`cargo build --release --locked --all-targets`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`node --check static/app.js`、`node --check static/i18n.js`、`git diff --check` 全部通過，無 compiler warnings。
+
+## Review follow-up
+
+- [x] 以官方 Grok Build wire fixture 驗證 `costUsdTicks`、partial/incomplete flags 與多模型 `modelUsage`。
+- [x] 驗證 Grok Build 0.1、Grok 4.5、未知模型、負數/進位 timestamp 與 EOF timeline 行為。
+- [x] 完成 Rust、前端語法、Clippy、release build、diff 與 PR mergeability 檢查。
+
+### Review follow-up results
+
+- `cargo test --locked` 通過：主 binary 96 tests、CLI binary 64 tests。
+- `cargo fmt -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`cargo build --release --locked --all-targets`、`node --check static/app.js`、`node --check static/i18n.js` 與 `git diff --check` 全部通過，零 compiler warnings。
+- PR #30 以 PR #29 的已推送 commit 為共同父系；`CHANGELOG.md` 衝突已在 merge commit 中整合，後續修正只保留 Grok/文件與測試差異。
 
 # 2026-07-10 codex_session_count_mismatch
 
@@ -264,3 +276,45 @@
 - 發布時間：`2026-07-10T13:13:54Z`。
 - 發布方式：推送 annotated tag `v0.1.2` 觸發既有 CI；未 force push、未改寫既有標籤或歷史。
 - 回滾方式：保留既有 `v0.1.0`、`v0.1.1` Release；如需停止採用本版，可回退下載與部署至前一版，不需改寫 Git 歷史。
+
+# 2026-07-29 PR #29/#30 review feedback
+
+## Goal and acceptance criteria
+
+- [x] 完成 PR #29 與 PR #30 維護者及 Copilot 提出的正確性修正。
+- [x] PR #29 的 Gemini 3.1 Pro 快取價格與封裝 `pricing.csv` 回歸測試一致，且 contains fallback 會選最具體模型 base。
+- [x] PR #30 的 Grok 4.5 動態門檻、官方 `costUsdTicks`、`modelUsage`、多模型歸因、Unknown Model、時間戳與 EOF timeline 行為均有回歸覆蓋。
+- [x] PR #30 的 Grok Build 0.1 與 Grok 4.5 使用獨立定價，且 README 路徑說明不再造成支援範圍誤解。
+- [ ] 新 commit 已推送至兩個 PR 的原有 head branch，並完成遠端 mergeability 驗證。
+
+## Plan
+
+- [x] Checkpoint A：取得 PR metadata、review comments、thread 狀態、changed files 與本地分支狀態。
+- [x] Checkpoint B：在 PR #29 分支完成定價資料、模型匹配與測試修正。
+- [x] Checkpoint C：在 PR #30 分支完成 Grok 解析、模型歸因、時間軸、定價與文件修正。
+- [x] Checkpoint D：執行 Rust/JavaScript 驗證、比較兩分支共同檔案並確認 merge base。
+- [ ] Checkpoint E：建立 Conventional Commit、推送兩個 head branch，記錄遠端驗證結果。
+
+## Risk and rollback
+
+- Risk: medium；影響定價計算、Grok provider cost、模型歸因、時間軸與兩個相互關聯的 PR 分支。
+- Rollback: 保留推送前的 remote head SHA；如驗證失敗，停止推送或以明確的新修正提交回復，禁止 force-push 或改寫 PR 歷史。
+- Merge safety: PR #30 已將 PR #29 的修正作為共同父系；PR #29 合併後，PR #30 的差異會只保留 Grok/文件/測試修正，避免共同檔案產生重複衝突。
+
+## Dependencies and environment
+
+- Rust stable、Cargo lockfile、Node.js（`node --check`）。
+- `origin` 為 `git@github.com:sdsg5bpnl/TokenUsageInsights.git`；本機未安裝 `gh` CLI，review thread 狀態以 GitHub connector 讀取結果為準。
+- 不使用真實使用者 session 或資料庫；測試沿用 repository fixture/temp-dir 模式。
+
+## Working notes
+
+- PR #29：修正 Gemini 3.1 Pro cache pricing；contains fallback 以正規化 base 長度選最具體候選，同一 base 再選 threshold 規則；補封裝 CSV 與 `GPT-5.4-mini-picker` regression tests。
+- PR #30：補 `costUsdTicks`/flags、保留 `modelUsage` 模型歸因、區分 `grok-build-0.1`、未知模型不可猜成 Grok 4.5、修正 timestamp normalization 與 EOF incomplete turn 時間。
+- PR #30 先在本地合併 PR #29 分支並保留 merge commit，讓 PR #29 的 head 成為 PR #30 的 ancestor；未改寫歷史或 force-push。
+
+## Results
+
+- `cargo test --locked` 通過：主 binary 96 tests、CLI binary 64 tests。
+- `cargo fmt -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`cargo build --release --locked --all-targets`、`node --check static/app.js`、`node --check static/i18n.js` 與 `git diff --check` 全部通過，零 compiler warnings。
+- 待完成：建立 PR #30 修正 commit、推送兩個分支，並以遠端 SHA/merge-base 確認 PR 狀態。

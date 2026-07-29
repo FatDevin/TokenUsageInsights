@@ -1,5 +1,5 @@
 use crate::db::{parse_cursor_timestamp, TokenStats};
-use crate::grok::{timestamp_to_rfc3339, value_to_text};
+use crate::grok::{display_model_name, timestamp_to_rfc3339, value_to_text, UNKNOWN_MODEL};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -1573,12 +1573,13 @@ pub fn parse_grok_timeline(
     let mut current_turn = 0u32;
     let mut next_turn = 1u32;
     let mut zero_based = None;
-    let mut current_model = "Grok 4.5".to_string();
+    let mut current_model = UNKNOWN_MODEL.to_string();
     let mut user_indices = HashMap::<u32, usize>::new();
     let mut reply_parts = HashMap::<u32, Vec<String>>::new();
     let mut reasoning_parts = HashMap::<u32, Vec<String>>::new();
     let mut tool_indices = HashMap::<String, usize>::new();
     let mut session_started = false;
+    let mut last_timestamp = String::new();
 
     for line_res in reader.lines() {
         let Ok(line) = line_res else {
@@ -1598,6 +1599,9 @@ pub fn parse_grok_timeline(
             .and_then(|value| value.as_str())
             .unwrap_or("");
         let timestamp = timestamp_to_rfc3339(event.get("timestamp"));
+        if !timestamp.is_empty() {
+            last_timestamp = timestamp.clone();
+        }
 
         if let Some(model) = update
             .get("model")
@@ -1605,7 +1609,7 @@ pub fn parse_grok_timeline(
             .or_else(|| update.get("modelId"))
             .and_then(|value| value.as_str())
         {
-            current_model = model.to_string();
+            current_model = display_model_name(model, None);
         }
 
         if matches!(update_type, "turn_started" | "user_message_chunk") && current_turn == 0 {
@@ -1774,7 +1778,7 @@ pub fn parse_grok_timeline(
             .unwrap_or((None, current_model.clone()));
         if !reply.is_empty() || tokens.is_some() {
             timeline.push(TimelineItem::AgentReply {
-                timestamp: String::new(),
+                timestamp: last_timestamp,
                 reply,
                 reasoning,
                 turn_no: current_turn,
@@ -1790,4 +1794,53 @@ pub fn parse_grok_timeline(
         "selected_model".to_string(),
         serde_json::Value::String(current_model),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn grok_eof_flush_keeps_last_timestamp_and_unknown_model() {
+        let path = std::env::temp_dir().join(format!(
+            "token_usage_insights_grok_timeline_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"timestamp":1710000000,"params":{"update":{"sessionUpdate":"turn_started","turn_number":0}}}"#, "\n",
+                r#"{"timestamp":1710000001,"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"hello"}}}}"#, "\n",
+                r#"{"timestamp":1710000002,"params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"reply"}}}}"#, "\n"
+            ),
+        )
+        .unwrap();
+
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_grok_timeline(
+            BufReader::new(File::open(&path).unwrap()),
+            &HashMap::new(),
+            &mut timeline,
+            &mut metadata,
+        );
+
+        let reply = timeline
+            .iter()
+            .find_map(|item| match item {
+                TimelineItem::AgentReply {
+                    timestamp, model, ..
+                } => Some((timestamp, model)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(reply.0, "2024-03-09T16:00:02.000Z");
+        assert_eq!(reply.1, UNKNOWN_MODEL);
+
+        let _ = std::fs::remove_file(path);
+    }
 }

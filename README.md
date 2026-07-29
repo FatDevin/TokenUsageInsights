@@ -293,6 +293,10 @@ $env:VSCODE_USER_DATA_DIR = "C:\path\to\vscode-user-data"; & "$HOME\bin\token-us
 ~/.grok/sessions
 ```
 
+這裡採用 Grok Build 內建保存的 Session stream；不讀取舊規格中的
+`~/.Grok/build/usage/usage-YYYY-MM-DD.jsonl`，也不需要在
+`~/.Grok/build/settings.json` 設定 `statusLine`。
+
 使用方式：
 
 1. 先正常使用 Grok Build 產生至少一個 Session。
