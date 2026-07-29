@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=31';
+import i18n from './i18n.js?v=32';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -272,6 +272,8 @@ let refreshInterval = 10000; // default 10s
 let currentLang = localStorage.getItem('lang') || 'zh-TW';
 let currentUsageData = null;
 let currentMonthlyData = null;
+const modelSessionDetailsCache = new Map();
+const expandedModelDrilldowns = new Map();
 let cachedCodexResets = null;
 let isQueryingCodexResets = false;
 
@@ -3500,6 +3502,38 @@ function updateSortHeadersUI() {
 // =========================================================================
 // 渲染 Session 列表 Table
 // =========================================================================
+function getSessionSourceBadge(session) {
+  if (session.source_kind === 'vscode-chat') {
+    return '<span class="badge source-badge" title="GitHub Copilot in VS Code">VS Code</span>';
+  }
+  if (session.assistant_type === 'copilot') {
+    return '<span class="badge source-badge" title="GitHub Copilot CLI">CLI</span>';
+  }
+  if (session.source_kind === 'codex-desktop') {
+    return '<span class="badge source-badge" title="Codex Desktop">Desktop</span>';
+  }
+  if (session.source_kind === 'codex-cli') {
+    return '<span class="badge source-badge" title="Codex CLI">CLI</span>';
+  }
+  if (session.source_kind === 'cursor-agent') {
+    return `<span class="badge source-badge cursor-mode-badge cursor-mode-agent" title="${escapeHtml(t('source_cursor_agent_title'))}">${escapeHtml(t('source_cursor_agent'))}</span>`;
+  }
+  if (session.source_kind === 'cursor-ide') {
+    return `<span class="badge source-badge cursor-mode-badge cursor-mode-ide" title="${escapeHtml(t('source_cursor_ide_title'))}">${escapeHtml(t('source_cursor_ide'))}</span>`;
+  }
+  return '';
+}
+
+function getCursorModeBadge(mode) {
+  if (mode === 'agent') {
+    return getSessionSourceBadge({ source_kind: 'cursor-agent' });
+  }
+  if (mode === 'ide') {
+    return getSessionSourceBadge({ source_kind: 'cursor-ide' });
+  }
+  return '';
+}
+
 function renderSessionTable(sessions) {
   const tbody = document.getElementById('session-list-body');
   const sessionCount = document.getElementById('session-count');
@@ -3597,20 +3631,9 @@ function renderSessionTable(sessions) {
       const meta = getAssistantMeta(s.assistant_type);
       assistantBadge = `<span class="badge" style="${meta.badgeStyle}">${getAssistantLogoHtml(s.assistant_type)} ${meta.shortLabel}</span>`;
     }
-    let sourceBadge = '';
-    if (s.source_kind === 'vscode-chat') {
-      sourceBadge = '<span class="badge source-badge" title="GitHub Copilot in VS Code">VS Code</span>';
-    } else if (s.assistant_type === 'copilot') {
-      sourceBadge = '<span class="badge source-badge" title="GitHub Copilot CLI">CLI</span>';
-    } else if (s.source_kind === 'codex-desktop') {
-      sourceBadge = '<span class="badge source-badge" title="Codex Desktop">Desktop</span>';
-    } else if (s.source_kind === 'codex-cli') {
-      sourceBadge = '<span class="badge source-badge" title="Codex CLI">CLI</span>';
-    } else if (s.source_kind === 'cursor-agent') {
-      sourceBadge = `<span class="badge source-badge" title="${escapeHtml(t('source_cursor_agent_title'))}">${escapeHtml(t('source_cursor_agent'))}</span>`;
-    } else if (s.source_kind === 'cursor-ide') {
-      sourceBadge = `<span class="badge source-badge" title="${escapeHtml(t('source_cursor_ide_title'))}">${escapeHtml(t('source_cursor_ide'))}</span>`;
-    }
+    const sourceBadge = getSessionSourceBadge(s);
+    const nameSourceBadge = s.assistant_type === 'cursor' ? '' : sourceBadge;
+    const modelSourceBadge = s.assistant_type === 'cursor' ? sourceBadge : '';
 
     const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td>${assistantBadge}</td>` : '';
 
@@ -3626,12 +3649,11 @@ function renderSessionTable(sessions) {
           <span class="tree-connector" style="left: ${connectorLeft}px;">└─</span>
           <div style="display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 3px;">
             <span class="badge subagent-badge" title="Subagent of: ${escapeHtml(s.parentName || '')}">Subagent</span>
-            ${sourceBadge}
+            ${nameSourceBadge}
             ${nickname ? `<span class="badge agent-nickname-badge" title="Agent Nickname: ${escapeHtml(nickname)}">${escapeHtml(nickname)}</span>` : ''}
             ${role ? `<span class="badge agent-role-badge" title="Agent Role: ${escapeHtml(role)}">${escapeHtml(role)}</span>` : ''}
           </div>
           <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
-          ${sourceBadge}
           <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
         </div>
       `;
@@ -3639,7 +3661,7 @@ function renderSessionTable(sessions) {
       nameCellContent = `
         <div class="session-name-wrapper">
           <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
-          ${sourceBadge}
+          ${nameSourceBadge}
           <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
         </div>
       `;
@@ -3653,6 +3675,7 @@ function renderSessionTable(sessions) {
       <td class="model-column">
         <div class="model-cell-content">
           <span class="badge highlight">${escapeHtml(s.model)}</span>
+          ${modelSourceBadge}
           ${s.reasoning_effort ? `<span class="badge" style="background: rgba(127, 142, 163, 0.15); color: #aeb9c8; font-size: 11px; font-weight: 600;">${escapeHtml(s.reasoning_effort)}</span>` : ''}
         </div>
       </td>
@@ -3717,6 +3740,7 @@ async function openSessionTimeline(session) {
     agent_nickname: agentNickname,
     agent_role: agentRole,
     cost_usd: estimatedCost,
+    source_kind: sourceKind,
   } = session;
   const drawerOverlay = document.getElementById('timeline-drawer');
   const timelineContainer = document.getElementById('timeline-items');
@@ -3784,7 +3808,12 @@ async function openSessionTimeline(session) {
 
   try {
     const resolvedAssistant = assistantType || currentAssistant;
-    const res = await fetch(`/api/${encodeURIComponent(resolvedAssistant)}/session/${encodeURIComponent(sessionId)}`);
+    const sourceQuery = sourceKind
+      ? `?${new URLSearchParams({ source_kind: sourceKind }).toString()}`
+      : '';
+    const res = await fetch(
+      `/api/${encodeURIComponent(resolvedAssistant)}/session/${encodeURIComponent(sessionId)}${sourceQuery}`
+    );
     if (res.status === 404) {
       const errData = await res.json().catch(() => ({}));
       if (errData.reason === 'no_events_yet') {
@@ -3792,6 +3821,11 @@ async function openSessionTimeline(session) {
       } else {
         timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${t('drawer_load_failed_cleaned')}</div>`;
       }
+      return;
+    }
+
+    if (!res.ok) {
+      timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${t('drawer_load_failed')}</div>`;
       return;
     }
 
@@ -3813,7 +3847,8 @@ function closeDrawer() {
 // 渲染 Session 詳細時間軸 (Timeline) 內容
 // =========================================================================
 function renderTimeline(data) {
-  const { metadata, timeline } = data;
+  const metadata = data?.metadata && typeof data.metadata === 'object' ? data.metadata : {};
+  const timeline = Array.isArray(data?.timeline) ? data.timeline : [];
   const timelineContainer = document.getElementById('timeline-items');
   timelineContainer.innerHTML = '';
 
@@ -4466,6 +4501,7 @@ async function loadYearlyData(year) {
     }
     
     const data = await res.json();
+    modelSessionDetailsCache.clear();
     toggleEmptyState(false);
     renderYearlyDashboard(data);
 
@@ -4563,7 +4599,7 @@ function renderYearlyDashboard(data) {
   renderYearlyProjectsTable(projects);
 
   // 5. 渲染模型佔比列表
-  renderYearlyModelsTable(models);
+  renderYearlyModelsTable(models, year);
 
   // 6. 渲染當年每月彙總列表
   yearlyMonthlySortColumn = 'month';
@@ -4801,7 +4837,274 @@ function renderYearlyProjectsTable(projects) {
 // =========================================================================
 // 渲染年度模型佔比列表 Table
 // =========================================================================
-function renderYearlyModelsTable(models) {
+function normalizedModelMode(mode) {
+  return mode === 'agent' || mode === 'ide' ? mode : 'unclassified';
+}
+
+function modelSessionCacheKey(period, model, mode) {
+  return [currentAssistant, period, model, normalizedModelMode(mode)].join('\u0000');
+}
+
+async function fetchModelSessions(period, model, mode) {
+  const normalizedMode = normalizedModelMode(mode);
+  const cacheKey = modelSessionCacheKey(period, model, normalizedMode);
+  if (modelSessionDetailsCache.has(cacheKey)) {
+    return modelSessionDetailsCache.get(cacheKey);
+  }
+
+  const params = new URLSearchParams({ period, model, mode: normalizedMode });
+  const response = await fetch(
+    `/api/${encodeURIComponent(currentAssistant)}/model-sessions?${params.toString()}`
+  );
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.error || `HTTP ${response.status}`);
+  }
+
+  const payload = await response.json();
+  const sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+  modelSessionDetailsCache.set(cacheKey, sessions);
+  return sessions;
+}
+
+function groupModelSessionsByDate(sessions) {
+  const groups = new Map();
+  sessions.forEach(session => {
+    const date = isValidDateKey(session.date) ? session.date : null;
+    const key = date || '';
+    if (!groups.has(key)) {
+      groups.set(key, []);
+    }
+    groups.get(key).push(session);
+  });
+
+  return Array.from(groups, ([date, dateSessions]) => ({ date, sessions: dateSessions }))
+    .sort((left, right) => {
+      if (!left.date) return 1;
+      if (!right.date) return -1;
+      return right.date.localeCompare(left.date);
+    });
+}
+
+function renderModelSessionDrilldown(sessions) {
+  if (sessions.length === 0) {
+    return `<div class="model-session-state">${escapeHtml(t('model_sessions_unavailable'))}</div>`;
+  }
+
+  const dateGroups = groupModelSessionsByDate(sessions);
+  const summary = t('model_sessions_summary')
+    .replace('{sessions}', String(sessions.length))
+    .replace('{dates}', String(dateGroups.length));
+
+  return `
+    <div class="model-session-drilldown">
+      <div class="model-session-summary">${escapeHtml(summary)}</div>
+      <div class="model-date-groups">
+        ${dateGroups.map(group => {
+          const dateTokens = group.sessions.reduce(
+            (total, session) => total + (session.total_tokens || 0),
+            0
+          );
+          const dateLabel = group.date || t('unknown_date');
+          const dateControl = group.date
+            ? `<button type="button" class="model-date-button" data-date="${escapeHtml(group.date)}" title="${escapeHtml(t('view_date'))}">${escapeHtml(group.date)}</button>`
+            : `<span class="model-date-label">${escapeHtml(dateLabel)}</span>`;
+          const sessionsLabel = t('model_sessions_count')
+            .replace('{count}', String(group.sessions.length));
+          const tokensLabel = t('model_tokens_count')
+            .replace('{tokens}', formatToken(dateTokens));
+
+          return `
+            <section class="model-date-group">
+              <div class="model-date-header">
+                ${dateControl}
+                <span>${escapeHtml(sessionsLabel)}</span>
+                <span>${escapeHtml(tokensLabel)}</span>
+              </div>
+              <div class="model-session-list">
+                ${group.sessions.map(session => {
+                  const name = session.session_name || session.session_id;
+                  const cwd = session.cwd || t('unknown_cwd');
+                  const time = formatLocalTime(session.timestamp, true) || '—';
+                  return `
+                    <button type="button" class="model-session-link" data-session-id="${escapeHtml(session.session_id)}" data-assistant-type="${escapeHtml(session.assistant_type || '')}" data-source-kind="${escapeHtml(session.source_kind || '')}" aria-label="${escapeHtml(`${t('open_session')}: ${name}`)}">
+                      <span class="model-session-primary">
+                        <span class="model-session-name-row">
+                          <span class="model-session-name">${escapeHtml(name)}</span>
+                          ${getSessionSourceBadge(session)}
+                        </span>
+                        <span class="model-session-cwd" title="${escapeHtml(cwd)}">${escapeHtml(cwd)}</span>
+                      </span>
+                      <span class="model-session-time">${escapeHtml(time)}</span>
+                      <span class="model-session-tokens">${escapeHtml(formatToken(session.total_tokens || 0))}</span>
+                    </button>
+                  `;
+                }).join('')}
+              </div>
+            </section>
+          `;
+        }).join('')}
+      </div>
+    </div>
+  `;
+}
+
+async function populateModelSessionDetails(detailsRow, period, model, mode) {
+  detailsRow.dataset.state = 'loading';
+  detailsRow.innerHTML = `
+    <td colspan="5">
+      <div class="model-session-state" role="status">${escapeHtml(t('model_sessions_loading'))}</div>
+    </td>
+  `;
+
+  try {
+    const sessions = await fetchModelSessions(period, model, mode);
+    if (!detailsRow.isConnected) return;
+    detailsRow.modelSessions = sessions;
+    detailsRow.dataset.state = 'loaded';
+    detailsRow.innerHTML = `<td colspan="5">${renderModelSessionDrilldown(sessions)}</td>`;
+  } catch (error) {
+    console.error('載入模型 Session 明細失敗:', error);
+    if (!detailsRow.isConnected) return;
+    detailsRow.dataset.state = 'error';
+    detailsRow.innerHTML = `
+      <td colspan="5">
+        <div class="model-session-state model-session-error" role="alert">
+          <span>${escapeHtml(t('model_sessions_failed'))}</span>
+          <button type="button" class="model-session-retry">${escapeHtml(t('model_sessions_retry'))}</button>
+        </div>
+      </td>
+    `;
+  }
+}
+
+function appendModelSummaryRows(tbody, models, period) {
+  const preserved = expandedModelDrilldowns.get(tbody.id);
+  if (preserved && preserved.period !== period) {
+    expandedModelDrilldowns.delete(tbody.id);
+  }
+
+  models.forEach((model, index) => {
+    const modelMode = model.mode || null;
+    const summaryRow = document.createElement('tr');
+    summaryRow.className = 'model-summary-row';
+    const detailsId = `${tbody.id}-details-${index}`;
+    summaryRow.innerHTML = `
+      <td style="text-align: center;"><span class="badge ${index < 3 ? 'highlight' : ''}">${index + 1}</span></td>
+      <td>
+        <button type="button" class="model-drilldown-toggle" aria-expanded="false" aria-controls="${detailsId}" title="${escapeHtml(t('model_drilldown_hint'))}">
+          <span class="model-drilldown-chevron" aria-hidden="true">›</span>
+          <span class="badge highlight model-badge">${escapeHtml(model.model)}</span>
+          ${getCursorModeBadge(modelMode)}
+        </button>
+      </td>
+      <td><span class="badge">${model.sessions_count} Sessions</span></td>
+      <td style="font-weight: 700; color: var(--accent-purple);">
+        ${formatToken(model.total_tokens)}
+        ${model.total_cache_read_tokens ? `<div style="font-size: 0.72rem; font-weight: normal; color: #a5b4fc; margin-top: 3px;" title="${t('chart_cache_label')}">${t('cache_prefix')}${formatToken(model.total_cache_read_tokens)}</div>` : ''}
+      </td>
+      <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(model.cost_usd || 0)}</td>
+    `;
+
+    const detailsRow = document.createElement('tr');
+    detailsRow.id = detailsId;
+    detailsRow.className = 'model-details-row';
+    detailsRow.hidden = true;
+
+    const toggle = summaryRow.querySelector('.model-drilldown-toggle');
+    const openDetails = async () => {
+      tbody.querySelectorAll('.model-summary-row.is-expanded').forEach(row => {
+        row.classList.remove('is-expanded');
+        row.querySelector('.model-drilldown-toggle')?.setAttribute('aria-expanded', 'false');
+      });
+      tbody.querySelectorAll('.model-details-row').forEach(row => {
+        row.hidden = true;
+      });
+      summaryRow.classList.add('is-expanded');
+      toggle.setAttribute('aria-expanded', 'true');
+      detailsRow.hidden = false;
+      expandedModelDrilldowns.set(tbody.id, { period, model: model.model, mode: modelMode });
+      if (!detailsRow.dataset.state) {
+        await populateModelSessionDetails(detailsRow, period, model.model, modelMode);
+      }
+    };
+
+    toggle.addEventListener('click', async () => {
+      const shouldOpen = toggle.getAttribute('aria-expanded') !== 'true';
+      if (!shouldOpen) {
+        summaryRow.classList.remove('is-expanded');
+        toggle.setAttribute('aria-expanded', 'false');
+        detailsRow.hidden = true;
+        expandedModelDrilldowns.delete(tbody.id);
+        return;
+      }
+      await openDetails();
+    });
+
+    detailsRow.addEventListener('click', async event => {
+      const retryButton = event.target.closest('.model-session-retry');
+      if (retryButton) {
+        await populateModelSessionDetails(detailsRow, period, model.model, modelMode);
+        return;
+      }
+
+      const dateButton = event.target.closest('.model-date-button');
+      if (dateButton) {
+        switchToDailyDate(dateButton.dataset.date);
+        return;
+      }
+
+      const sessionButton = event.target.closest('.model-session-link');
+      if (!sessionButton || !Array.isArray(detailsRow.modelSessions)) return;
+      const session = detailsRow.modelSessions.find(
+        item =>
+          item.session_id === sessionButton.dataset.sessionId
+          && (item.assistant_type || '') === sessionButton.dataset.assistantType
+          && (item.source_kind || '') === sessionButton.dataset.sourceKind
+      );
+      if (session) {
+        openSessionTimeline({
+          ...session,
+          model: session.session_model || session.model,
+          total_tokens: session.session_total_tokens ?? session.total_tokens,
+          total_input_tokens: session.session_total_input_tokens ?? session.total_input_tokens,
+          total_output_tokens: session.session_total_output_tokens ?? session.total_output_tokens,
+          total_cache_read_tokens:
+            session.session_total_cache_read_tokens ?? session.total_cache_read_tokens,
+          total_cache_write_tokens:
+            session.session_total_cache_write_tokens ?? session.total_cache_write_tokens,
+          total_reasoning_tokens:
+            session.session_total_reasoning_tokens ?? session.total_reasoning_tokens,
+          cost_usd: session.session_cost_usd ?? session.cost_usd,
+        });
+      }
+    });
+
+    tbody.appendChild(summaryRow);
+    tbody.appendChild(detailsRow);
+
+    const restore = expandedModelDrilldowns.get(tbody.id);
+    if (
+      restore?.period === period
+      && restore.model === model.model
+      && (restore.mode || null) === modelMode
+    ) {
+      void openDetails();
+    }
+  });
+
+  const active = expandedModelDrilldowns.get(tbody.id);
+  if (
+    active
+    && !models.some(
+      model => model.model === active.model && (model.mode || null) === (active.mode || null)
+    )
+  ) {
+    expandedModelDrilldowns.delete(tbody.id);
+  }
+}
+
+function renderYearlyModelsTable(models, period) {
   const tbody = document.getElementById('yearly-models-body');
   if (!tbody) return;
   tbody.innerHTML = '';
@@ -4811,22 +5114,7 @@ function renderYearlyModelsTable(models) {
     return;
   }
 
-  models.forEach((m, idx) => {
-    const tr = document.createElement('tr');
-    tr.style.cursor = 'default';
-
-    tr.innerHTML = `
-      <td style="text-align: center;"><span class="badge ${idx < 3 ? 'highlight' : ''}">${idx + 1}</span></td>
-      <td><span class="badge highlight">${escapeHtml(m.model)}</span></td>
-      <td><span class="badge">${m.sessions_count} Sessions</span></td>
-      <td style="font-weight: 700; color: var(--accent-purple);">
-        ${formatToken(m.total_tokens)}
-        ${m.total_cache_read_tokens ? `<div style="font-size: 0.72rem; font-weight: normal; color: #a5b4fc; margin-top: 3px;" title="${t('chart_cache_label')}">${t('cache_prefix')}${formatToken(m.total_cache_read_tokens)}</div>` : ''}
-      </td>
-      <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(m.cost_usd || 0)}</td>
-    `;
-    tbody.appendChild(tr);
-  });
+  appendModelSummaryRows(tbody, models, period);
 }
 
 // =========================================================================
@@ -4979,6 +5267,7 @@ async function loadMonthlyData(month) {
     }
     
     const data = await res.json();
+    modelSessionDetailsCache.clear();
     toggleEmptyState(false);
     renderMonthlyDashboard(data);
 
@@ -5052,7 +5341,7 @@ function renderMonthlyDashboard(data) {
   renderMonthlyProjectsTable(projects);
 
   // 5. 渲染模型佔比列表
-  renderMonthlyModelsTable(models);
+  renderMonthlyModelsTable(models, year_month);
 
   // 6. 渲染當月每日彙總列表
   monthlyDailySortColumn = 'date';
@@ -5267,7 +5556,7 @@ function renderMonthlyProjectsTable(projects) {
 // =========================================================================
 // 渲染模型佔比列表 Table
 // =========================================================================
-function renderMonthlyModelsTable(models) {
+function renderMonthlyModelsTable(models, period) {
   const tbody = document.getElementById('monthly-models-body');
   tbody.innerHTML = '';
 
@@ -5276,22 +5565,7 @@ function renderMonthlyModelsTable(models) {
     return;
   }
 
-  models.forEach((m, idx) => {
-    const tr = document.createElement('tr');
-    tr.style.cursor = 'default';
-
-    tr.innerHTML = `
-      <td style="text-align: center;"><span class="badge ${idx < 3 ? 'highlight' : ''}">${idx + 1}</span></td>
-      <td><span class="badge highlight">${escapeHtml(m.model)}</span></td>
-      <td><span class="badge">${m.sessions_count} Sessions</span></td>
-      <td style="font-weight: 700; color: var(--accent-purple);">
-        ${formatToken(m.total_tokens)}
-        ${m.total_cache_read_tokens ? `<div style="font-size: 0.72rem; font-weight: normal; color: #a5b4fc; margin-top: 3px;" title="${t('chart_cache_label')}">${t('cache_prefix')}${formatToken(m.total_cache_read_tokens)}</div>` : ''}
-      </td>
-      <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(m.cost_usd || 0)}</td>
-    `;
-    tbody.appendChild(tr);
-  });
+  appendModelSummaryRows(tbody, models, period);
 }
 
 // =========================================================================

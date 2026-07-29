@@ -670,11 +670,16 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             session_id TEXT NOT NULL,
             cwd TEXT,
             mode TEXT,
+            model TEXT,
             PRIMARY KEY (source_id, session_id)
         )",
         [],
     )
     .map_err(|error| format!("建立 Cursor Session 中繼資料表失敗: {error}"))?;
+    let _ = conn.execute(
+        "ALTER TABLE cursor_session_metadata ADD COLUMN model TEXT",
+        [],
+    );
 
     // Before source_kind existed, every Copilot record came from the CLI
     // collector. Classify those historical rows once so the new source-scoped
@@ -2845,11 +2850,10 @@ fn sync_cursor_model_signatures(
         let mut statement = source_conn
             .prepare(
                 "SELECT CAST(value AS BLOB)
-                 FROM cursorDiskKV
+                 FROM cursorDiskKV INDEXED BY sqlite_autoindex_cursorDiskKV_1
                  WHERE rowid > ? AND rowid <= ?
                    AND key >= 'agentKv:blob:' AND key < 'agentKv:blob;'
-                   AND instr(CAST(value AS TEXT), '\"modelName\"') > 0
-                 ORDER BY rowid",
+                   AND instr(CAST(value AS TEXT), '\"modelName\"') > 0",
             )
             .map_err(|error| format!("準備 Cursor agentKv 查詢失敗: {error}"))?;
         let mut rows = statement
@@ -2990,10 +2994,32 @@ fn load_cursor_model_signatures(
     Ok(mappings)
 }
 
+fn load_cursor_ambiguous_model_signatures(
+    conn: &Connection,
+    source_id: &str,
+) -> Result<HashSet<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT signature
+             FROM cursor_model_signatures
+             WHERE source_id = ? AND is_ambiguous = 1",
+        )
+        .map_err(|error| format!("準備讀取 Cursor 歧義模型簽章失敗: {error}"))?;
+    let rows = statement
+        .query_map(params![source_id], |row| row.get(0))
+        .map_err(|error| format!("讀取 Cursor 歧義模型簽章失敗: {error}"))?;
+    let mut signatures = HashSet::new();
+    for row in rows {
+        signatures.insert(row.map_err(|error| format!("解析 Cursor 歧義模型簽章失敗: {error}"))?);
+    }
+    Ok(signatures)
+}
+
 #[derive(Clone, Debug, Default)]
 struct CursorSessionMetadata {
     cwd: Option<String>,
     mode: Option<String>,
+    model: Option<String>,
 }
 
 fn parse_cursor_session_metadata(key: &str, raw: &[u8]) -> Option<(String, CursorSessionMetadata)> {
@@ -3030,11 +3056,23 @@ fn parse_cursor_session_metadata(key: &str, raw: &[u8]) -> Option<(String, Curso
     } else {
         None
     };
+    let model = value
+        .pointer("/modelConfig/modelName")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| {
+            !item.is_empty()
+                && item.len() <= 200
+                && !item.eq_ignore_ascii_case("default")
+                && !item.eq_ignore_ascii_case("auto")
+                && !item.eq_ignore_ascii_case("unknown model")
+        })
+        .map(str::to_string);
 
-    if cwd.is_none() && mode.is_none() {
+    if cwd.is_none() && mode.is_none() && model.is_none() {
         return None;
     }
-    Some((session_id, CursorSessionMetadata { cwd, mode }))
+    Some((session_id, CursorSessionMetadata { cwd, mode, model }))
 }
 
 fn sync_cursor_session_metadata(
@@ -3042,7 +3080,7 @@ fn sync_cursor_session_metadata(
     state_db_path: &Path,
 ) -> Result<String, String> {
     let source_id = cursor_model_source_id(state_db_path);
-    let state_key = format!("cursor-composer-data:v2:{source_id}");
+    let state_key = format!("cursor-composer-data:v3:{source_id}");
     let source_conn = open_cursor_state_db(state_db_path)?;
     let max_rowid = cursor_state_max_rowid(&source_conn)?;
     let stored_rowid: i64 = conn
@@ -3060,10 +3098,9 @@ fn sync_cursor_session_metadata(
         let mut statement = source_conn
             .prepare(
                 "SELECT key, CAST(value AS BLOB)
-                 FROM cursorDiskKV
+                 FROM cursorDiskKV INDEXED BY sqlite_autoindex_cursorDiskKV_1
                  WHERE rowid > ? AND rowid <= ?
-                   AND key >= 'composerData:' AND key < 'composerData;'
-                 ORDER BY rowid",
+                   AND key >= 'composerData:' AND key < 'composerData;'",
             )
             .map_err(|error| format!("準備 Cursor composerData 查詢失敗: {error}"))?;
         let mut rows = statement
@@ -3105,12 +3142,19 @@ fn sync_cursor_session_metadata(
         for (session_id, metadata) in metadata_rows {
             tx.execute(
                 "INSERT INTO cursor_session_metadata (
-                    source_id, session_id, cwd, mode
-                 ) VALUES (?, ?, ?, ?)
+                    source_id, session_id, cwd, mode, model
+                 ) VALUES (?, ?, ?, ?, ?)
                  ON CONFLICT(source_id, session_id) DO UPDATE SET
                     cwd = COALESCE(excluded.cwd, cursor_session_metadata.cwd),
-                    mode = COALESCE(excluded.mode, cursor_session_metadata.mode)",
-                params![source_id, session_id, metadata.cwd, metadata.mode],
+                    mode = COALESCE(excluded.mode, cursor_session_metadata.mode),
+                    model = COALESCE(excluded.model, cursor_session_metadata.model)",
+                params![
+                    source_id,
+                    session_id,
+                    metadata.cwd,
+                    metadata.mode,
+                    metadata.model
+                ],
             )
             .map_err(|error| format!("寫入 Cursor Session 中繼資料快取失敗: {error}"))?;
         }
@@ -3133,6 +3177,28 @@ fn sync_cursor_session_metadata(
                 params![source_id, source_id],
             )
             .map_err(|error| format!("回填 Cursor 工作路徑失敗: {error}"))?;
+            tx.execute(
+                "DELETE FROM usage_entries
+                 WHERE rowid IN (
+                    SELECT legacy.rowid
+                    FROM usage_entries legacy
+                    JOIN cursor_session_metadata metadata
+                      ON metadata.source_id = ?
+                     AND metadata.session_id = legacy.session_id
+                    JOIN usage_entries classified
+                      ON classified.assistant_type = legacy.assistant_type
+                     AND classified.session_id = legacy.session_id
+                     AND classified.turn_no = legacy.turn_no
+                     AND classified.source_kind = CASE metadata.mode
+                        WHEN 'agent' THEN ?
+                        WHEN 'ide' THEN ?
+                     END
+                    WHERE legacy.assistant_type = 'cursor'
+                      AND legacy.source_kind = 'legacy'
+                 )",
+                params![source_id, CURSOR_AGENT_SOURCE_KIND, CURSOR_IDE_SOURCE_KIND],
+            )
+            .map_err(|error| format!("清除 Cursor legacy 重複記錄失敗: {error}"))?;
             tx.execute(
                 "UPDATE usage_entries
                  SET source_kind = CASE (
@@ -3159,6 +3225,34 @@ fn sync_cursor_session_metadata(
                 ],
             )
             .map_err(|error| format!("回填 Cursor Session 模式失敗: {error}"))?;
+            tx.execute(
+                "UPDATE usage_entries
+                 SET model = (
+                        SELECT metadata.model FROM cursor_session_metadata metadata
+                        WHERE metadata.source_id = ?
+                          AND metadata.session_id = usage_entries.session_id
+                     ),
+                     model_id = (
+                        SELECT metadata.model FROM cursor_session_metadata metadata
+                        WHERE metadata.source_id = ?
+                          AND metadata.session_id = usage_entries.session_id
+                     )
+                 WHERE assistant_type = 'cursor'
+                   AND EXISTS (
+                        SELECT 1 FROM cursor_session_metadata metadata
+                        WHERE metadata.source_id = ?
+                          AND metadata.session_id = usage_entries.session_id
+                          AND metadata.model IS NOT NULL
+                          AND metadata.model != ''
+                   )
+                   AND NOT EXISTS (
+                        SELECT 1 FROM cursor_model_signatures signatures
+                        WHERE signatures.source_id = ?
+                          AND signatures.signature = usage_entries.model_signature
+                   )",
+                params![source_id, source_id, source_id, source_id],
+            )
+            .map_err(|error| format!("回填 Cursor Session 模型 fallback 失敗: {error}"))?;
         }
 
         let now = SystemTime::now()
@@ -3185,7 +3279,7 @@ fn load_cursor_session_metadata(
 ) -> Result<HashMap<String, CursorSessionMetadata>, String> {
     let mut statement = conn
         .prepare(
-            "SELECT session_id, cwd, mode
+            "SELECT session_id, cwd, mode, model
              FROM cursor_session_metadata
              WHERE source_id = ?",
         )
@@ -3197,6 +3291,7 @@ fn load_cursor_session_metadata(
                 CursorSessionMetadata {
                     cwd: row.get(1)?,
                     mode: row.get(2)?,
+                    model: row.get(3)?,
                 },
             ))
         })
@@ -3218,6 +3313,7 @@ struct CursorParsedEntry {
 fn parse_cursor_session_file(
     filepath: &Path,
     model_mappings: &HashMap<String, String>,
+    ambiguous_model_signatures: &HashSet<String>,
     session_metadata: &HashMap<String, CursorSessionMetadata>,
 ) -> Result<Vec<CursorParsedEntry>, String> {
     let file = File::open(filepath).map_err(|e| format!("無法開啟檔案: {}", e))?;
@@ -3285,11 +3381,19 @@ fn parse_cursor_session_file(
                 cursor_content_to_text(content_val.unwrap_or(&serde_json::Value::Null));
             let current_model_signature =
                 cursor_response_signature(content_val.unwrap_or(&serde_json::Value::Null));
-            let current_model = current_model_signature
-                .as_ref()
-                .and_then(|signature| model_mappings.get(signature))
-                .cloned()
-                .unwrap_or_else(|| "Unknown Model".to_string());
+            let current_model = match current_model_signature.as_ref() {
+                Some(signature) if ambiguous_model_signatures.contains(signature) => {
+                    "Unknown Model".to_string()
+                }
+                Some(signature) => model_mappings
+                    .get(signature)
+                    .cloned()
+                    .or_else(|| metadata.and_then(|value| value.model.clone()))
+                    .unwrap_or_else(|| "Unknown Model".to_string()),
+                None => metadata
+                    .and_then(|value| value.model.clone())
+                    .unwrap_or_else(|| "Unknown Model".to_string()),
+            };
 
             if current_timestamp.is_empty() {
                 if let Ok(metadata) = filepath.metadata() {
@@ -3358,11 +3462,11 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
     let state_db_path = get_cursor_state_db_path();
     let source_id = if state_db_path.exists() {
         let source_id = cursor_model_source_id(&state_db_path);
-        if let Err(error) = sync_cursor_model_signatures(conn, &state_db_path) {
-            eprintln!("同步 Cursor agentKv 模型資訊失敗: {error}");
-        }
         if let Err(error) = sync_cursor_session_metadata(conn, &state_db_path) {
             eprintln!("同步 Cursor composerData Session 中繼資料失敗: {error}");
+        }
+        if let Err(error) = sync_cursor_model_signatures(conn, &state_db_path) {
+            eprintln!("同步 Cursor agentKv 模型資訊失敗: {error}");
         }
         Some(source_id)
     } else {
@@ -3372,6 +3476,11 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
         load_cursor_model_signatures(conn, source_id)?
     } else {
         HashMap::new()
+    };
+    let ambiguous_model_signatures = if let Some(source_id) = source_id.as_deref() {
+        load_cursor_ambiguous_model_signatures(conn, source_id)?
+    } else {
+        HashSet::new()
     };
     let session_metadata = if let Some(source_id) = source_id.as_deref() {
         load_cursor_session_metadata(conn, source_id)?
@@ -3409,14 +3518,18 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
         let current_size = metadata.len();
 
         if current_size != last_synced_size {
-            let parsed_entries =
-                match parse_cursor_session_file(&filepath, &model_mappings, &session_metadata) {
-                    Ok(entries) => entries,
-                    Err(e) => {
-                        eprintln!("解析 Cursor 會話檔案 {:?} 失敗: {}", filepath, e);
-                        continue;
-                    }
-                };
+            let parsed_entries = match parse_cursor_session_file(
+                &filepath,
+                &model_mappings,
+                &ambiguous_model_signatures,
+                &session_metadata,
+            ) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    eprintln!("解析 Cursor 會話檔案 {:?} 失敗: {}", filepath, e);
+                    continue;
+                }
+            };
 
             let tx = conn
                 .transaction()
@@ -3534,37 +3647,38 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
 
 /// Unified sync function triggering sync for all supported assistants
 pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
-    // 1. Sync Google Antigravity CLI
+    // 1. Sync Cursor metadata first so model and mode attribution is available
+    // before the potentially slower transcript collectors finish.
+    let cursor_dir = get_cursor_dir();
+    if let Err(e) = sync_cursor_usage_logs(conn, &cursor_dir) {
+        eprintln!("❌ 同步 Cursor 失敗: {}", e);
+    }
+
+    // 2. Sync Google Antigravity CLI
     let antigravity_dir = get_antigravity_dir();
     if let Err(e) = sync_hook_usage_logs(conn, "antigravity", &antigravity_dir) {
         eprintln!("❌ 同步 Antigravity 失敗: {}", e);
     }
 
-    // 2. Sync GitHub Copilot CLI
+    // 3. Sync GitHub Copilot CLI
     let copilot_dir = get_copilot_dir();
     if let Err(e) = sync_hook_usage_logs(conn, "copilot", &copilot_dir) {
         eprintln!("❌ 同步 Copilot 失敗: {}", e);
     }
 
-    // 2b. Sync GitHub Copilot sessions created in VS Code
+    // 3b. Sync GitHub Copilot sessions created in VS Code
     if let Err(e) = sync_vscode_chat_sessions(conn) {
         eprintln!("❌ 同步 VS Code Copilot 失敗: {}", e);
     }
 
-    // 3. Sync Codex CLI and Desktop
+    // 4. Sync Codex CLI and Desktop
     if let Err(e) = sync_codex_usage_logs(conn) {
         eprintln!("❌ 同步 Codex 失敗: {}", e);
     }
 
-    // 4. Sync Claude Code
+    // 5. Sync Claude Code
     if let Err(e) = sync_claude_usage_logs(conn) {
         eprintln!("❌ 同步 Claude Code 失敗: {}", e);
-    }
-
-    // 5. Sync Cursor
-    let cursor_dir = get_cursor_dir();
-    if let Err(e) = sync_cursor_usage_logs(conn, &cursor_dir) {
-        eprintln!("❌ 同步 Cursor 失敗: {}", e);
     }
 
     Ok(())
@@ -4320,14 +4434,25 @@ pub fn get_session_assistant_and_transcript(
     conn: &rusqlite::Connection,
     assistant: &str,
     session_id: &str,
+    source_kind: Option<&str>,
 ) -> Result<(String, Option<String>, String), String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT assistant_type, transcript_path, source_kind FROM usage_entries WHERE session_id = ? AND assistant_type = ? LIMIT 1",
-        )
-        .map_err(|e| e.to_string())?;
+    let mut sql = String::from(
+        "SELECT assistant_type, transcript_path, source_kind
+         FROM usage_entries
+         WHERE session_id = ? AND assistant_type = ?",
+    );
+    let mut params_vec = vec![
+        rusqlite::types::Value::Text(session_id.to_string()),
+        rusqlite::types::Value::Text(assistant.to_string()),
+    ];
+    if let Some(source_kind) = source_kind {
+        sql.push_str(" AND source_kind = ?");
+        params_vec.push(rusqlite::types::Value::Text(source_kind.to_string()));
+    }
+    sql.push_str(" ORDER BY source_kind ASC, id ASC LIMIT 1");
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let mut rows = stmt
-        .query(params![session_id, assistant])
+        .query(rusqlite::params_from_iter(params_vec))
         .map_err(|e| e.to_string())?;
     if let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let ast: String = row.get(0).map_err(|e| e.to_string())?;
@@ -4345,12 +4470,27 @@ pub fn get_session_assistant_and_transcript(
 
 pub fn get_session_cwd(
     conn: &rusqlite::Connection,
+    assistant: &str,
     session_id: &str,
+    source_kind: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let mut stmt = conn
-        .prepare("SELECT cwd FROM usage_entries WHERE session_id = ? AND cwd IS NOT NULL LIMIT 1")
+    let mut sql = String::from(
+        "SELECT cwd FROM usage_entries
+         WHERE assistant_type = ? AND session_id = ? AND cwd IS NOT NULL",
+    );
+    let mut params_vec = vec![
+        rusqlite::types::Value::Text(assistant.to_string()),
+        rusqlite::types::Value::Text(session_id.to_string()),
+    ];
+    if let Some(source_kind) = source_kind {
+        sql.push_str(" AND source_kind = ?");
+        params_vec.push(rusqlite::types::Value::Text(source_kind.to_string()));
+    }
+    sql.push_str(" ORDER BY source_kind ASC, id ASC LIMIT 1");
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(params_vec))
         .map_err(|e| e.to_string())?;
-    let mut rows = stmt.query(params![session_id]).map_err(|e| e.to_string())?;
     if let Some(row) = rows.next().map_err(|e| e.to_string())? {
         Ok(row.get::<_, String>(0).ok())
     } else {
@@ -4360,14 +4500,28 @@ pub fn get_session_cwd(
 
 pub fn get_session_turns_token_stats(
     conn: &rusqlite::Connection,
+    assistant: &str,
     session_id: &str,
+    source_kind: Option<&str>,
 ) -> Result<HashMap<u32, (TokenStats, String)>, String> {
     let mut map = HashMap::new();
-    let mut stmt = conn.prepare(
+    let mut sql = String::from(
         "SELECT turn_no, delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total, model
-         FROM usage_entries WHERE session_id = ? ORDER BY turn_no ASC"
-    ).map_err(|e| e.to_string())?;
-    let mut rows = stmt.query(params![session_id]).map_err(|e| e.to_string())?;
+         FROM usage_entries WHERE assistant_type = ? AND session_id = ?",
+    );
+    let mut params_vec = vec![
+        rusqlite::types::Value::Text(assistant.to_string()),
+        rusqlite::types::Value::Text(session_id.to_string()),
+    ];
+    if let Some(source_kind) = source_kind {
+        sql.push_str(" AND source_kind = ?");
+        params_vec.push(rusqlite::types::Value::Text(source_kind.to_string()));
+    }
+    sql.push_str(" ORDER BY turn_no ASC, id ASC");
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(params_vec))
+        .map_err(|e| e.to_string())?;
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         if let (Ok(turn_no), Ok(delta_input), Ok(delta_output), Ok(delta_total)) = (
             row.get::<_, i64>(0),
@@ -5513,7 +5667,8 @@ mod tests {
         let day_entries = get_usage_entries_by_date(&conn, "2026-07-10", "claude").unwrap();
         let month_entries = get_usage_entries_by_month(&conn, "2026-07", "claude").unwrap();
         let year_entries = get_usage_entries_by_year(&conn, "2026", "claude").unwrap();
-        let turn_entries = get_session_turns_token_stats(&conn, "claude-cache-write-ttl").unwrap();
+        let turn_entries =
+            get_session_turns_token_stats(&conn, "claude", "claude-cache-write-ttl", None).unwrap();
         let entries = [
             &day_entries[0].0.entry,
             &month_entries[0].0,
@@ -5538,6 +5693,58 @@ mod tests {
         assert_eq!(turn.cache_write, Some(4));
         assert_eq!(turn.cache_write_5m, Some(1));
         assert_eq!(turn.cache_write_1h, Some(3));
+    }
+
+    #[test]
+    fn session_detail_queries_are_scoped_by_assistant_and_source() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (source_kind, transcript_path, cwd, model, input) in [
+            (
+                "copilot-cli",
+                "/tmp/cli/events.jsonl",
+                "/tmp/cli",
+                "gpt-5",
+                10i64,
+            ),
+            (
+                "vscode-chat",
+                "/tmp/vscode/session.json",
+                "/tmp/vscode",
+                "gpt-4.1",
+                20i64,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, timestamp, date, session_id,
+                    transcript_path, cwd, turn_no, model,
+                    delta_input, delta_output, delta_total
+                 ) VALUES (
+                    'copilot', ?, '2026-07-10T10:00:00Z', '2026-07-10', 'shared',
+                    ?, ?, 1, ?, ?, 1, ?
+                 )",
+                params![source_kind, transcript_path, cwd, model, input, input + 1],
+            )
+            .unwrap();
+        }
+
+        let (_, transcript_path, source_kind) =
+            get_session_assistant_and_transcript(&conn, "copilot", "shared", Some("vscode-chat"))
+                .unwrap();
+        assert_eq!(source_kind, "vscode-chat");
+        assert_eq!(transcript_path.as_deref(), Some("/tmp/vscode/session.json"));
+
+        let cwd = get_session_cwd(&conn, "copilot", "shared", Some("vscode-chat")).unwrap();
+        assert_eq!(cwd.as_deref(), Some("/tmp/vscode"));
+
+        let turns =
+            get_session_turns_token_stats(&conn, "copilot", "shared", Some("vscode-chat")).unwrap();
+        let (tokens, model) = turns.get(&1).unwrap();
+        assert_eq!(tokens.input, 20);
+        assert_eq!(tokens.output, 1);
+        assert_eq!(tokens.total, 21);
+        assert_eq!(model, "gpt-4.1");
     }
 
     #[test]
@@ -6477,7 +6684,9 @@ mod tests {
 "#;
 
         fs::write(&path, content).unwrap();
-        let entries = parse_cursor_session_file(&path, &HashMap::new(), &HashMap::new()).unwrap();
+        let entries =
+            parse_cursor_session_file(&path, &HashMap::new(), &HashSet::new(), &HashMap::new())
+                .unwrap();
         let _ = fs::remove_file(&path);
 
         assert_eq!(entries.len(), 2);
@@ -6574,7 +6783,9 @@ mod tests {
         .unwrap();
         let model_mappings = HashMap::from([(signature, "composer-2.5".to_string())]);
 
-        let entries = parse_cursor_session_file(&path, &model_mappings, &HashMap::new()).unwrap();
+        let entries =
+            parse_cursor_session_file(&path, &model_mappings, &HashSet::new(), &HashMap::new())
+                .unwrap();
         let _ = fs::remove_file(&path);
 
         assert_eq!(entries.len(), 2);
@@ -6617,6 +6828,67 @@ mod tests {
         assert_eq!(false_overrides_agent_mode.mode.as_deref(), Some("ide"));
         assert_eq!(non_agent_mode_overrides_true.mode.as_deref(), Some("ide"));
         assert_eq!(agent_mode.mode.as_deref(), Some("agent"));
+    }
+
+    #[test]
+    fn cursor_session_metadata_uses_only_concrete_model_configs() {
+        let (_, concrete_model) = parse_cursor_session_metadata(
+            "composerData:concrete-model",
+            br#"{
+                "composerId": "concrete-model",
+                "unifiedMode": "agent",
+                "modelConfig": { "modelName": "composer-2.5" }
+            }"#,
+        )
+        .unwrap();
+        let (_, default_model) = parse_cursor_session_metadata(
+            "composerData:default-model",
+            br#"{
+                "composerId": "default-model",
+                "unifiedMode": "agent",
+                "modelConfig": { "modelName": "default" }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(concrete_model.model.as_deref(), Some("composer-2.5"));
+        assert!(default_model.model.is_none());
+    }
+
+    #[test]
+    fn cursor_state_db_reader_observes_uncheckpointed_wal() {
+        let state_db_path = temp_jsonl_path("cursor-state-wal").with_extension("vscdb");
+        let writer = Connection::open(&state_db_path).unwrap();
+        let journal_mode: String = writer
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE cursorDiskKV (
+                    key TEXT PRIMARY KEY,
+                    value BLOB
+                 );
+                 INSERT INTO cursorDiskKV (key, value)
+                 VALUES ('agentKv:blob:test', X'7B7D');",
+            )
+            .unwrap();
+
+        let wal_path = PathBuf::from(format!("{}-wal", state_db_path.to_string_lossy()));
+        assert!(wal_path.exists(), "fixture must keep committed data in WAL");
+
+        let reader = open_cursor_state_db(&state_db_path).unwrap();
+        let row_count: i64 = reader
+            .query_row("SELECT COUNT(*) FROM cursorDiskKV", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 1, "read-only connection must observe WAL data");
+
+        drop(reader);
+        drop(writer);
+        let _ = fs::remove_file(&state_db_path);
+        let _ = fs::remove_file(wal_path);
+        let _ = fs::remove_file(format!("{}-shm", state_db_path.to_string_lossy()));
     }
 
     #[test]
@@ -6770,7 +7042,10 @@ mod tests {
                             }
                         },
                         "unifiedMode": "agent",
-                        "isAgentic": false
+                        "isAgentic": false,
+                        "modelConfig": {
+                            "modelName": "composer-2"
+                        }
                     }"#
                 ],
             )
@@ -6982,7 +7257,7 @@ mod tests {
         }
         let _ = fs::remove_dir_all(&root);
 
-        assert_eq!(initial.0, "Unknown Model");
+        assert_eq!(initial.0, "composer-2");
         assert_eq!(initial.1, "/tmp/project");
         assert_eq!(initial.2, CURSOR_IDE_SOURCE_KIND);
         assert_eq!(initial.3, "2026-07-24");

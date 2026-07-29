@@ -160,6 +160,7 @@ async fn main() {
             "/api/:assistant/monthly/:year_month",
             get(get_monthly_details),
         )
+        .route("/api/:assistant/model-sessions", get(get_model_sessions))
         .route("/api/:assistant/years", get(get_available_years))
         .route("/api/:assistant/yearly/:year", get(get_yearly_details))
         .route("/api/:assistant/pricing", get(get_pricing))

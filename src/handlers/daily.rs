@@ -296,6 +296,11 @@ pub struct SessionSearchQuery {
     q: String,
 }
 
+#[derive(Deserialize, Default)]
+pub struct SessionDetailsQuery {
+    source_kind: Option<String>,
+}
+
 #[derive(Serialize)]
 struct SessionSearchMatch {
     session_id: String,
@@ -753,6 +758,7 @@ fn get_git_info(cwd_str: &str) -> (Option<String>, Option<String>) {
 
 pub async fn get_session_details(
     Path((assistant, session_id)): Path<(String, String)>,
+    Query(query): Query<SessionDetailsQuery>,
 ) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
     if !is_supported_assistant(&assistant) {
@@ -771,13 +777,36 @@ pub async fn get_session_details(
             .into_response();
     }
 
+    let requested_source_kind = query
+        .source_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if requested_source_kind
+        .as_ref()
+        .is_some_and(|value| value.len() > 64)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "source_kind 格式不正確。" })),
+        )
+            .into_response();
+    }
+
     let session_info: Result<(String, Option<String>, String), String> =
         tokio::task::spawn_blocking({
             let sid = session_id.clone();
             let assistant_name = assistant.clone();
+            let source_kind = requested_source_kind.clone();
             move || {
                 let conn = db::get_db_conn()?;
-                db::get_session_assistant_and_transcript(&conn, &assistant_name, &sid)
+                db::get_session_assistant_and_transcript(
+                    &conn,
+                    &assistant_name,
+                    &sid,
+                    source_kind.as_deref(),
+                )
             }
         })
         .await
@@ -834,11 +863,25 @@ pub async fn get_session_details(
 
     // 3. 預先載入 SQLite 中的回合 (turn_no) 增量 token 數據
     let sid_clone = session_id.clone();
+    let assistant_clone = resolved_assistant.clone();
+    let source_kind_clone = source_kind.clone();
     let (db_entries, session_cwd): (HashMap<u32, (TokenStats, String)>, Option<String>) =
         tokio::task::spawn_blocking(move || {
             if let Ok(conn) = db::get_db_conn() {
-                let session_cwd = db::get_session_cwd(&conn, &sid_clone).unwrap_or(None);
-                let map = db::get_session_turns_token_stats(&conn, &sid_clone).unwrap_or_default();
+                let session_cwd = db::get_session_cwd(
+                    &conn,
+                    &assistant_clone,
+                    &sid_clone,
+                    Some(&source_kind_clone),
+                )
+                .unwrap_or(None);
+                let map = db::get_session_turns_token_stats(
+                    &conn,
+                    &assistant_clone,
+                    &sid_clone,
+                    Some(&source_kind_clone),
+                )
+                .unwrap_or_default();
                 (map, session_cwd)
             } else {
                 (HashMap::new(), None)
