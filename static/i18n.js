@@ -541,7 +541,7 @@ const i18n = {
     model_sessions_failed: 'Unable to load Session details',
     model_sessions_retry: 'Reload',
     model_sessions_count: '{count} Sessions',
-    model_tokens_count: '{tokens} Token',
+    model_tokens_count: '{tokens} Tokens',
     view_date: 'View Sessions for this date',
     open_session: 'Open conversation',
     col_turns: 'Turns',

@@ -84,18 +84,27 @@ fn collect_model_session_details(
     requested_mode: Option<ModelSessionMode>,
     pricing_rules: &[PricingRule],
 ) -> Vec<ModelSessionDetail> {
-    let mut sessions_map: HashMap<String, (Vec<UsageEntry>, String)> = HashMap::new();
-    let mut session_first_entries: HashMap<String, (UsageEntry, String)> = HashMap::new();
+    type SessionIdentity = (String, String, String);
+    let mut sessions_map: HashMap<SessionIdentity, Vec<UsageEntry>> = HashMap::new();
+    let mut session_first_entries: HashMap<SessionIdentity, (UsageEntry, String)> = HashMap::new();
 
     for (entry, assistant_type, entry_date) in entries_with_type {
-        let session_id = entry.session_id.clone();
-        let (entries, _) = sessions_map
-            .entry(session_id.clone())
-            .or_insert_with(|| (Vec::new(), assistant_type.clone()));
-        entries.push(entry.clone());
+        let source_kind = entry
+            .source_kind
+            .clone()
+            .unwrap_or_else(|| "legacy".to_string());
+        let identity = (
+            assistant_type.clone(),
+            source_kind,
+            entry.session_id.clone(),
+        );
+        sessions_map
+            .entry(identity.clone())
+            .or_default()
+            .push(entry.clone());
 
         let first = session_first_entries
-            .entry(session_id)
+            .entry(identity)
             .or_insert_with(|| (entry.clone(), entry_date.clone()));
         if entry.turn_no < first.0.turn_no
             || (entry.turn_no == first.0.turn_no && entry.timestamp < first.0.timestamp)
@@ -105,7 +114,7 @@ fn collect_model_session_details(
     }
 
     let mut details = Vec::new();
-    for (session_id, (entries, assistant_type)) in sessions_map {
+    for ((assistant_type, source_kind, session_id), entries) in sessions_map {
         let mode = cursor_session_mode(&assistant_type, &entries);
         if requested_mode.is_some_and(|requested| !requested.matches(mode)) {
             continue;
@@ -118,7 +127,12 @@ fn collect_model_session_details(
         else {
             continue;
         };
-        let Some((first_entry, first_date)) = session_first_entries.get(&session_id) else {
+        let identity = (
+            assistant_type.clone(),
+            source_kind.clone(),
+            session_id.clone(),
+        );
+        let Some((first_entry, first_date)) = session_first_entries.get(&identity) else {
             continue;
         };
         let last_entry = entries
@@ -147,10 +161,7 @@ fn collect_model_session_details(
                 .clone()
                 .unwrap_or_else(|| session_id.clone()),
             assistant_type,
-            source_kind: last_entry
-                .source_kind
-                .clone()
-                .unwrap_or_else(|| "legacy".to_string()),
+            source_kind,
             date: valid_model_session_date(first_date),
             timestamp: first_entry.timestamp.clone(),
             cwd: last_entry.cwd.clone().unwrap_or_default(),
@@ -165,6 +176,14 @@ fn collect_model_session_details(
             duration_ms,
             total_requests,
             cost_usd: model_usage.usage.cost_usd,
+            session_model: session_usage.display_model.clone(),
+            session_total_tokens: session_usage.usage.total_tokens,
+            session_total_input_tokens: session_usage.usage.input_tokens,
+            session_total_output_tokens: session_usage.usage.output_tokens,
+            session_total_cache_read_tokens: session_usage.usage.cache_read_tokens,
+            session_total_cache_write_tokens: session_usage.usage.cache_write_tokens,
+            session_total_reasoning_tokens: session_usage.usage.reasoning_tokens,
+            session_cost_usd: session_usage.usage.cost_usd,
             parent_session_id: last_entry.parent_session_id.clone(),
             agent_nickname: last_entry.agent_nickname.clone(),
             agent_role: last_entry.agent_role.clone(),
@@ -177,6 +196,8 @@ fn collect_model_session_details(
             .timestamp
             .cmp(&left.timestamp)
             .then_with(|| left.session_id.cmp(&right.session_id))
+            .then_with(|| left.assistant_type.cmp(&right.assistant_type))
+            .then_with(|| left.source_kind.cmp(&right.source_kind))
     });
     details
 }
@@ -575,12 +596,20 @@ mod tests {
                 "not-a-date".to_string(),
             ),
         ];
-        let rules = [PricingRule {
-            model_name: "composer-2.5".to_string(),
-            input_price: 0.0,
-            cache_input_price: 0.0,
-            output_price: 0.0,
-        }];
+        let rules = [
+            PricingRule {
+                model_name: "composer-2.5".to_string(),
+                input_price: 1.0,
+                cache_input_price: 0.0,
+                output_price: 2.0,
+            },
+            PricingRule {
+                model_name: "cursor-grok-4.5".to_string(),
+                input_price: 2.0,
+                cache_input_price: 0.0,
+                output_price: 3.0,
+            },
+        ];
 
         let details = collect_model_session_details(
             &entries,
@@ -600,6 +629,12 @@ mod tests {
         assert_eq!(mixed.total_output_tokens, 50);
         assert_eq!(mixed.max_turn_no, 2);
         assert_eq!(mixed.date.as_deref(), Some("2026-07-10"));
+        assert_eq!(mixed.session_model, "cursor-grok-4.5");
+        assert_eq!(mixed.session_total_tokens, 450);
+        assert_eq!(mixed.session_total_input_tokens, 300);
+        assert_eq!(mixed.session_total_output_tokens, 150);
+        assert!((mixed.cost_usd - 0.0002).abs() < 1e-12);
+        assert!((mixed.session_cost_usd - 0.0009).abs() < 1e-12);
 
         let invalid_date = details
             .iter()
@@ -699,5 +734,47 @@ mod tests {
 
         assert_eq!(details.len(), 1);
         assert_eq!(details[0].session_id, "ide");
+    }
+
+    #[test]
+    fn model_session_details_keep_same_id_sources_separate() {
+        let entries = vec![
+            (
+                model_entry(
+                    "shared",
+                    1,
+                    "2026-07-10T10:00:00Z",
+                    "gpt-5",
+                    "copilot-cli",
+                    100,
+                    10,
+                ),
+                "copilot".to_string(),
+                "2026-07-10".to_string(),
+            ),
+            (
+                model_entry(
+                    "shared",
+                    1,
+                    "2026-07-10T11:00:00Z",
+                    "gpt-5",
+                    "vscode-chat",
+                    200,
+                    20,
+                ),
+                "copilot".to_string(),
+                "2026-07-10".to_string(),
+            ),
+        ];
+
+        let details = collect_model_session_details(&entries, "gpt-5", None, &[]);
+
+        assert_eq!(details.len(), 2);
+        assert!(details
+            .iter()
+            .any(|detail| { detail.source_kind == "copilot-cli" && detail.total_tokens == 110 }));
+        assert!(details
+            .iter()
+            .any(|detail| { detail.source_kind == "vscode-chat" && detail.total_tokens == 220 }));
     }
 }

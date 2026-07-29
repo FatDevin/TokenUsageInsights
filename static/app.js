@@ -3740,6 +3740,7 @@ async function openSessionTimeline(session) {
     agent_nickname: agentNickname,
     agent_role: agentRole,
     cost_usd: estimatedCost,
+    source_kind: sourceKind,
   } = session;
   const drawerOverlay = document.getElementById('timeline-drawer');
   const timelineContainer = document.getElementById('timeline-items');
@@ -3807,7 +3808,12 @@ async function openSessionTimeline(session) {
 
   try {
     const resolvedAssistant = assistantType || currentAssistant;
-    const res = await fetch(`/api/${encodeURIComponent(resolvedAssistant)}/session/${encodeURIComponent(sessionId)}`);
+    const sourceQuery = sourceKind
+      ? `?${new URLSearchParams({ source_kind: sourceKind }).toString()}`
+      : '';
+    const res = await fetch(
+      `/api/${encodeURIComponent(resolvedAssistant)}/session/${encodeURIComponent(sessionId)}${sourceQuery}`
+    );
     if (res.status === 404) {
       const errData = await res.json().catch(() => ({}));
       if (errData.reason === 'no_events_yet') {
@@ -4495,6 +4501,7 @@ async function loadYearlyData(year) {
     }
     
     const data = await res.json();
+    modelSessionDetailsCache.clear();
     toggleEmptyState(false);
     renderYearlyDashboard(data);
 
@@ -4509,7 +4516,6 @@ async function loadYearlyData(year) {
 // =========================================================================
 function renderYearlyDashboard(data) {
   currentYearlyData = data;
-  modelSessionDetailsCache.clear();
   const { year, summary, monthly_breakdown, models, projects, agent_breakdown } = data;
 
   // 1. 更新標題
@@ -4921,7 +4927,7 @@ function renderModelSessionDrilldown(sessions) {
                   const cwd = session.cwd || t('unknown_cwd');
                   const time = formatLocalTime(session.timestamp, true) || '—';
                   return `
-                    <button type="button" class="model-session-link" data-session-id="${escapeHtml(session.session_id)}" aria-label="${escapeHtml(`${t('open_session')}: ${name}`)}">
+                    <button type="button" class="model-session-link" data-session-id="${escapeHtml(session.session_id)}" data-assistant-type="${escapeHtml(session.assistant_type || '')}" data-source-kind="${escapeHtml(session.source_kind || '')}" aria-label="${escapeHtml(`${t('open_session')}: ${name}`)}">
                       <span class="model-session-primary">
                         <span class="model-session-name-row">
                           <span class="model-session-name">${escapeHtml(name)}</span>
@@ -5051,10 +5057,26 @@ function appendModelSummaryRows(tbody, models, period) {
       const sessionButton = event.target.closest('.model-session-link');
       if (!sessionButton || !Array.isArray(detailsRow.modelSessions)) return;
       const session = detailsRow.modelSessions.find(
-        item => item.session_id === sessionButton.dataset.sessionId
+        item =>
+          item.session_id === sessionButton.dataset.sessionId
+          && (item.assistant_type || '') === sessionButton.dataset.assistantType
+          && (item.source_kind || '') === sessionButton.dataset.sourceKind
       );
       if (session) {
-        openSessionTimeline(session);
+        openSessionTimeline({
+          ...session,
+          model: session.session_model || session.model,
+          total_tokens: session.session_total_tokens ?? session.total_tokens,
+          total_input_tokens: session.session_total_input_tokens ?? session.total_input_tokens,
+          total_output_tokens: session.session_total_output_tokens ?? session.total_output_tokens,
+          total_cache_read_tokens:
+            session.session_total_cache_read_tokens ?? session.total_cache_read_tokens,
+          total_cache_write_tokens:
+            session.session_total_cache_write_tokens ?? session.total_cache_write_tokens,
+          total_reasoning_tokens:
+            session.session_total_reasoning_tokens ?? session.total_reasoning_tokens,
+          cost_usd: session.session_cost_usd ?? session.cost_usd,
+        });
       }
     });
 
@@ -5245,6 +5267,7 @@ async function loadMonthlyData(month) {
     }
     
     const data = await res.json();
+    modelSessionDetailsCache.clear();
     toggleEmptyState(false);
     renderMonthlyDashboard(data);
 
@@ -5259,7 +5282,6 @@ async function loadMonthlyData(month) {
 // =========================================================================
 function renderMonthlyDashboard(data) {
   currentMonthlyData = data;
-  modelSessionDetailsCache.clear();
   const { year_month, summary, daily_breakdown, models, projects, agent_breakdown } = data;
 
   // 1. 更新標題

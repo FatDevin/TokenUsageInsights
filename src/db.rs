@@ -2794,26 +2794,10 @@ fn run_cursor_cache_tokens_unknown_migration(conn: &mut Connection) -> Result<()
         .map_err(|error| format!("提交 Cursor 快取 Token 遷移失敗: {error}"))
 }
 
-fn cursor_state_db_immutable_uri(state_db_path: &Path) -> String {
-    let normalized = state_db_path.to_string_lossy().replace('\\', "/");
-    let mut encoded = String::with_capacity(normalized.len());
-    for byte in normalized.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/' | b':') {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    format!("file:{encoded}?mode=ro&immutable=1")
-}
-
 fn open_cursor_state_db(state_db_path: &Path) -> Result<Connection, String> {
-    let immutable_uri = cursor_state_db_immutable_uri(state_db_path);
     let conn = Connection::open_with_flags(
-        immutable_uri,
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_URI,
+        state_db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| format!("無法唯讀開啟 Cursor state.vscdb: {error}"))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
@@ -4450,14 +4434,25 @@ pub fn get_session_assistant_and_transcript(
     conn: &rusqlite::Connection,
     assistant: &str,
     session_id: &str,
+    source_kind: Option<&str>,
 ) -> Result<(String, Option<String>, String), String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT assistant_type, transcript_path, source_kind FROM usage_entries WHERE session_id = ? AND assistant_type = ? LIMIT 1",
-        )
-        .map_err(|e| e.to_string())?;
+    let mut sql = String::from(
+        "SELECT assistant_type, transcript_path, source_kind
+         FROM usage_entries
+         WHERE session_id = ? AND assistant_type = ?",
+    );
+    let mut params_vec = vec![
+        rusqlite::types::Value::Text(session_id.to_string()),
+        rusqlite::types::Value::Text(assistant.to_string()),
+    ];
+    if let Some(source_kind) = source_kind {
+        sql.push_str(" AND source_kind = ?");
+        params_vec.push(rusqlite::types::Value::Text(source_kind.to_string()));
+    }
+    sql.push_str(" ORDER BY source_kind ASC, id ASC LIMIT 1");
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let mut rows = stmt
-        .query(params![session_id, assistant])
+        .query(rusqlite::params_from_iter(params_vec))
         .map_err(|e| e.to_string())?;
     if let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let ast: String = row.get(0).map_err(|e| e.to_string())?;
@@ -4475,12 +4470,27 @@ pub fn get_session_assistant_and_transcript(
 
 pub fn get_session_cwd(
     conn: &rusqlite::Connection,
+    assistant: &str,
     session_id: &str,
+    source_kind: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let mut stmt = conn
-        .prepare("SELECT cwd FROM usage_entries WHERE session_id = ? AND cwd IS NOT NULL LIMIT 1")
+    let mut sql = String::from(
+        "SELECT cwd FROM usage_entries
+         WHERE assistant_type = ? AND session_id = ? AND cwd IS NOT NULL",
+    );
+    let mut params_vec = vec![
+        rusqlite::types::Value::Text(assistant.to_string()),
+        rusqlite::types::Value::Text(session_id.to_string()),
+    ];
+    if let Some(source_kind) = source_kind {
+        sql.push_str(" AND source_kind = ?");
+        params_vec.push(rusqlite::types::Value::Text(source_kind.to_string()));
+    }
+    sql.push_str(" ORDER BY source_kind ASC, id ASC LIMIT 1");
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(params_vec))
         .map_err(|e| e.to_string())?;
-    let mut rows = stmt.query(params![session_id]).map_err(|e| e.to_string())?;
     if let Some(row) = rows.next().map_err(|e| e.to_string())? {
         Ok(row.get::<_, String>(0).ok())
     } else {
@@ -4490,14 +4500,28 @@ pub fn get_session_cwd(
 
 pub fn get_session_turns_token_stats(
     conn: &rusqlite::Connection,
+    assistant: &str,
     session_id: &str,
+    source_kind: Option<&str>,
 ) -> Result<HashMap<u32, (TokenStats, String)>, String> {
     let mut map = HashMap::new();
-    let mut stmt = conn.prepare(
+    let mut sql = String::from(
         "SELECT turn_no, delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total, model
-         FROM usage_entries WHERE session_id = ? ORDER BY turn_no ASC"
-    ).map_err(|e| e.to_string())?;
-    let mut rows = stmt.query(params![session_id]).map_err(|e| e.to_string())?;
+         FROM usage_entries WHERE assistant_type = ? AND session_id = ?",
+    );
+    let mut params_vec = vec![
+        rusqlite::types::Value::Text(assistant.to_string()),
+        rusqlite::types::Value::Text(session_id.to_string()),
+    ];
+    if let Some(source_kind) = source_kind {
+        sql.push_str(" AND source_kind = ?");
+        params_vec.push(rusqlite::types::Value::Text(source_kind.to_string()));
+    }
+    sql.push_str(" ORDER BY turn_no ASC, id ASC");
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(params_vec))
+        .map_err(|e| e.to_string())?;
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         if let (Ok(turn_no), Ok(delta_input), Ok(delta_output), Ok(delta_total)) = (
             row.get::<_, i64>(0),
@@ -5643,7 +5667,8 @@ mod tests {
         let day_entries = get_usage_entries_by_date(&conn, "2026-07-10", "claude").unwrap();
         let month_entries = get_usage_entries_by_month(&conn, "2026-07", "claude").unwrap();
         let year_entries = get_usage_entries_by_year(&conn, "2026", "claude").unwrap();
-        let turn_entries = get_session_turns_token_stats(&conn, "claude-cache-write-ttl").unwrap();
+        let turn_entries =
+            get_session_turns_token_stats(&conn, "claude", "claude-cache-write-ttl", None).unwrap();
         let entries = [
             &day_entries[0].0.entry,
             &month_entries[0].0,
@@ -5668,6 +5693,58 @@ mod tests {
         assert_eq!(turn.cache_write, Some(4));
         assert_eq!(turn.cache_write_5m, Some(1));
         assert_eq!(turn.cache_write_1h, Some(3));
+    }
+
+    #[test]
+    fn session_detail_queries_are_scoped_by_assistant_and_source() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (source_kind, transcript_path, cwd, model, input) in [
+            (
+                "copilot-cli",
+                "/tmp/cli/events.jsonl",
+                "/tmp/cli",
+                "gpt-5",
+                10i64,
+            ),
+            (
+                "vscode-chat",
+                "/tmp/vscode/session.json",
+                "/tmp/vscode",
+                "gpt-4.1",
+                20i64,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, timestamp, date, session_id,
+                    transcript_path, cwd, turn_no, model,
+                    delta_input, delta_output, delta_total
+                 ) VALUES (
+                    'copilot', ?, '2026-07-10T10:00:00Z', '2026-07-10', 'shared',
+                    ?, ?, 1, ?, ?, 1, ?
+                 )",
+                params![source_kind, transcript_path, cwd, model, input, input + 1],
+            )
+            .unwrap();
+        }
+
+        let (_, transcript_path, source_kind) =
+            get_session_assistant_and_transcript(&conn, "copilot", "shared", Some("vscode-chat"))
+                .unwrap();
+        assert_eq!(source_kind, "vscode-chat");
+        assert_eq!(transcript_path.as_deref(), Some("/tmp/vscode/session.json"));
+
+        let cwd = get_session_cwd(&conn, "copilot", "shared", Some("vscode-chat")).unwrap();
+        assert_eq!(cwd.as_deref(), Some("/tmp/vscode"));
+
+        let turns =
+            get_session_turns_token_stats(&conn, "copilot", "shared", Some("vscode-chat")).unwrap();
+        let (tokens, model) = turns.get(&1).unwrap();
+        assert_eq!(tokens.input, 20);
+        assert_eq!(tokens.output, 1);
+        assert_eq!(tokens.total, 21);
+        assert_eq!(model, "gpt-4.1");
     }
 
     #[test]
@@ -6776,6 +6853,42 @@ mod tests {
 
         assert_eq!(concrete_model.model.as_deref(), Some("composer-2.5"));
         assert!(default_model.model.is_none());
+    }
+
+    #[test]
+    fn cursor_state_db_reader_observes_uncheckpointed_wal() {
+        let state_db_path = temp_jsonl_path("cursor-state-wal").with_extension("vscdb");
+        let writer = Connection::open(&state_db_path).unwrap();
+        let journal_mode: String = writer
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE cursorDiskKV (
+                    key TEXT PRIMARY KEY,
+                    value BLOB
+                 );
+                 INSERT INTO cursorDiskKV (key, value)
+                 VALUES ('agentKv:blob:test', X'7B7D');",
+            )
+            .unwrap();
+
+        let wal_path = PathBuf::from(format!("{}-wal", state_db_path.to_string_lossy()));
+        assert!(wal_path.exists(), "fixture must keep committed data in WAL");
+
+        let reader = open_cursor_state_db(&state_db_path).unwrap();
+        let row_count: i64 = reader
+            .query_row("SELECT COUNT(*) FROM cursorDiskKV", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 1, "read-only connection must observe WAL data");
+
+        drop(reader);
+        drop(writer);
+        let _ = fs::remove_file(&state_db_path);
+        let _ = fs::remove_file(wal_path);
+        let _ = fs::remove_file(format!("{}-shm", state_db_path.to_string_lossy()));
     }
 
     #[test]
