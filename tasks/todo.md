@@ -1,3 +1,35 @@
+# 2026-07-29 Issue #27 動態模型 Token 計價門檻
+
+## Goal and acceptance criteria
+
+- [x] `pricing.csv` 將非 Codex 長上下文模型的門檻修正為 200K，並保留其他模型的實際門檻。
+- [x] `src/pricing.rs` 從定價規則解析門檻，不再硬編碼 `272K`。
+- [x] 長上下文判斷使用 prompt/input 加快取讀取 Token，不把輸出 Token 誤算進門檻。
+- [x] 新增門檻格式、邊界值與規則排序的回歸測試。
+- [x] 通過格式、測試、build、Clippy 與 diff 檢查，且無 compiler warnings。
+
+## Plan
+
+- [x] 從 `origin/main` 與舊綜合 commit 比對計價邏輯及 CSV 規則。
+- [x] 實作可變 K 值門檻解析與規則選擇。
+- [x] 更新模型定價資料並補齊最小回歸測試。
+- [x] 執行完整驗證並記錄結果。
+
+## Risk and rollback
+
+- Risk: medium；影響所有使用長上下文分級價格的模型成本估算。
+- Rollback: 還原 `src/pricing.rs`、`pricing.csv` 與本節任務紀錄；不涉及資料庫 schema 或資料遷移。
+
+## Working notes
+
+- 目前主線仍以 `272K` 辨識長上下文；#27 branch 不引入 Grok parser 或 UI 變更。
+
+## Results
+
+- `src/pricing.rs` 新增可解析任意 `N k` threshold 的規則選擇，threshold row 優先於 default row；prompt 門檻排除 output 並納入 cache read/Claude cache write。
+- `pricing.csv` 將 Gemini 3.1 Pro 與 Claude Opus 4.6 的門檻由 272K 修正為 200K；GPT-5.4/5.5 的 272K 規則保留。
+- 驗證通過：`cargo fmt -- --check`、`cargo test --locked`（80 + 53）、`cargo build --release --locked --all-targets`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`git diff --check`。
+
 # 2026-07-10 windows_native_support
 
 ## Goal and acceptance criteria
