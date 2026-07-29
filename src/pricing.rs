@@ -184,15 +184,17 @@ fn rule_applies_to_context(
         .unwrap_or(true)
 }
 
-/// Prefer an applicable threshold row over an unthresholded default row,
-/// regardless of their order in the CSV.
+/// Prefer the most specific applicable model base, then a threshold row over
+/// an unthresholded default row, regardless of their order in the CSV.
 fn find_pricing_rule<'a>(
     rules: &'a [PricingRule],
     model_base: &str,
     prompt_tokens: u64,
     contains_match: bool,
 ) -> Option<&'a PricingRule> {
-    let mut default_rule = None;
+    let mut best_rule = None;
+    let mut best_base_len = 0;
+    let mut best_has_threshold = false;
 
     for rule in rules {
         let (rule_base, rule_threshold) = parse_threshold_rule(&rule.model_name);
@@ -206,15 +208,19 @@ fn find_pricing_rule<'a>(
             continue;
         }
 
-        if rule_threshold.is_some() {
-            return Some(rule);
-        }
-        if default_rule.is_none() {
-            default_rule = Some(rule);
+        let base_len = rule_base.len();
+        let has_threshold = rule_threshold.is_some();
+        let is_more_specific = base_len > best_base_len;
+        let is_same_base_with_threshold =
+            base_len == best_base_len && has_threshold && !best_has_threshold;
+        if best_rule.is_none() || is_more_specific || is_same_base_with_threshold {
+            best_rule = Some(rule);
+            best_base_len = base_len;
+            best_has_threshold = has_threshold;
         }
     }
 
-    default_rule
+    best_rule
 }
 
 #[allow(dead_code)]
@@ -565,5 +571,40 @@ mod tests {
         let long = calculate_cost(&rules, "GPT-5.5", 300_000, 20_000, 0, 0, 0).unwrap();
         let long_expected = (300_000.0 / 1_000_000.0) * 10.00 + (20_000.0 / 1_000_000.0) * 45.00;
         assert!((long - long_expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn contains_fallback_prefers_the_most_specific_model_base() {
+        let rules = [
+            PricingRule {
+                model_name: "GPT-5.4 (<272k)".to_string(),
+                input_price: 2.50,
+                cache_input_price: 0.25,
+                output_price: 15.00,
+            },
+            PricingRule {
+                model_name: "GPT-5.4-mini".to_string(),
+                input_price: 0.75,
+                cache_input_price: 0.08,
+                output_price: 4.50,
+            },
+        ];
+
+        let cost = calculate_cost(&rules, "GPT-5.4-mini-picker", 100_000, 0, 0, 0, 0).unwrap();
+
+        assert!((cost - 0.075).abs() < 1e-12);
+    }
+
+    #[test]
+    fn packaged_gemini_pricing_uses_standard_cache_rates() {
+        let rules = load_pricing_rules();
+
+        let short_context =
+            calculate_cost(&rules, "Gemini 3.1 Pro (Low)", 100_000, 0, 100_000, 0, 0).unwrap();
+        assert!((short_context - 0.22).abs() < 1e-12);
+
+        let long_context =
+            calculate_cost(&rules, "Gemini 3.1 Pro (Low)", 201_000, 0, 0, 0, 0).unwrap();
+        assert!((long_context - 0.804).abs() < 1e-12);
     }
 }
