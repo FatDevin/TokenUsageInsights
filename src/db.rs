@@ -207,12 +207,17 @@ const COPILOT_CLI_SOURCE_KIND: &str = "copilot-cli";
 /// `COPILOT_DIR` starts a fresh cursor.
 const COPILOT_CLI_AGENT_CURSOR_PREFIX: &str = "sync:copilot_cli_agents:";
 
+/// `sync_state.filename` prefix for CLI sessions whose hook rows are ahead of
+/// `assistant_usage_events`. These sessions are retried even when no new agent
+/// event arrives, without forcing already-valid sessions to roll back.
+const COPILOT_CLI_AGENT_PENDING_PREFIX: &str = "sync:copilot_cli_agents:pending:";
+
 /// Versioned migration key recording that the first CLI agent reconciliation
 /// backfill has completed. The migration scans every CLI-classified session
 /// (transcript at `session-state/<id>/events.jsonl`) and replaces its merged
 /// `copilot-cli` hook rows with per-agent split rows. Idempotent and safe to
 /// retry; only affects `copilot-cli` rows, never `copilot-app` or others.
-const COPILOT_CLI_AGENT_MIGRATION_KEY: &str = "migration:copilot_cli_agent_split_v1";
+const COPILOT_CLI_AGENT_MIGRATION_KEY: &str = "migration:copilot_cli_agent_split_v2";
 
 #[derive(Default)]
 enum InitialUserPromptState {
@@ -2900,17 +2905,17 @@ struct CopilotCliAgentRow {
 /// avoid double-counting cache-read tokens in both `tokens_input` and
 /// `tokens_cache_read` (and again in `tokens_total`), `tokens_input` is stored
 /// as `SUM(input_tokens) - SUM(cache_read_tokens)` (clamped at 0), mirroring
-/// [`normalize_copilot_cli_usage_entry`]. `tokens_total` sums net input +
-/// output + cache_read + cache_write + reasoning, so cache read is counted
-/// once and reasoning is not added twice.
+/// [`normalize_copilot_cli_usage_entry`]. `tokens_total` follows the Copilot
+/// hook's accounting semantics: net input + cache read + output. Cache read is
+/// therefore counted once, while reasoning remains a separate breakdown.
 ///
 /// ## Replacing hook rows
 /// For each reconciled session, the merged `copilot-cli` hook rows for that
 /// session (the main session id and any `__`-suffixed synthetic subagent ids)
 /// are deleted and the new split rows are inserted in the same transaction.
-/// The transaction commits only after the sum of per-agent `tokens_total`
-/// equals the hook session total; on any mismatch or failure it rolls back and
-/// the hook rows are preserved.
+/// Hook deltas form a lower bound because the status-line hook may not run for
+/// every API call. If hook usage is ahead of the agent events, that session is
+/// preserved and marked for retry; other valid sessions still commit.
 ///
 /// ## Cursor & backfill
 /// Incremental sync is tracked by a `(created_at, id)` high-water mark scoped
@@ -2933,6 +2938,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
         .unwrap_or_else(|_| copilot_dir.clone());
     let source_key = encode_hex(canonical_copilot_dir.as_os_str().as_encoded_bytes());
     let cursor_key_prefix = format!("{}{}::", COPILOT_CLI_AGENT_CURSOR_PREFIX, source_key);
+    let pending_key_prefix = format!("{}{}::", COPILOT_CLI_AGENT_PENDING_PREFIX, source_key);
 
     // CLI reconciliation must not touch App sessions. The App registry
     // (`data.db.sessions`) is authoritative; without it we cannot safely
@@ -3062,6 +3068,42 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
     if scan_failed {
         return Ok(());
     }
+
+    // Retry sessions whose hook totals were previously ahead of the agent
+    // event store. The marker also records the compared totals so an unchanged
+    // mismatch is not logged repeatedly on every application sync.
+    let mut pending_totals: HashMap<String, (i64, i64)> = HashMap::new();
+    let mut pending_stmt = conn
+        .prepare(
+            "SELECT filename, last_synced_size, last_synced_time
+             FROM sync_state
+             WHERE filename LIKE ? ESCAPE '\\'",
+        )
+        .map_err(|e| format!("準備 Copilot CLI pending-session 查詢失敗: {}", e))?;
+    let pending_rows = pending_stmt
+        .query_map(params![format!("{}%", pending_key_prefix)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| format!("執行 Copilot CLI pending-session 查詢失敗: {}", e))?;
+    for row in pending_rows {
+        let (filename, hook_total, agent_total) =
+            row.map_err(|e| format!("讀取 Copilot CLI pending-session 失敗: {}", e))?;
+        let Some(session_id) = filename.strip_prefix(&pending_key_prefix) else {
+            continue;
+        };
+        if matches!(
+            classify_copilot_app_session(&copilot_dir, &app_session_ids, session_id),
+            CopilotAppSessionKind::Cli
+        ) {
+            touched_cli_sessions.insert(session_id.to_string());
+            pending_totals.insert(session_id.to_string(), (hook_total, agent_total));
+        }
+    }
+    drop(pending_stmt);
 
     // First-run backfill: scan every CLI-classified session in the store, not
     // just those after the cursor. This converts existing hook merged rows
@@ -3196,28 +3238,25 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
     let mut hook_replaced = 0usize;
 
     for (session_id, agent_rows) in &all_session_rows {
-        // Validate the per-agent total against the existing hook session total
-        // BEFORE deleting anything. The Copilot CLI hook records cumulative
-        // session totals where `tokens.total = net_input + output` (cache_read
-        // is normalized out of input, and reasoning/cache_write are tracked in
-        // separate columns but NOT included in the accounting total — see
-        // `separate_copilot_cli_cached_input` which checks
-        // `total == input + output`). The reconciled per-agent totals must
-        // follow the same semantics and sum to the hook session total exactly;
-        // otherwise we keep the hook rows and skip this session.
+        // Compare the per-agent total against the raw status-line hook rows
+        // BEFORE deleting anything. Copilot's raw input includes cache reads,
+        // while the normalized database input excludes them. Add cache read
+        // back exactly once so this total matches `tokens.total`.
         let agent_total: u64 = agent_rows
             .iter()
-            .map(|r| r.input_tokens + r.output_tokens)
+            .map(|r| r.input_tokens + r.cache_read + r.output_tokens)
             .sum();
+        let agent_total = i64::try_from(agent_total).unwrap_or(i64::MAX);
 
         let hook_total: Option<i64> = tx
             .query_row(
-                "SELECT MAX(tokens_total)
+                "SELECT COALESCE(SUM(delta_total), MAX(tokens_total))
                  FROM usage_entries
                  WHERE assistant_type = 'copilot'
                    AND source_kind = ?
                    AND (session_id = ? OR session_id LIKE ? ESCAPE '\\')
-                   AND parent_session_id IS NULL",
+                   AND parent_session_id IS NULL
+                   AND import_source_id IS NULL",
                 params![
                     COPILOT_CLI_SOURCE_KIND,
                     session_id,
@@ -3228,24 +3267,49 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
             .ok()
             .flatten();
 
-        // If hook rows exist, the reconciled total must match the hook session
-        // total. If there are no hook rows yet (e.g. events arrived before the
-        // hook wrote), accept the reconciled total as authoritative.
-        if let Some(hook_total) = hook_total {
-            if hook_total != agent_total as i64 {
+        // assistant_usage_events records every API call, while the status-line
+        // hook runs only when Copilot redraws it. Agent usage may therefore be
+        // greater than hook usage and is authoritative in that direction. If
+        // the hook is greater, keep this session intact and retry it later
+        // without rolling back other sessions in the same batch.
+        if hook_total.is_some_and(|hook_total| hook_total > agent_total) {
+            let hook_total = hook_total.unwrap_or_default();
+            let compared_totals = (hook_total, agent_total);
+            if pending_totals.get(session_id) != Some(&compared_totals) {
                 eprintln!(
-                    "⚠️ Copilot CLI session {} 總量不符（hook={} agent={}），保留 hook rows",
+                    "⚠️ Copilot CLI session {} 尚待 agent events 補齊（hook={} agent={}），保留 hook rows",
                     session_id, hook_total, agent_total
                 );
-                // The hook may be written after assistant_usage_events. Do
-                // not advance the global cursor or migration marker when the
-                // totals are temporarily inconsistent; rolling back the
-                // whole reconciliation guarantees this session is retried
-                // even when no new event arrives.
-                let _ = tx.rollback();
-                return Ok(());
             }
+            tx.execute(
+                "INSERT OR REPLACE INTO sync_state (
+                    filename, last_synced_size, last_synced_time
+                 ) VALUES (?, ?, ?)",
+                params![
+                    format!("{}{}", pending_key_prefix, session_id),
+                    hook_total,
+                    agent_total
+                ],
+            )
+            .map_err(|e| {
+                format!(
+                    "寫入 Copilot CLI pending-session 失敗 (session {}): {}",
+                    session_id, e
+                )
+            })?;
+            continue;
         }
+
+        tx.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![format!("{}{}", pending_key_prefix, session_id)],
+        )
+        .map_err(|e| {
+            format!(
+                "清除 Copilot CLI pending-session 失敗 (session {}): {}",
+                session_id, e
+            )
+        })?;
 
         // Delete the merged hook rows for this session: the main session id
         // and any synthetic subagent ids. Scoped precisely to copilot-cli so
@@ -3275,12 +3339,11 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
         for row in agent_rows {
             let timestamp = normalize_copilot_app_timestamp(&row.ts);
             let date_str = timestamp.get(..10).unwrap_or(&row.ts).to_string();
-            // CLI accounting total mirrors the hook semantics: net_input +
-            // output only. reasoning, cache_read and cache_write are stored in
-            // their own columns but NOT added to tokens_total, so the per-agent
-            // rows sum to the original hook session total without double
-            // counting reasoning or cache.
-            let total = row.input_tokens + row.output_tokens;
+            // CLI accounting mirrors the hook: raw input + output. Since
+            // `input_tokens` was normalized to exclude cache reads, add
+            // `cache_read` back once. Reasoning and cache write remain separate
+            // breakdowns and are not added to tokens_total.
+            let total = row.input_tokens + row.cache_read + row.output_tokens;
 
             let (row_session_id, parent_session_id, agent_nickname, agent_id_segment, agent_role) =
                 match &row.agent_id {
@@ -13124,6 +13187,232 @@ mod tests {
     }
 
     #[test]
+    fn cli_reconciler_counts_cache_read_once_in_total() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-cache-read").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "cache-read-session";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[session_id]);
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id,
+                model: "mai-code-1-flash-picker",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 443_554,
+                output: 1_370,
+                cache_read: 401_024,
+                cache_write: 0,
+                reasoning: 384,
+                duration_ms: 50,
+            },
+            "2026-07-15T12:39:57",
+        );
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, session_id, 444_924);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        let row: (i64, Option<i64>, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT tokens_total, tokens_input, tokens_cache_read, import_source_id
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND session_id = ? AND parent_session_id IS NULL",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, 444_924, "total must match raw input plus output");
+        assert_eq!(row.1, Some(42_530), "stored input must exclude cache read");
+        assert_eq!(row.2, Some(401_024), "cache read must remain explicit");
+        assert!(
+            row.3
+                .as_deref()
+                .is_some_and(|id| id.starts_with("copilot-cli-agents:")),
+            "hook row must be replaced by the reconciled agent row"
+        );
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_sums_hook_deltas_across_cumulative_reset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-hook-reset").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "hook-reset-session";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[session_id]);
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 200,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:00",
+        );
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 2,
+                session_id,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:01:00",
+        );
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, session_id, 220);
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, session_name,
+                turn_no, model, tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-cli', '2026-07-22T10:01:00Z', '2026-07-22', ?,
+                'Test Session', 2, 'DP4P', 100, 10, 110, 100, 10, 110
+             )",
+            [session_id],
+        )
+        .unwrap();
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        let row: (i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(tokens_total), 0), MAX(import_source_id)
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND (session_id = ? OR session_id LIKE ? ESCAPE '\\')",
+                params![session_id, format!("{}\\__%", session_id)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, 1, "cumulative hook rows must be replaced");
+        assert_eq!(row.1, 330, "hook delta sum must cover both reset segments");
+        assert!(row
+            .2
+            .as_deref()
+            .is_some_and(|id| id.starts_with("copilot-cli-agents:")));
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_accepts_agent_events_missing_from_hook() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-hook-gap").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "hook-gap-session";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[session_id]);
+        for (id, input, output) in [(1, 100, 10), (2, 200, 20)] {
+            insert_cli_event(
+                &store,
+                CliEventIdentity {
+                    id,
+                    session_id,
+                    model: "DP4P",
+                    agent_id: None,
+                    initiator: None,
+                },
+                CliEventTokens {
+                    input,
+                    output,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                    duration_ms: 50,
+                },
+                if id == 1 {
+                    "2026-07-22T10:00:00"
+                } else {
+                    "2026-07-22T10:01:00"
+                },
+            );
+        }
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The hook did not run for the second API call.
+        seed_cli_hook_row(&conn, session_id, 110);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        let row: (i64, Option<String>) = conn
+            .query_row(
+                "SELECT tokens_total, import_source_id
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND session_id = ? AND parent_session_id IS NULL",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, 330, "agent events are the complete API-call source");
+        assert!(row
+            .1
+            .as_deref()
+            .is_some_and(|id| id.starts_with("copilot-cli-agents:")));
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
     fn cli_reconciler_different_models_not_merged() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_dir = std::env::var("COPILOT_DIR").ok();
@@ -13412,6 +13701,118 @@ mod tests {
     }
 
     #[test]
+    fn cli_reconciler_commits_valid_sessions_while_another_is_pending() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-partial-batch").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let valid_session = "valid-batch-session";
+        let pending_session = "pending-batch-session";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[valid_session, pending_session]);
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id: valid_session,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:00",
+        );
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 2,
+                session_id: pending_session,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 200,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:01:00",
+        );
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, valid_session, 110);
+        seed_cli_hook_row(&conn, pending_session, 999);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        let valid_import_source: Option<String> = conn
+            .query_row(
+                "SELECT import_source_id
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND session_id = ?",
+                [valid_session],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            valid_import_source
+                .as_deref()
+                .is_some_and(|id| id.starts_with("copilot-cli-agents:")),
+            "valid session must commit even when another session is pending"
+        );
+
+        let pending_row: (i64, Option<String>) = conn
+            .query_row(
+                "SELECT tokens_total, import_source_id
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND session_id = ?",
+                [pending_session],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending_row, (999, None), "pending hook row must remain");
+
+        let pending_marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM sync_state
+                 WHERE filename LIKE ?",
+                [format!(
+                    "{}%{}",
+                    COPILOT_CLI_AGENT_PENDING_PREFIX, pending_session
+                )],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending_marker_count, 1,
+            "pending session must be retained for a later retry"
+        );
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
     fn cli_reconciler_idempotent() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_dir = std::env::var("COPILOT_DIR").ok();
@@ -13688,7 +14089,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_reconciler_rollback_on_total_mismatch() {
+    fn cli_reconciler_preserves_hook_when_agent_events_lag() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_dir = std::env::var("COPILOT_DIR").ok();
 
@@ -13740,8 +14141,8 @@ mod tests {
         std::env::set_var("COPILOT_DIR", &app_dir);
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        // Hook row has a WRONG total (999) that does not match the agent sum
-        // (330). Reconciliation must roll back and preserve the hook row.
+        // Hook usage is ahead of the available agent events. Reconciliation
+        // must preserve this session until the agent event store catches up.
         seed_cli_hook_row(&conn, session_id, 999);
 
         sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
@@ -13782,7 +14183,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             subagent_rows, 0,
-            "no half-split subagent rows after rollback"
+            "pending session must not contain partially split subagent rows"
         );
 
         if let Some(value) = old_dir {
