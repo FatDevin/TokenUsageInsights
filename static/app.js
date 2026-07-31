@@ -1578,24 +1578,36 @@ async function loadUsageData(date, assistant = currentAssistant) {
   }
 }
 
-function getCurrentUsageDayDate() {
+function getCurrentUsagePeriod() {
+  if (activeTab === 'monthly') {
+    const monthSelect = document.getElementById('month-select');
+    if (monthSelect?.value) return { value: monthSelect.value, scope: 'month' };
+  } else if (activeTab === 'yearly') {
+    const yearSelect = document.getElementById('year-select');
+    if (yearSelect?.value) return { value: yearSelect.value, scope: 'year' };
+  }
+
   const dateSelect = document.getElementById('date-select');
-  return dateSelect && dateSelect.value ? dateSelect.value : getUtcDateString();
+  return {
+    value: dateSelect && dateSelect.value ? dateSelect.value : getUtcDateString(),
+    scope: 'day',
+  };
 }
 
 function getUsageExportFilename(payload) {
   const safeAssistant = currentAssistant || 'unknown';
-  const date = payload?.date || getCurrentUsageDayDate();
-  return `token-usage-${safeAssistant}-${date}-day-v${payload?.version || 1}.json`;
+  const period = getCurrentUsagePeriod();
+  const value = payload?.date || period.value;
+  return `token-usage-${safeAssistant}-${value}-${period.scope}-v${payload?.version || 1}.json`;
 }
 
 async function exportCurrentUsageDay() {
-  const date = getCurrentUsageDayDate();
+  const period = getCurrentUsagePeriod();
   const btnExport = document.getElementById('btn-export-usage-day');
   if (btnExport) btnExport.classList.add('loading');
 
   try {
-    const res = await fetch(`/api/${currentAssistant}/usage/${date}/export`);
+    const res = await fetch(`/api/${currentAssistant}/usage/${period.value}/export`);
     const payload = await res.json().catch(() => null);
 
     if (!res.ok) {
@@ -1628,7 +1640,7 @@ async function exportCurrentUsageDay() {
     showNotification(
       t('usage_exported')
         .replace('{count}', String(records.length))
-        .replace('{date}', payload.date || date),
+        .replace('{date}', payload.date || period.value),
       'success'
     );
   } catch (err) {
@@ -1656,13 +1668,9 @@ async function importUsageDayFromFile(file) {
       return;
     }
 
-    const targetDate = typeof payload?.date === 'string' && payload.date.trim()
+    const dateLabel = typeof payload?.date === 'string' && payload.date.trim()
       ? payload.date.trim()
-      : getCurrentUsageDayDate();
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
-      showNotification(t('import_failed').replace('{msg}', t('invalid_import_date')), 'error');
-      return;
-    }
+      : t('import_all_dates');
     const records = Array.isArray(payload?.records) ? payload.records : [];
     if (records.length === 0) {
       showNotification(t('import_failed').replace('{msg}', t('import_empty_records')), 'error');
@@ -1699,7 +1707,7 @@ async function importUsageDayFromFile(file) {
       fileName: file.name || t('import_unknown_file'),
       records,
       sourceAssistant,
-      targetDate,
+      dateLabel,
     };
     const sourceAssistantElement = document.getElementById('usage-import-source-assistant');
     const fileNameElement = document.getElementById('usage-import-file-name');
@@ -1712,7 +1720,7 @@ async function importUsageDayFromFile(file) {
         : t('import_unknown_source');
     }
     if (fileNameElement) fileNameElement.textContent = pendingUsageImport.fileName;
-    if (dateElement) dateElement.textContent = targetDate;
+    if (dateElement) dateElement.textContent = dateLabel;
     if (recordCountElement) recordCountElement.textContent = String(records.length);
     if (targetSelect) targetSelect.value = '';
     updateUsageImportValidation();
@@ -1801,7 +1809,7 @@ async function executePendingUsageImport() {
   }
 
   try {
-    const res = await fetch(`/api/${targetAssistant}/usage/${pendingImport.targetDate}/import`, {
+    const res = await fetch(`/api/${targetAssistant}/usage/all/import`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1810,7 +1818,7 @@ async function executePendingUsageImport() {
         assistant: pendingImport.sourceAssistant,
         confirmed_assistant: targetAssistant,
         source_file_name: pendingImport.fileName,
-        date: pendingImport.targetDate,
+        date: pendingImport.dateLabel,
         records: pendingImport.records,
       }),
     });
@@ -1842,17 +1850,9 @@ async function executePendingUsageImport() {
     if (currentAssistant !== targetAssistant) {
       activateAssistantWithoutReload(targetAssistant);
     }
-    const dateSelect = document.getElementById('date-select');
-    if (dateSelect) {
-      dateSelect.value = pendingImport.targetDate;
-    }
-    await fetchDates(pendingImport.targetDate, true);
+    await fetchDates(null, true);
     await fetchMonths();
     await fetchYears();
-    if (activeTab !== 'daily') {
-      switchTab('daily');
-    }
-    await loadUsageData(pendingImport.targetDate);
   } catch (err) {
     console.error('Import failed:', err);
     showNotification(t('import_failed').replace('{msg}', err.message || String(err)), 'error');

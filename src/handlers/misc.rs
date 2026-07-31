@@ -217,30 +217,21 @@ fn is_valid_date(date: &str) -> bool {
     true
 }
 
-fn normalize_import_payload_date(
-    route_date: &str,
-    payload_date: Option<String>,
-) -> Result<String, String> {
-    if let Some(payload_date) = payload_date {
-        if payload_date.trim().is_empty() {
-            return Err("缺少匯入檔案日期欄位".to_string());
+fn is_valid_period(period: &str) -> bool {
+    match period.len() {
+        4 => period.parse::<i32>().is_ok_and(|year| year > 0),
+        7 => {
+            let Some((year, month)) = period.split_once('-') else {
+                return false;
+            };
+            year.parse::<i32>().is_ok_and(|year| year > 0)
+                && month
+                    .parse::<i32>()
+                    .is_ok_and(|month| (1..=12).contains(&month))
         }
-        if !is_valid_date(&payload_date) {
-            return Err("匯入檔案日期格式不正確".to_string());
-        }
-        if payload_date != route_date {
-            return Err(format!(
-                "匯入檔案日期 {payload_date} 與 API 路徑日期 {route_date} 不一致"
-            ));
-        }
-        return Ok(payload_date);
+        10 => is_valid_date(period),
+        _ => false,
     }
-
-    if is_valid_date(route_date) {
-        return Ok(route_date.to_string());
-    }
-
-    Err("日期格式不正確".to_string())
 }
 
 fn validate_import_assistant(
@@ -288,10 +279,10 @@ pub async fn export_usage_day(
             .into_response();
     }
 
-    if !is_valid_date(&date) {
+    if !is_valid_period(&date) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "日期格式不正確，請使用 YYYY-MM-DD" })),
+            Json(serde_json::json!({ "error": "資料範圍格式不正確，請使用 YYYY、YYYY-MM 或 YYYY-MM-DD" })),
         )
             .into_response();
     }
@@ -300,7 +291,7 @@ pub async fn export_usage_day(
     let date_clone = date.clone();
     let export_res = tokio::task::spawn_blocking(move || {
         let conn = db::get_db_conn()?;
-        let records = db::export_usage_day_entries(&conn, &assistant_clone, &date_clone)?;
+        let records = db::export_usage_period_entries(&conn, &assistant_clone, &date_clone)?;
         Ok::<Vec<crate::db::UsageDayExportRecord>, String>(records)
     })
     .await
@@ -311,7 +302,7 @@ pub async fn export_usage_day(
             if records.is_empty() {
                 (
                     StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": "指定日期沒有可匯出的使用紀錄" })),
+                    Json(serde_json::json!({ "error": "指定資料範圍沒有可匯出的使用紀錄" })),
                 )
                     .into_response()
             } else {
@@ -346,14 +337,6 @@ pub async fn import_usage_day(
             .into_response();
     }
 
-    if !is_valid_date(&date) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "日期格式不正確，請使用 YYYY-MM-DD" })),
-        )
-            .into_response();
-    }
-
     let source_assistant = match validate_import_assistant(
         &assistant,
         payload.assistant.as_deref(),
@@ -369,16 +352,10 @@ pub async fn import_usage_day(
         }
     };
 
-    let import_date = match normalize_import_payload_date(&date, payload.date) {
-        Ok(v) => v,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": err })),
-            )
-                .into_response();
-        }
-    };
+    let import_date = payload
+        .date
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(date);
 
     if payload.records.is_empty() {
         return (
@@ -412,10 +389,7 @@ pub async fn import_usage_day(
     match import_res {
         Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
         Err(err) => {
-            let status = if err.contains("匯入資料日期不一致")
-                || err.contains("日期")
-                || err.contains("無效")
-            {
+            let status = if err.contains("日期") || err.contains("無效") {
                 StatusCode::BAD_REQUEST
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -500,7 +474,16 @@ pub async fn rollback_usage_import_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_import_assistant;
+    use super::{is_valid_period, validate_import_assistant};
+
+    #[test]
+    fn export_period_accepts_day_month_and_year() {
+        assert!(is_valid_period("2026-08-01"));
+        assert!(is_valid_period("2026-08"));
+        assert!(is_valid_period("2026"));
+        assert!(!is_valid_period("2026-13"));
+        assert!(!is_valid_period("all"));
+    }
 
     #[test]
     fn import_requires_explicit_matching_target_confirmation() {

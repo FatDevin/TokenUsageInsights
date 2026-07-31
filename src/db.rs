@@ -6085,10 +6085,32 @@ pub fn export_usage_day_entries(
     Ok(records)
 }
 
+pub fn export_usage_period_entries(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+    period: &str,
+) -> Result<Vec<UsageDayExportRecord>, String> {
+    if period.len() == 10 {
+        return export_usage_day_entries(conn, assistant, period);
+    }
+
+    let mut dates = get_available_dates(conn, assistant)?
+        .into_iter()
+        .filter(|date| date.starts_with(period))
+        .collect::<Vec<_>>();
+    dates.sort();
+
+    let mut records = Vec::new();
+    for date in dates {
+        records.extend(export_usage_day_entries(conn, assistant, &date)?);
+    }
+    Ok(records)
+}
+
 pub fn import_usage_day_entries(
     conn: &mut Connection,
     assistant: &str,
-    date: &str,
+    batch_date: &str,
     records: Vec<UsageDayExportRecord>,
     metadata: UsageImportMetadata,
 ) -> Result<UsageDayImportSummary, String> {
@@ -6117,7 +6139,7 @@ pub fn import_usage_day_entries(
             assistant,
             source_assistant,
             source_file_name,
-            date,
+            batch_date,
             total as i64,
             created_at,
         ],
@@ -6127,14 +6149,11 @@ pub fn import_usage_day_entries(
     for record in records {
         let mut entry = record.entry;
         let normalized_id = normalize_import_source_id(record.import_source_id.as_deref());
-        let generated_source_id = build_usage_entry_import_source_id(assistant, date, &entry);
-        let file_date = entry_date_from_timestamp(&entry.timestamp)
-            .ok_or_else(|| "無效的 timestamp 格式，無法取得日期".to_string())?;
-        if file_date != date {
-            return Err(format!(
-                "匯入資料日期不一致：預期 {date}，但資料為 {file_date}"
-            ));
-        }
+        let record_date = entry_date_from_timestamp(&entry.timestamp)
+            .ok_or_else(|| "無效的 timestamp 格式，無法取得日期".to_string())?
+            .to_string();
+        let generated_source_id =
+            build_usage_entry_import_source_id(assistant, &record_date, &entry);
 
         let source_kind = entry
             .source_kind
@@ -6178,7 +6197,7 @@ pub fn import_usage_day_entries(
                     source_kind,
                     usage_identity,
                     entry.timestamp,
-                    date,
+                    record_date,
                     entry.session_id,
                     entry.session_name,
                     entry.transcript_path,
@@ -6234,7 +6253,7 @@ pub fn import_usage_day_entries(
         .map_err(|e| format!("提交匯入結果失敗: {}", e))?;
 
     Ok(UsageDayImportSummary {
-        date: date.to_string(),
+        date: batch_date.to_string(),
         total,
         imported: inserted,
         skipped_duplicates,
@@ -7715,6 +7734,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(imported_rows, 1);
+    }
+
+    #[test]
+    fn import_uses_each_record_timestamp_date_and_period_export_includes_all_dates() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let first = sample_import_record();
+        let mut second = sample_import_record();
+        second.entry.timestamp = "2026-07-11T01:02:03Z".to_string();
+        second.entry.session_id = "import-session-next-day".to_string();
+        second.import_source_id = Some("import-test-record-next-day".to_string());
+
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07",
+            vec![first, second],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.imported, 2);
+        assert_eq!(
+            get_available_dates(&conn, "codex").unwrap(),
+            vec!["2026-07-11", "2026-07-10"]
+        );
+        assert_eq!(
+            export_usage_period_entries(&conn, "codex", "2026-07")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            export_usage_period_entries(&conn, "codex", "2026")
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

@@ -24,23 +24,22 @@ const EXPORT_VERSION: u8 = 1;
 const HELP_TEXT: &str = r#"Token 使用量 CLI 匯入 / 匯出工具
 
 用途:
-  export  匯出某日資料為 JSON（可重複匯入且支援重複資料去重）
-  import  匯入匯出 JSON 檔（預設以檔內日期為準，可用 --date 覆蓋）
+  export  匯出指定日、月或年的資料為 JSON（可重複匯入且支援重複資料去重）
+  import  匯入 JSON 檔內的所有資料（每筆資料依 timestamp 決定日期）
 
 共用參數:
   --agent <name>      助理名稱: antigravity / copilot / codex / claude / cursor / grok
                      亦可使用 claude-code / claude_code / claudecode（會正規化為 claude）
 
 匯出:
-  token-usage-insights-cli export --agent <name> --date YYYY-MM-DD --out <path>
+  token-usage-insights-cli export --agent <name> --date YYYY[-MM[-DD]] --out <path>
   例如:
   token-usage-insights-cli export --agent codex --date 2026-07-09 --out daily.json
 
 匯入:
-  token-usage-insights-cli import --agent <name> --file <path> [--date YYYY-MM-DD]
+  token-usage-insights-cli import --agent <name> --file <path>
   例如:
   token-usage-insights-cli import --agent codex --file daily.json
-  token-usage-insights-cli import --agent codex --file daily.json --date 2026-07-09
 
 注意:
   - 若未指定 export 的 --out，會直接輸出到 stdout
@@ -153,8 +152,8 @@ fn run_export(args: &[String]) -> i32 {
         return 2;
     }
 
-    if !is_valid_date(&date) {
-        eprintln!("日期格式不正確，請使用 YYYY-MM-DD");
+    if !is_valid_period(&date) {
+        eprintln!("資料範圍格式不正確，請使用 YYYY、YYYY-MM 或 YYYY-MM-DD");
         return 2;
     }
 
@@ -171,7 +170,7 @@ fn run_export(args: &[String]) -> i32 {
         return 1;
     }
 
-    let records = match db::export_usage_day_entries(&conn, &assistant, &date) {
+    let records = match db::export_usage_period_entries(&conn, &assistant, &date) {
         Ok(v) => v,
         Err(err) => {
             eprintln!("匯出資料失敗: {err}");
@@ -288,13 +287,10 @@ fn run_import(args: &[String]) -> i32 {
         }
     };
 
-    let imported_from = match normalize_import_date(date, payload.date) {
-        Ok(v) => v,
-        Err(err) => {
-            eprintln!("{err}");
-            return 2;
-        }
-    };
+    let imported_from = date
+        .or(payload.date)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "all".to_string());
 
     let source_assistant =
         match validate_import_source_assistant(&assistant, payload.assistant.as_deref()) {
@@ -352,45 +348,6 @@ fn run_import(args: &[String]) -> i32 {
     }
 
     0
-}
-
-fn normalize_import_date(
-    route_date: Option<String>,
-    file_date: Option<String>,
-) -> Result<String, String> {
-    if let Some(file_date) = file_date {
-        if file_date.trim().is_empty() {
-            return Err("匯入檔案日期欄位不能為空".to_string());
-        }
-
-        if !is_valid_date(&file_date) {
-            return Err(format!("匯入檔案日期欄位格式不正確: {file_date}"));
-        }
-
-        if let Some(route_date) = route_date {
-            if !is_valid_date(&route_date) {
-                return Err(format!("--date 格式不正確: {route_date}"));
-            }
-
-            if route_date != file_date {
-                return Err(format!(
-                    "匯入檔案日期 {file_date} 與 --date 指定 {route_date} 不一致"
-                ));
-            }
-            return Ok(route_date);
-        }
-
-        return Ok(file_date);
-    }
-
-    if let Some(route_date) = route_date {
-        if !is_valid_date(&route_date) {
-            return Err(format!("--date 格式不正確: {route_date}"));
-        }
-        return Ok(route_date);
-    }
-
-    Err("缺少日期：請在匯入檔案內提供 date 欄位，或使用 --date 指定".to_string())
 }
 
 fn next_flag_value(args: &[String], i: &mut usize, flag: &str) -> String {
@@ -466,6 +423,23 @@ fn is_valid_date(date: &str) -> bool {
     true
 }
 
+fn is_valid_period(period: &str) -> bool {
+    match period.len() {
+        4 => period.parse::<i32>().is_ok_and(|year| year > 0),
+        7 => {
+            let Some((year, month)) = period.split_once('-') else {
+                return false;
+            };
+            year.parse::<i32>().is_ok_and(|year| year > 0)
+                && month
+                    .parse::<i32>()
+                    .is_ok_and(|month| (1..=12).contains(&month))
+        }
+        10 => is_valid_date(period),
+        _ => false,
+    }
+}
+
 fn print_help() {
     println!("{HELP_TEXT}");
 }
@@ -473,11 +447,11 @@ fn print_help() {
 fn print_export_help() {
     println!(
         r#"export usage:
-  token-usage-insights-cli export --agent <name> --date YYYY-MM-DD --out <path>
+  token-usage-insights-cli export --agent <name> --date YYYY[-MM[-DD]] --out <path>
 
 參數:
   --agent <name>    助理名稱（antigravity/copilot/codex/claude/cursor/grok）
-  --date YYYY-MM-DD  匯出日期
+  --date <period>     匯出年份、月份或日期
   --out <path>      輸出檔案路徑，不指定則輸出到 stdout
   --help, -h        顯示此說明
 "#
@@ -487,12 +461,12 @@ fn print_export_help() {
 fn print_import_help() {
     println!(
         r#"import usage:
-  token-usage-insights-cli import --agent <name> --file <path> [--date YYYY-MM-DD]
+  token-usage-insights-cli import --agent <name> --file <path>
 
 參數:
   --agent <name>      助理名稱（antigravity/copilot/codex/claude/cursor/grok）
   --file <path>       匯入檔案
-  --date YYYY-MM-DD    覆蓋匯入日期，不指定則使用檔案中的 date
+  --date <label>       相容舊版，僅作為匯入紀錄標籤，不影響資料日期
   --help, -h          顯示此說明
 "#
     );
