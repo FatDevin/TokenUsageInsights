@@ -16,7 +16,6 @@ The repository currently uses Rust unit/integration-style tests embedded under `
 
 ## Commit & Pull Request Guidelines
 Recent history uses short conventional prefixes such as `feat:`, `fix:`, `style:`, and scoped forms like `feat(web):`. Keep commit subjects imperative and specific. PRs should describe the user-visible change, note any schema or env var impact, and include screenshots for `static/` UI changes. Link related issues when applicable and list the verification commands you ran.
-**Crucial Rule**: Do not automatically commit code changes. All code modifications should be left in the working directory (staged or unstaged) for the user to review and commit manually.
 
 ## Release & Changelog Guidelines
 Every release must update `CHANGELOG.md` in the same release change before creating the version tag. Move the relevant items from the `Unreleased` / `未發行` section into a version heading with the release date, and derive the entries from both the Git log and the actual diff from the previous tag. Record user-visible additions, changes, fixes, removals, security changes, migrations, environment variable changes, and breaking changes when applicable; do not list a version bump by itself as a product change.
