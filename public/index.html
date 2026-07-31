@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Token 戰情室｜本機優先的 AI Coding Agent Token 看板</title>
+    <meta
+      name="description"
+      content="Token 戰情室集中分析多種 AI Coding Agent 的 Token、估算費用與完整 Session 時間軸。資料來自本機日誌與 SQLite。"
+    >
+    <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1">
+    <meta name="theme-color" content="#f4f6f9">
+    <meta name="color-scheme" content="light">
+    <link rel="canonical" href="https://token.gh.miniasp.com/">
+    <link rel="icon" href="/favicon.ico" sizes="any">
+    <link rel="icon" type="image/png" href="/assets/favicon-32.png" sizes="32x32">
+    <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+    <link rel="manifest" href="/site.webmanifest">
+    <link rel="preload" href="/assets/dashboard-desktop.webp" as="image" type="image/webp" fetchpriority="high">
+
+    <meta property="og:type" content="website">
+    <meta property="og:locale" content="zh_TW">
+    <meta property="og:site_name" content="Token 戰情室">
+    <meta property="og:title" content="Token 戰情室｜讀懂 Token 與 Session">
+    <meta
+      property="og:description"
+      content="本機優先的 AI Coding Agent Token 使用量與會話還原看板。"
+    >
+    <meta property="og:url" content="https://token.gh.miniasp.com/">
+    <meta property="og:image" content="https://token.gh.miniasp.com/assets/og-token-usage-insights.png">
+    <meta property="og:image:secure_url" content="https://token.gh.miniasp.com/assets/og-token-usage-insights.png">
+    <meta property="og:image:type" content="image/png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:image:alt" content="Token 戰情室本機 Token 分析看板">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Token 戰情室｜讀懂 Token 與 Session">
+    <meta
+      name="twitter:description"
+      content="本機優先的 AI Coding Agent Token 使用量與會話還原看板。"
+    >
+    <meta name="twitter:image" content="https://token.gh.miniasp.com/assets/og-token-usage-insights.png">
+    <meta name="twitter:image:alt" content="Token 戰情室本機 Token 分析看板">
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "Token 戰情室",
+        "alternateName": "Token Usage Insights",
+        "description": "本機優先的 AI Coding Agent Token 使用量與會話還原看板。",
+        "url": "https://token.gh.miniasp.com/",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Windows 10, Windows 11, macOS, Linux, WSL",
+        "inLanguage": "zh-Hant-TW",
+        "codeRepository": "https://github.com/doggy8088/TokenUsageInsights",
+        "downloadUrl": "https://github.com/doggy8088/TokenUsageInsights/releases/latest",
+        "license": "https://opensource.org/license/mit",
+        "image": "https://token.gh.miniasp.com/assets/og-token-usage-insights.png",
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "USD"
+        }
+      }
+    </script>
+
+    <script>document.documentElement.classList.add('js');</script>
+    <link rel="stylesheet" href="/assets/site.css">
+    <script src="/assets/site.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到主要內容</a>
+
+    <header class="site-header" data-header>
+      <div class="shell header-inner">
+        <a class="brand" href="#top" aria-label="Token 戰情室首頁">
+          <img src="/assets/favicon-32.png" width="32" height="32" alt="">
+          <span>Token 戰情室</span>
+        </a>
+
+        <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav">
+          選單
+        </button>
+
+        <nav class="site-nav" id="site-nav" aria-label="主要導覽">
+          <a href="#sources">支援來源</a>
+          <a href="#workflow">資料流</a>
+          <a href="#features">功能</a>
+          <a href="https://github.com/doggy8088/TokenUsageInsights" target="_blank" rel="noreferrer">GitHub</a>
+          <a class="nav-cta" href="#install">立即安裝</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main-content">
+      <section class="hero shell" id="top" aria-labelledby="hero-title">
+        <div class="hero-copy" data-reveal>
+          <h1 id="hero-title">
+            <span>Token 戰情室</span>
+            <span>讀懂 Token 與 Session。</span>
+          </h1>
+          <p>
+            從本機日誌統整用量、費用與完整 Session 時間軸。資料留在你的電腦。
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#install">立即安裝</a>
+            <a class="button button-secondary" href="https://github.com/doggy8088/TokenUsageInsights" target="_blank" rel="noreferrer">
+              查看原始碼
+            </a>
+          </div>
+        </div>
+
+        <figure class="hero-media" data-reveal>
+          <div class="image-frame">
+            <img
+              src="/assets/dashboard-desktop.webp"
+              width="1440"
+              height="900"
+              alt="Token 戰情室每日看板，顯示 Token 統計、估算費用、趨勢圖與 Session 清單"
+              fetchpriority="high"
+            >
+          </div>
+          <figcaption>每日看板，實際產品畫面</figcaption>
+        </figure>
+      </section>
+
+      <section class="sources-section" id="sources" aria-labelledby="sources-title">
+        <div class="shell">
+          <h2 id="sources-title" data-reveal>七種來源，一個視角</h2>
+          <div class="source-rail" role="list" aria-label="支援的 AI Coding Agent 資料來源">
+            <div class="source-item" role="listitem" data-reveal>
+              <img src="/assets/antigravity.webp" width="42" height="42" alt="">
+              <span>Google<br>Antigravity</span>
+            </div>
+            <div class="source-item" role="listitem" data-reveal>
+              <img src="/assets/githubcopilot.webp" width="42" height="42" alt="">
+              <span>GitHub<br>Copilot</span>
+            </div>
+            <div class="source-item" role="listitem" data-reveal>
+              <img src="/assets/githubcopilot.webp" width="42" height="42" alt="">
+              <span>VS Code<br>Copilot Chat</span>
+            </div>
+            <div class="source-item" role="listitem" data-reveal>
+              <img src="/assets/codex.webp" width="42" height="42" alt="">
+              <span>Codex<br>Desktop / CLI</span>
+            </div>
+            <div class="source-item" role="listitem" data-reveal>
+              <img src="/assets/claude-code-logo.svg" width="42" height="42" alt="">
+              <span>Claude<br>Code</span>
+            </div>
+            <div class="source-item" role="listitem" data-reveal>
+              <img src="/assets/cursor-logo.svg" width="42" height="42" alt="">
+              <span>Cursor</span>
+            </div>
+            <div class="source-item" role="listitem" data-reveal>
+              <img src="/assets/grok-logo.svg" width="42" height="42" alt="">
+              <span>Grok<br>Build</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="workflow-section section shell" id="workflow" aria-labelledby="workflow-title">
+        <div class="section-heading" data-reveal>
+          <h2 id="workflow-title">資料一路在本機</h2>
+          <p>
+            不替你呼叫 AI 供應商 API。Token 戰情室讀取本機資料，整理進本機 SQLite，再交給瀏覽器看板。
+          </p>
+        </div>
+
+        <div class="workflow-grid">
+          <article class="workflow-step" data-reveal>
+            <h3>本機日誌</h3>
+            <p>讀取各工具既有的 Session 記錄與 Status Line 收集檔。</p>
+            <code>~/.codex · ~/.claude · ~/.copilot</code>
+          </article>
+          <article class="workflow-step" data-reveal>
+            <h3>本機 SQLite</h3>
+            <p>背景增量同步，集中整理 Session、模型、Token 與費用資料。</p>
+            <code>token_usage_insights.db</code>
+          </article>
+          <article class="workflow-step workflow-step-visual" data-reveal>
+            <h3>瀏覽器看板</h3>
+            <p>在 <code>localhost:3003</code> 檢視趨勢與工作脈絡。</p>
+            <img
+              src="/assets/dashboard-desktop.webp"
+              width="1440"
+              height="900"
+              alt="Token 戰情室瀏覽器看板縮圖"
+              loading="lazy"
+            >
+          </article>
+        </div>
+      </section>
+
+      <section class="features-section section" id="features" aria-label="主要功能">
+        <div class="shell feature-row feature-row-analysis">
+          <figure class="feature-media" data-reveal>
+            <img
+              src="/assets/dashboard-desktop.webp"
+              width="1440"
+              height="900"
+              alt="Token 戰情室趨勢分析與 Session 清單"
+              loading="lazy"
+            >
+          </figure>
+          <div class="feature-copy" data-reveal>
+            <h2>每日、月度、年度，一眼讀懂</h2>
+            <p>
+              拆解輸入、輸出、快取讀取、快取寫入與推理 Token，並依 <code>pricing.csv</code> 估算費用。
+            </p>
+            <dl class="feature-index">
+              <div>
+                <dt>模型分佈</dt>
+                <dd>看清 Token 用在哪些模型。</dd>
+              </div>
+              <div>
+                <dt>專案目錄</dt>
+                <dd>依工作目錄追蹤投入。</dd>
+              </div>
+              <div>
+                <dt>Session 清單</dt>
+                <dd>排序、篩選，再下鑽細節。</dd>
+              </div>
+            </dl>
+          </div>
+        </div>
+
+        <div class="shell feature-row feature-row-session">
+          <div class="feature-copy" data-reveal>
+            <h2>回到完整 Session 脈絡</h2>
+            <p>
+              從使用者提示詞、助理回覆、推理內容到工具呼叫，一段段還原。
+            </p>
+            <dl class="feature-index">
+              <div>
+                <dt>工具步驟</dt>
+                <dd>保留參數、退出碼、stdout 與 stderr。</dd>
+              </div>
+              <div>
+                <dt>助理回覆</dt>
+                <dd>以 Markdown 清楚呈現完整內容。</dd>
+              </div>
+              <div>
+                <dt>Agent 關係</dt>
+                <dd>辨識 Codex subagent 與父 Session。</dd>
+              </div>
+            </dl>
+          </div>
+          <figure class="mobile-proof" data-reveal>
+            <img
+              src="/assets/dashboard-mobile.webp"
+              width="560"
+              height="960"
+              alt="Token 戰情室行動版深色看板"
+            >
+          </figure>
+        </div>
+      </section>
+
+      <section class="privacy-section" aria-labelledby="privacy-title">
+        <div class="shell privacy-inner" data-reveal>
+          <h2 id="privacy-title">資料不必離開你的電腦</h2>
+          <p>
+            核心資料來源是本機日誌、Status Line 收集檔與本機 SQLite。分析與費用估算都在你的電腦上完成。
+          </p>
+        </div>
+      </section>
+
+      <section class="install-section section" id="install" aria-labelledby="install-title">
+        <div class="shell">
+          <div class="section-heading install-heading" data-reveal>
+            <h2 id="install-title">一行安裝，直接開啟</h2>
+            <p>下載目前平台的已編譯版本，不需要先安裝 Rust 或 Cargo。</p>
+          </div>
+
+          <div class="install-panel" data-reveal>
+            <div class="install-tabs" role="tablist" aria-label="選擇作業系統">
+              <button
+                class="install-tab is-active"
+                type="button"
+                role="tab"
+                id="tab-unix"
+                aria-selected="true"
+                aria-controls="panel-unix"
+                data-command-tab="unix"
+              >
+                Linux / macOS
+              </button>
+              <button
+                class="install-tab"
+                type="button"
+                role="tab"
+                id="tab-windows"
+                aria-selected="false"
+                aria-controls="panel-windows"
+                tabindex="-1"
+                data-command-tab="windows"
+              >
+                Windows PowerShell
+              </button>
+            </div>
+
+            <div class="command-panel" id="panel-unix" role="tabpanel" aria-labelledby="tab-unix" data-command-panel="unix">
+              <code data-command>curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash &amp;&amp; "$HOME/.local/bin/token-usage-insights"</code>
+              <button class="copy-button" type="button" data-copy-command="unix">複製指令</button>
+            </div>
+            <div
+              class="command-panel"
+              id="panel-windows"
+              role="tabpanel"
+              aria-labelledby="tab-windows"
+              data-command-panel="windows"
+              hidden
+            >
+              <code data-command>irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex; &amp; "$HOME\bin\token-usage-insights.cmd"</code>
+              <button class="copy-button" type="button" data-copy-command="windows">複製指令</button>
+            </div>
+            <p class="copy-status" role="status" aria-live="polite"></p>
+          </div>
+
+          <div class="launch-note" data-reveal>
+            <span>安裝完成後開啟</span>
+            <code>http://localhost:3003</code>
+          </div>
+
+          <div class="platform-row" data-reveal>
+            <strong>Windows 10/11、macOS、Linux 與 WSL</strong>
+            <span>MIT License · Open source</span>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-inner">
+        <a class="brand" href="#top" aria-label="回到頁首">
+          <img src="/assets/favicon-32.png" width="32" height="32" alt="">
+          <span>Token 戰情室</span>
+        </a>
+        <p>本機優先的 AI Coding Agent Token 看板。</p>
+        <a href="https://github.com/doggy8088/TokenUsageInsights" target="_blank" rel="noreferrer">GitHub 原始碼</a>
+      </div>
+    </footer>
+  </body>
+</html>

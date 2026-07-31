@@ -1,0 +1,21 @@
+{
+  "name": "Token 戰情室",
+  "short_name": "Token 戰情室",
+  "description": "本機優先的 AI Coding Agent Token 使用量與會話還原看板。",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f6f9",
+  "theme_color": "#f4f6f9",
+  "icons": [
+    {
+      "src": "/assets/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/assets/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
