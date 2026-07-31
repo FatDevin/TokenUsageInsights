@@ -2,6 +2,7 @@ use crate::db::{CostStats, InitialUserPromptSelector, TokenStats, UsageEntry};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -194,7 +195,7 @@ pub fn read_session_file(path: &Path) -> Result<ChatSession, String> {
     let document = if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
         replay_operation_log(&content)?
     } else {
-        serde_json::from_str(&content)
+        serde_json::from_str(&sanitize_json_surrogates(&content))
             .map_err(|error| format!("VS Code 聊天 JSON 格式錯誤 {:?}: {error}", path))?
     };
 
@@ -323,7 +324,7 @@ fn replay_operation_log(content: &str) -> Result<Value, String> {
 
     for line in content.lines().filter(|line| !line.trim().is_empty()) {
         line_count += 1;
-        let entry: OperationLogEntry = serde_json::from_str(line)
+        let entry: OperationLogEntry = serde_json::from_str(&sanitize_json_surrogates(line))
             .map_err(|error| format!("VS Code 聊天操作記錄格式錯誤: {error}"))?;
 
         match entry.kind {
@@ -355,6 +356,76 @@ fn replay_operation_log(content: &str) -> Result<Value, String> {
     }
 
     state.ok_or_else(|| "VS Code 聊天操作記錄沒有初始資料".to_string())
+}
+
+fn sanitize_json_surrogates(input: &str) -> Cow<'_, str> {
+    let bytes = input.as_bytes();
+    let mut output = None::<String>;
+    let mut copied_until = 0usize;
+    let mut in_string = false;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                in_string = !in_string;
+                index += 1;
+            }
+            b'\\' if in_string => {
+                if bytes.get(index + 1) != Some(&b'u') {
+                    index += if index + 1 < bytes.len() { 2 } else { 1 };
+                    continue;
+                }
+
+                let Some(code_unit) = parse_hex_code_unit(bytes, index + 2) else {
+                    index += 2;
+                    continue;
+                };
+                let is_high_surrogate = (0xD800..=0xDBFF).contains(&code_unit);
+                let is_low_surrogate = (0xDC00..=0xDFFF).contains(&code_unit);
+                let has_matching_low_surrogate = is_high_surrogate
+                    && bytes.get(index + 6) == Some(&b'\\')
+                    && bytes.get(index + 7) == Some(&b'u')
+                    && parse_hex_code_unit(bytes, index + 8)
+                        .is_some_and(|next| (0xDC00..=0xDFFF).contains(&next));
+
+                if has_matching_low_surrogate {
+                    index += 12;
+                } else if is_high_surrogate || is_low_surrogate {
+                    let sanitized =
+                        output.get_or_insert_with(|| String::with_capacity(input.len()));
+                    sanitized.push_str(&input[copied_until..index]);
+                    sanitized.push_str("\\uFFFD");
+                    index += 6;
+                    copied_until = index;
+                } else {
+                    index += 6;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+
+    match output {
+        Some(mut sanitized) => {
+            sanitized.push_str(&input[copied_until..]);
+            Cow::Owned(sanitized)
+        }
+        None => Cow::Borrowed(input),
+    }
+}
+
+fn parse_hex_code_unit(bytes: &[u8], start: usize) -> Option<u16> {
+    let digits = bytes.get(start..start + 4)?;
+    digits.iter().try_fold(0u16, |value, digit| {
+        let digit = match digit {
+            b'0'..=b'9' => u16::from(digit - b'0'),
+            b'a'..=b'f' => u16::from(digit - b'a' + 10),
+            b'A'..=b'F' => u16::from(digit - b'A' + 10),
+            _ => return None,
+        };
+        Some((value << 4) | digit)
+    })
 }
 
 fn apply_set(root: &mut Value, path: &[Value], value: Option<Value>) -> Result<(), String> {
@@ -550,6 +621,32 @@ mod tests {
         assert_eq!(value["sessionId"], "abc");
         assert_eq!(value["requests"][0]["promptTokens"], 12);
         assert!(value["requests"][0].get("requestId").is_none());
+    }
+
+    #[test]
+    fn replays_operation_log_with_lone_surrogates() {
+        let content = concat!(
+            r#"{"kind":0,"v":{"sessionId":"abc","requests":[{"message":{"text":"range [\uD800-\uDFFF], emoji \uD83D\uDC69, literal \\uD800"},"promptTokens":1}]}}"#,
+            "\n"
+        );
+
+        let value = replay_operation_log(content).expect("operation log should replay");
+        assert_eq!(
+            value["requests"][0]["message"]["text"],
+            "range [�-�], emoji 👩, literal \\uD800"
+        );
+    }
+
+    #[test]
+    fn sanitizer_only_allocates_for_invalid_surrogates() {
+        let valid = r#"{"text":"emoji \uD83D\uDC69 and literal \\uD800"}"#;
+        assert!(matches!(sanitize_json_surrogates(valid), Cow::Borrowed(_)));
+
+        let invalid = r#"{"text":"\uD800 \udfff"}"#;
+        assert_eq!(
+            sanitize_json_surrogates(invalid),
+            r#"{"text":"\uFFFD \uFFFD"}"#
+        );
     }
 
     #[test]
