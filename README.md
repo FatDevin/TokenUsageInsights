@@ -362,13 +362,13 @@ cargo build --release --bin token-usage-insights-cli
 ```
 
 ```bash
-# 匯出（輸出 JSON，含匯入唯一 id）
-./target/release/token-usage-insights-cli export --agent codex --date 2026-07-09 --out daily-codex-2026-07-09.json
+# 匯出日、月或年資料（輸出 JSON，含匯入唯一 id）
+./target/release/token-usage-insights-cli export --agent codex --date 2026-07 --out monthly-codex-2026-07.json
 ```
 
 ```bash
-# 匯入（以匯入結果中的 date 或 `--date` 為準）
-./target/release/token-usage-insights-cli import --agent codex --file daily-codex-2026-07-09.json
+# 匯入檔案中的所有資料；每筆資料依 timestamp 決定日期
+./target/release/token-usage-insights-cli import --agent codex --file monthly-codex-2026-07.json
 ```
 
 ```bash
@@ -484,7 +484,7 @@ token-usage-insights
 
 | 變數 | 適用平台 | 說明 |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安裝的 Release tag，例如 `v0.6.1`。預設 `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安裝的 Release tag，例如 `v0.6.2`。預設 `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | 安裝目錄，會轉交給 `install.sh` |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | 執行檔連結目錄，會轉交給 `install.sh` |
 

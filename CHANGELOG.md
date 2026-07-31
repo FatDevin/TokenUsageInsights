@@ -4,26 +4,42 @@
 
 ## [未發行]
 
+目前沒有尚未發行的變更。
+
+## [0.6.2] - 2026-08-01
+
 ### 新增與改善
 
 - 支援 GitHub Copilot App（Tauri 桌面應用）的 Token 使用量同步，自動讀取 `~/.copilot/data.db` 與 `~/.copilot/session-store.db`，依 Session、Turn、Agent 與模型保存 `assistant_usage_events`，並以 `source_kind = "copilot-app"` 與 CLI / VS Code 區分；Session 清單以 `App` 標示來源。新增 `COPILOT_APP_DIR` 環境變數自訂 App 資料目錄。
 - 新增 Grok Build 助理支援，掃描 `~/.grok/sessions` 的 `updates.jsonl`，提供每日、月度、年度統計、Session 清單與時間軸還原。
 - 支援 Grok Build 的 provider usage、model alias、reasoning effort、快取讀取與 context-only snapshot，並在 Session 清單標示 `Usage` 或 `Context` 來源。
+- 模型用量明細新增 Session 下鑽，可從每日、月度與年度模型統計直接查看對應 Session。
+- 看板匯出會依目前報表範圍輸出完整日、月或年資料；CLI 同步支援 `YYYY`、`YYYY-MM` 與 `YYYY-MM-DD`。
+- 匯入改為逐筆依 `timestamp` 決定日期，可一次匯入跨日、跨月或跨年的完整檔案。
+- 新增 `HOST` 環境變數控制看板綁定位址，啟動訊息會顯示實際可連線網址。
 
 ### 變更
 
 - Grok Build Session 若包含 provider 回報成本，統計頁面會優先使用該成本；只有 context snapshot 時才依 xAI API pricing 估算。
+- Cursor 會從本機 `state.vscdb` 的 `agentKv` 記錄歸因實際模型與 Mode；無法唯一比對時保留為未知模型，避免錯誤歸因。
+- Session 清單改依實際時間排序，統一各來源時間戳解析。
+- 費用統計改依每筆資料的實際模型計算，不再以整個 Session 的單一模型套用價格。
 
 ### 資料影響
 
 - SQLite `usage_entries` 新增 `reported_cost_usd` 欄位，並以一次性 migration 重新解析既有 Grok Build Session；不會刪除其他助理的資料。
+- Copilot App 會依來源目錄、Session、Turn、Agent 與模型隔離記錄，並清理舊版可能合併的資料；既有匯入批次與其他助理資料不受影響。
 
 ### 相容性
 
-- 新增 `GROK_DIR` 環境變數；既有助理識別碼、API 與資料目錄維持相容。
+- 新增 `GROK_DIR`、`COPILOT_APP_DIR`、`CURSOR_STATE_DB` 與 `HOST` 環境變數；既有助理識別碼、API 與資料目錄維持相容。
+- 匯入檔案的頂層 `date` 與 CLI `--date` 僅保留作為批次標籤；資料實際日期一律由每筆 `timestamp` 決定。
 
 ### 修正
 
+- 防止匯入檔案被寫入不同 Agent，保留來源驗證、重複資料去重、批次追蹤與撤銷能力。
+- 修正 Claude 快取寫入費用、每日舊格式用量彙整，以及多模型 Session 的成本計算。
+- 新增 Claude Opus 5 與 Gemini 3.6 Flash 費率，並移除已下架的 Grok 模型定價。
 - 修正非 Codex 長上下文模型的計價門檻，改由 `pricing.csv` 動態解析各模型的實際門檻，並將 Gemini 3.1 Pro 與 Claude Opus 4.6 的門檻修正為 200K。
 - 修正 Gemini 3.1 Pro 的快取價格，改用 Google Standard Context caching 的 0.20／0.40 美元費率。
 - 修正模型名稱 contains fallback，優先套用最具體的模型 base，避免 `GPT-5.4-mini-picker` 誤用 `GPT-5.4` 價格。
