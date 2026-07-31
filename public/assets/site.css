@@ -12,6 +12,8 @@
   --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif;
   --font-mono: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   --header-height: 72px;
+  --letter-spacing-body: 0.012em;
+  --letter-spacing-heading: 0.006em;
   color-scheme: light;
   font-synthesis: none;
 }
@@ -33,6 +35,7 @@ body {
   font-family: var(--font-sans);
   font-size: 16px;
   line-height: 1.65;
+  letter-spacing: var(--letter-spacing-body);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
@@ -130,7 +133,7 @@ h3 {
   color: var(--ink);
   font-size: 1.03rem;
   font-weight: 800;
-  letter-spacing: -0.02em;
+  letter-spacing: var(--letter-spacing-heading);
   text-decoration: none;
 }
 
@@ -206,20 +209,19 @@ h3 {
 }
 
 .hero h1 {
-  font-size: clamp(3.1rem, 5.3vw, 5rem);
   font-weight: 850;
-  letter-spacing: -0.065em;
-  line-height: 0.98;
-}
-
-.hero h1 span {
-  display: block;
-}
-
-.hero h1 span:last-child {
-  margin-top: 20px;
-  font-size: 0.62em;
+  letter-spacing: var(--letter-spacing-heading);
   line-height: 1.08;
+  font-size: clamp(1.9rem, 3.4vw, 3.6rem);
+}
+
+.hero-line {
+  display: block;
+  white-space: nowrap;
+}
+
+.hero-line + .hero-line {
+  margin-top: 0.2em;
 }
 
 .hero-copy > p {
@@ -326,7 +328,7 @@ h3 {
 .sources-section h2 {
   margin-bottom: 30px;
   font-size: clamp(1.55rem, 2.5vw, 2.2rem);
-  letter-spacing: -0.035em;
+  letter-spacing: var(--letter-spacing-heading);
   line-height: 1.1;
 }
 
@@ -376,7 +378,7 @@ h3 {
 .privacy-inner h2 {
   font-size: clamp(2.35rem, 4.5vw, 4.5rem);
   font-weight: 850;
-  letter-spacing: -0.065em;
+  letter-spacing: var(--letter-spacing-heading);
   line-height: 1.02;
 }
 
@@ -433,7 +435,7 @@ h3 {
 
 .workflow-step h3 {
   font-size: clamp(1.3rem, 2vw, 1.8rem);
-  letter-spacing: -0.03em;
+  letter-spacing: var(--letter-spacing-heading);
 }
 
 .workflow-step p {
@@ -698,17 +700,31 @@ h3 {
   display: grid;
   min-height: 150px;
   align-items: center;
-  grid-template-columns: 1fr auto 1fr;
+  grid-template-columns: auto 1fr;
   gap: 30px;
+}
+
+.footer-left {
+  display: flex;
+  align-items: center;
+  gap: 0;
 }
 
 .footer-inner p {
   color: var(--muted);
   font-size: 0.83rem;
-  text-align: center;
+  text-align: left;
+  margin: 0;
 }
 
-.footer-inner > a:last-child {
+.footer-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-self: end;
+}
+
+.footer-right a {
   justify-self: end;
   font-size: 0.85rem;
   font-weight: 800;
@@ -909,13 +925,7 @@ h3 {
   }
 
   .hero h1 {
-    font-size: clamp(2.65rem, 13vw, 4rem);
-  }
-
-  .hero h1 span:last-child {
-    margin-top: 14px;
-    font-size: 0.54em;
-    line-height: 1.18;
+    font-size: clamp(1.35rem, 7.5vw, 2.4rem);
   }
 
   .hero-copy > p {
