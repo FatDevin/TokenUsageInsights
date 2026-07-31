@@ -417,7 +417,7 @@ fn sanitize_json_surrogates(input: &str) -> Cow<'_, str> {
 
 fn parse_hex_code_unit(bytes: &[u8], start: usize) -> Option<u16> {
     let digits = bytes.get(start..start + 4)?;
-    digits.iter().try_fold(0u16, |value, digit| {
+    digits.iter().try_fold(0u16, |value, &digit| {
         let digit = match digit {
             b'0'..=b'9' => u16::from(digit - b'0'),
             b'a'..=b'f' => u16::from(digit - b'a' + 10),
