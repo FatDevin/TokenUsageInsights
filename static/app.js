@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=32';
+import i18n from './i18n.js?v=34';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -280,7 +280,41 @@ let secondsRemaining = 10;
 let refreshInterval = 10000; // default 10s
 
 // Language / Internationalization (i18n) State
-let currentLang = localStorage.getItem('lang') || 'zh-TW';
+const supportedLocales = ['zh-TW', 'zh-CN', 'en', 'ja', 'ko'];
+const localeOptions = ['auto', ...supportedLocales];
+const localeLabels = {
+  'zh-TW': '繁體中文',
+  'zh-CN': '简体中文',
+  en: 'English',
+  ja: '日本語',
+  ko: '한국어',
+};
+const localeForFormatting = {
+  'zh-CN': 'zh-CN',
+  'zh-TW': 'zh-TW',
+  en: 'en-US',
+  ja: 'ja-JP',
+  ko: 'ko-KR',
+};
+
+function detectBrowserLocale() {
+  const languages = Array.isArray(navigator.languages) && navigator.languages.length
+    ? navigator.languages
+    : [navigator.language || ''];
+  for (const language of languages) {
+    const normalized = String(language).toLowerCase();
+    if (normalized === 'zh-cn' || normalized === 'zh-sg' || normalized.startsWith('zh-cn-') || normalized.startsWith('zh-sg-')) return 'zh-CN';
+    if (normalized === 'zh-tw' || normalized === 'zh-hk' || normalized === 'zh-mo' || normalized.startsWith('zh-tw-') || normalized.startsWith('zh-hk-') || normalized.startsWith('zh-mo-')) return 'zh-TW';
+    if (normalized === 'en' || normalized.startsWith('en-')) return 'en';
+    if (normalized === 'ja' || normalized.startsWith('ja-')) return 'ja';
+    if (normalized === 'ko' || normalized.startsWith('ko-')) return 'ko';
+  }
+  return 'zh-TW';
+}
+
+const savedLanguage = localStorage.getItem('lang');
+let languagePreference = localeOptions.includes(savedLanguage) ? savedLanguage : 'auto';
+let currentLang = languagePreference === 'auto' ? detectBrowserLocale() : languagePreference;
 let currentUsageData = null;
 let currentMonthlyData = null;
 const modelSessionDetailsCache = new Map();
@@ -340,39 +374,16 @@ function updateBrandLogo() {
   brandLogo.alt = meta.alt;
 }
 
-function languageMeta(lang) {
-  return lang === 'en'
-    ? { label: 'United States', next: 'zh-TW' }
-    : { label: '臺灣', next: 'en' };
-}
-
-// Flag artwork sourced from the open-source "flag-icons" project (lipis/flag-icons, MIT license):
-// https://github.com/lipis/flag-icons — local copies live in static/flags/{us,tw}.svg
-function languageFlagIcon(lang) {
-  const code = lang === 'en' ? 'us' : 'tw';
-  const label = lang === 'en' ? 'United States flag' : 'Taiwan flag';
-  return `<img src="/static/flags/${code}.svg" alt="${label}" class="lang-flag-icon" />`;
-}
-
 function updateLanguageToggle() {
-  const langToggle = document.getElementById('lang-toggle-btn');
-  if (!langToggle) return;
-
-  const langToggleIcon = document.getElementById('lang-toggle-icon');
-  const langToggleText = document.getElementById('lang-toggle-text');
-
-  const meta = languageMeta(currentLang);
-  const label = currentLang === 'en'
-    ? `Switch language, current: United States`
-    : `切換語言，目前：${meta.label}`;
-  if (langToggleIcon) {
-    langToggleIcon.innerHTML = languageFlagIcon(currentLang);
-  }
-  if (langToggleText) {
-    langToggleText.textContent = t('btn_language');
-  }
-  langToggle.title = label;
-  langToggle.setAttribute('aria-label', label);
+  const langSelect = document.getElementById('lang-select');
+  if (!langSelect) return;
+  langSelect.value = languagePreference;
+  langSelect.setAttribute('aria-label', t('btn_language'));
+  langSelect.title = t('btn_language');
+  langSelect.innerHTML = localeOptions
+    .map(locale => `<option value="${locale}">${locale === 'auto' ? t('language_auto') : localeLabels[locale]}</option>`)
+    .join('');
+  langSelect.value = languagePreference;
 }
 
 function syncSidebarToggleButton() {
@@ -486,7 +497,11 @@ function setSetupModalBody(assistant) {
 }
 
 function updateLanguageUI() {
-  document.title = 'Token 戰情室';
+  document.documentElement.lang = currentLang;
+  document.title = t('title');
+  document.querySelectorAll('[data-i18n-content]').forEach(el => {
+    el.setAttribute('content', t(el.getAttribute('data-i18n-content')));
+  });
 
   document.querySelectorAll('[data-i18n]').forEach(el => {
     const key = el.getAttribute('data-i18n');
@@ -512,6 +527,10 @@ function updateLanguageUI() {
     el.placeholder = t(key);
   });
 
+  document.querySelectorAll('#live-interval option[data-seconds]').forEach(option => {
+    option.textContent = `${option.dataset.seconds} ${t('seconds')}`;
+  });
+
   // Specific dynamic text updates
   updateLanguageToggle();
 
@@ -528,6 +547,13 @@ function updateLanguageUI() {
   if (emptyContainer && !emptyContainer.classList.contains('hidden')) {
     toggleEmptyState(true);
   }
+
+  ['monthly-stat-input-pct', 'monthly-stat-cache-input-pct', 'monthly-stat-output-pct',
+    'yearly-stat-input-pct', 'yearly-stat-output-pct'].forEach(id => {
+    const element = document.getElementById(id);
+    const percent = element?.textContent.match(/\d+(?:\.\d+)?%/);
+    if (element && percent) element.textContent = `${t('ratio_label')}: ${percent[0]}`;
+  });
 
   // Update dynamic brand logo in sidebar
   updateBrandLogo();
@@ -685,12 +711,13 @@ function initApp() {
   }
 
   // Language toggle
-  const langToggle = document.getElementById('lang-toggle-btn');
-  if (langToggle) {
+  const langSelect = document.getElementById('lang-select');
+  if (langSelect) {
     updateLanguageToggle();
-    langToggle.addEventListener('click', () => {
-      currentLang = languageMeta(currentLang).next;
-      localStorage.setItem('lang', currentLang);
+    langSelect.addEventListener('change', () => {
+      languagePreference = localeOptions.includes(langSelect.value) ? langSelect.value : 'auto';
+      currentLang = languagePreference === 'auto' ? detectBrowserLocale() : languagePreference;
+      localStorage.setItem('lang', languagePreference);
       updateLanguageUI();
       
       // Re-render currently active view
@@ -795,7 +822,7 @@ function initApp() {
         dateSelect.value = todayStr;
       }
       await loadUsageData(todayStr);
-      showNotification(`${t('today_btn') || '今日'} ${todayStr}`, 'success');
+      showNotification(`${t('today_btn')} ${todayStr}`, 'success');
     });
   }
 
@@ -891,7 +918,7 @@ function initApp() {
       }
       monthSelect.value = thisMonthStr;
       await loadMonthlyData(thisMonthStr);
-      showNotification(`${t('this_month_btn') || '今月'} ${thisMonthStr}`, 'success');
+      showNotification(`${t('this_month_btn')} ${thisMonthStr}`, 'success');
     });
   }
 
@@ -1018,7 +1045,7 @@ function initApp() {
       }
       yearSelect.value = thisYearStr;
       await loadYearlyData(thisYearStr);
-      showNotification(`${t('this_year_btn') || '今年'} ${thisYearStr}`, 'success');
+      showNotification(`${t('this_year_btn')} ${thisYearStr}`, 'success');
     });
   }
 
@@ -3637,7 +3664,7 @@ function renderSessionTable(sessions) {
       .replace('{matched}', sessions.length)
       .replace('{total}', currentSessions.length);
   } else {
-    sessionCount.textContent = `${sessions.length} Sessions`;
+    sessionCount.textContent = t('session_count').replace('{count}', sessions.length);
   }
   tbody.innerHTML = '';
 
@@ -3734,10 +3761,10 @@ function renderSessionTable(sessions) {
         <div class="session-name-wrapper is-subagent" style="padding-left: ${paddingLeft}px;">
           <span class="tree-connector" style="left: ${connectorLeft}px;">└─</span>
           <div style="display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 3px;">
-            <span class="badge subagent-badge" title="Subagent of: ${escapeHtml(s.parentName || '')}">Subagent</span>
+            <span class="badge subagent-badge" title="${escapeHtml(t('subagent_parent_label'))}: ${escapeHtml(s.parentName || '')}">${escapeHtml(t('subagent_label'))}</span>
             ${nameSourceBadge}
-            ${nickname ? `<span class="badge agent-nickname-badge" title="Agent Nickname: ${escapeHtml(nickname)}">${escapeHtml(nickname)}</span>` : ''}
-            ${semanticRole ? `<span class="badge agent-role-badge" title="Agent Role: ${escapeHtml(semanticRole)}">${escapeHtml(semanticRole)}</span>` : ''}
+            ${nickname ? `<span class="badge agent-nickname-badge" title="${escapeHtml(t('assistant_nickname_label'))}: ${escapeHtml(nickname)}">${escapeHtml(nickname)}</span>` : ''}
+            ${semanticRole ? `<span class="badge agent-role-badge" title="${escapeHtml(t('assistant_role_label'))}: ${escapeHtml(semanticRole)}">${escapeHtml(semanticRole)}</span>` : ''}
           </div>
           <span class="session-name-text" title="${escapeHtml(subagentDisplayName)}">${escapeHtml(subagentDisplayName)}</span>
           <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
@@ -4038,7 +4065,7 @@ function renderTimeline(data) {
         if (item.event_data.attachments && item.event_data.attachments.length > 0) {
           attachmentsHTML = `<div class="bubble-attachments">`;
           item.event_data.attachments.forEach(att => {
-            const path = att.filePath || att.path || '檔名未知';
+            const path = att.filePath || att.path || t('attachment_unknown_filename');
             const basename = path.split(/[\\/]/).pop();
             const attType = att.type || 'file';
             attachmentsHTML += `
@@ -4153,11 +4180,11 @@ function renderTimeline(data) {
         if (totalTokens || inTokens || outTokens || cacheReadTokens || reasoningTokens) {
           tokenBadge = `
             <div class="turn-token-stats">
-              ${inTokens ? `<span class="token-badge input" title="輸入 Token (Input Tokens)">In: ${formatToken(inTokens)}</span>` : ''}
-              ${outTokens ? `<span class="token-badge output" title="輸出 Token (Output Tokens)">Out: ${formatToken(outTokens)}</span>` : ''}
-              ${reasoningTokens ? `<span class="token-badge reasoning" title="推理 Token (Reasoning Tokens)">Reasoning: ${formatToken(reasoningTokens)}</span>` : ''}
-              ${cacheReadTokens ? `<span class="token-badge cache" title="快取讀取 Token (Cache Read Tokens)">Cache: ${formatToken(cacheReadTokens)}</span>` : ''}
-              ${totalTokens ? `<span class="token-badge total" title="總 Token (Total Tokens)">Total: ${formatToken(totalTokens)}</span>` : ''}
+              ${inTokens ? `<span class="token-badge input" title="${escapeHtml(t('token_input_title'))}">${escapeHtml(t('input_tokens_label'))}: ${formatToken(inTokens)}</span>` : ''}
+              ${outTokens ? `<span class="token-badge output" title="${escapeHtml(t('token_output_title'))}">${escapeHtml(t('output_tokens_label'))}: ${formatToken(outTokens)}</span>` : ''}
+              ${reasoningTokens ? `<span class="token-badge reasoning" title="${escapeHtml(t('token_reasoning_title'))}">${escapeHtml(t('reasoning_tokens_label'))}: ${formatToken(reasoningTokens)}</span>` : ''}
+              ${cacheReadTokens ? `<span class="token-badge cache" title="${escapeHtml(t('token_cache_title'))}">${escapeHtml(t('cache_read_label'))}: ${formatToken(cacheReadTokens)}</span>` : ''}
+              ${totalTokens ? `<span class="token-badge total" title="${escapeHtml(t('token_total_title'))}">${escapeHtml(t('total_tokens_label'))}: ${formatToken(totalTokens)}</span>` : ''}
             </div>
           `;
         }
@@ -4254,7 +4281,7 @@ function renderTimeline(data) {
 
         const isSuccess = result !== null && result !== undefined;
         const badgeClass = isSuccess ? 'badge success' : 'badge executing';
-        const badgeText = isSuccess ? 'Success' : 'Executing';
+        const badgeText = isSuccess ? t('tool_status_success') : t('tool_status_executing');
 
         // 格式化 Args & Result 為 Pre 區塊
         const argsStr = stringifyToolValue(args, '{}');
@@ -4329,9 +4356,9 @@ function renderTimeline(data) {
           message = t('session_compaction');
         }
 
-        let statusLabel = 'System';
+        let statusLabel = t('system_status');
         if (item.event_data.status_type === 'session_compaction') {
-          statusLabel = 'Compaction';
+          statusLabel = t('system_compaction');
         }
 
         div.innerHTML = `
@@ -6311,7 +6338,7 @@ function renderPricingModalTable() {
   tbody.innerHTML = '';
 
   if (!pricingRules || pricingRules.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" class="placeholder-text">載入中...</td></tr>';
+    tbody.innerHTML = `<tr><td colspan="7" class="placeholder-text">${escapeHtml(t('pricing_loading'))}</td></tr>`;
     return;
   }
 
@@ -6355,14 +6382,15 @@ function renderCodexResets(cachedData) {
 
 function formatDateTime(dateObj) {
   if (!dateObj || isNaN(dateObj.getTime())) return '';
-  const pad = (num) => String(num).padStart(2, '0');
-  const year = dateObj.getFullYear();
-  const month = pad(dateObj.getMonth() + 1);
-  const date = pad(dateObj.getDate());
-  const hours = pad(dateObj.getHours());
-  const minutes = pad(dateObj.getMinutes());
-  const seconds = pad(dateObj.getSeconds());
-  return `${year}-${month}-${date} ${hours}:${minutes}:${seconds}`;
+  return new Intl.DateTimeFormat(localeForFormatting[currentLang] || 'zh-TW', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(dateObj).replace(',', '');
 }
 
 async function updateCodexAuthSwitcher() {

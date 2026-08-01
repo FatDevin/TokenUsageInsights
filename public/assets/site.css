@@ -185,6 +185,23 @@ h3 {
   color: #f7f9fc !important;
 }
 
+.site-language {
+  display: inline-flex;
+  align-items: center;
+}
+
+.site-language select {
+  min-width: 92px;
+  border: 1px solid var(--ink);
+  border-radius: 0;
+  padding: 8px 24px 8px 8px;
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
 .menu-toggle {
   display: none;
   border: 1px solid var(--ink);
@@ -206,9 +223,11 @@ h3 {
 
 .hero-copy {
   align-self: center;
+  min-width: 0;
 }
 
 .hero h1 {
+  max-width: 100%;
   font-weight: 850;
   letter-spacing: var(--letter-spacing-heading);
   line-height: 1.08;
@@ -217,7 +236,8 @@ h3 {
 
 .hero-line {
   display: block;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .hero-line + .hero-line {
@@ -811,7 +831,7 @@ h3 {
     border-bottom: 1px solid var(--line);
   }
 
-  .site-nav a:last-child {
+  .site-nav .nav-cta {
     margin-top: 12px;
     padding-inline: 14px;
     border-bottom: 0;

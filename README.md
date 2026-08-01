@@ -6,6 +6,8 @@
 
 > 系統環境：支援 Windows 10/11 原生 PowerShell、macOS、Linux 與 WSL。
 
+語言： [繁體中文](README.md) · [简体中文](README.zh-CN.md) · [English](README.en.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
+
 * * *
 
 ## 最短上手路徑
