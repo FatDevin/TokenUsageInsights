@@ -219,6 +219,12 @@ const COPILOT_CLI_AGENT_PENDING_PREFIX: &str = "sync:copilot_cli_agents:pending:
 /// retry; only affects `copilot-cli` rows, never `copilot-app` or others.
 const COPILOT_CLI_AGENT_MIGRATION_KEY: &str = "migration:copilot_cli_agent_split_v2";
 
+/// One-time backfill of `cwd` for existing Copilot rows (`copilot-cli` and
+/// `copilot-app`) that were written before CWD was populated from
+/// `session-store.db.sessions`. Idempotent: the marker is set on success so
+/// re-runs only cover sessions synced after the marker.
+const COPILOT_CWD_BACKFILL_MIGRATION_KEY: &str = "migration:copilot_cwd_backfill_v1";
+
 #[derive(Default)]
 enum InitialUserPromptState {
     #[default]
@@ -2450,7 +2456,9 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         // Resolve session metadata (title + cwd) from the original session.
         let meta = session_meta_cache
             .entry(row.session_id.clone())
-            .or_insert_with(|| resolve_copilot_app_session_meta(&data_db, &row.session_id))
+            .or_insert_with(|| {
+                resolve_copilot_app_session_meta(&data_db, &session_store, &row.session_id)
+            })
             .clone();
 
         // Normalize timestamp: Copilot App uses `YYYY-MM-DD HH:MM:SS` UTC.
@@ -2819,8 +2827,26 @@ struct CopilotAppSessionMeta {
     cwd: Option<String>,
 }
 
+/// Resolve the CWD for a Copilot session from `session-store.db.sessions.cwd`.
+///
+/// The `sessions` table in the shared session-store records the working
+/// directory for every session (both CLI and App). Filter out empty strings
+/// and bare `/` (the root directory, which is usually a meaningless default).
+fn resolve_session_store_cwd(session_store: &Connection, session_id: &str) -> Option<String> {
+    let cwd: Option<String> = session_store
+        .query_row(
+            "SELECT cwd FROM sessions WHERE id = ?",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    cwd.filter(|c| !c.is_empty() && c != "/")
+}
+
 fn resolve_copilot_app_session_meta(
     data_db: &Connection,
+    session_store: &Connection,
     session_id: &str,
 ) -> CopilotAppSessionMeta {
     let title: Option<String> = data_db
@@ -2832,9 +2858,10 @@ fn resolve_copilot_app_session_meta(
         .ok()
         .flatten();
 
-    // Workspace/checkout path resolution is non-trivial across schema versions;
-    // leave cwd empty for now. The frontend can fall back to session-state.
-    CopilotAppSessionMeta { title, cwd: None }
+    // data.db.sessions has no cwd column; resolve it from the shared
+    // session-store.db.sessions table instead.
+    let cwd = resolve_session_store_cwd(session_store, session_id);
+    CopilotAppSessionMeta { title, cwd }
 }
 
 /// Convert Copilot App `created_at` (`YYYY-MM-DD HH:MM:SS` UTC) to ISO 8601.
@@ -2874,6 +2901,8 @@ struct CopilotCliAgentRow {
     /// `initiator` of the first event for this agent, used only to label
     /// subagent `agent_role` when it is `'sub-agent'`. Never guessed.
     initiator: Option<String>,
+    /// Working directory from `session-store.db.sessions.cwd`.
+    cwd: Option<String>,
     input_tokens: u64,
     output_tokens: u64,
     cache_read: u64,
@@ -3176,6 +3205,9 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
 
     let mut all_session_rows: HashMap<String, Vec<CopilotCliAgentRow>> = HashMap::new();
     for session_id in &touched_cli_sessions {
+        // Resolve CWD once per session from session-store.db.sessions.
+        let session_cwd = resolve_session_store_cwd(&session_store, session_id);
+
         let rows_res = agg_stmt.query_map(params![session_id], |row| {
             let raw_input: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0);
             let cache_read: i64 = row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0);
@@ -3187,6 +3219,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
                 model: row.get::<_, Option<String>>(1)?,
                 agent_id: row.get::<_, Option<String>>(2)?,
                 initiator: row.get::<_, Option<String>>(3)?,
+                cwd: session_cwd.clone(),
                 input_tokens: net_input,
                 output_tokens: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as u64,
                 cache_read: cache_read as u64,
@@ -3403,7 +3436,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
                     parent_session_id, agent_nickname, agent_role
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?,
-                    NULL, NULL, NULL, ?, ?, ?,
+                    NULL, ?, NULL, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
                     ?, NULL, ?, NULL,
@@ -3417,6 +3450,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
                     date_str,
                     row_session_id,
                     session_name,
+                    row.cwd.as_deref(),
                     // CLI sessions aggregate across all turns into a single
                     // row per agent, so turn_no is fixed at 1.
                     1i64,
@@ -3491,6 +3525,115 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
             hook_replaced
         );
     }
+    Ok(())
+}
+
+/// One-time backfill: populate `cwd` for Copilot rows that were written before
+/// CWD was resolved from `session-store.db.sessions`. Covers both `copilot-cli`
+/// and `copilot-app` source kinds. Only fills rows where `cwd IS NULL` and the
+/// session-store has a non-trivial CWD for the session.
+fn backfill_copilot_cwd(conn: &mut Connection) -> Result<(), String> {
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![COPILOT_CWD_BACKFILL_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if migration_done {
+        return Ok(());
+    }
+
+    let copilot_dir = get_copilot_dir();
+    let session_store_path = copilot_dir.join("session-store.db");
+    if !session_store_path.exists() {
+        // Nothing to backfill from; mark as done so we don't retry every sync.
+        return mark_copilot_cwd_backfill_done(conn);
+    }
+
+    let session_store = match Connection::open_with_flags(
+        &session_store_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(_) => return mark_copilot_cwd_backfill_done(conn),
+    };
+    let _ = session_store.busy_timeout(std::time::Duration::from_secs(2));
+
+    let sessions_table_exists: bool = session_store
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !sessions_table_exists {
+        return mark_copilot_cwd_backfill_done(conn);
+    }
+
+    // Collect distinct session_ids that need a CWD backfill.
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT session_id FROM usage_entries
+             WHERE assistant_type = 'copilot' AND cwd IS NULL",
+        )
+        .map_err(|e| format!("準備 Copilot CWD backfill 查詢失敗: {}", e))?;
+    let session_ids: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("執行 Copilot CWD backfill 查詢失敗: {}", e))?
+        .filter_map(Result::ok)
+        .collect();
+    drop(stmt);
+
+    if session_ids.is_empty() {
+        return mark_copilot_cwd_backfill_done(conn);
+    }
+
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("開啟 Copilot CWD backfill transaction 失敗: {}", e))?;
+
+    let mut updated = 0usize;
+    for session_id in &session_ids {
+        let cwd = match resolve_session_store_cwd(&session_store, session_id) {
+            Some(cwd) => cwd,
+            None => continue,
+        };
+        updated += tx
+            .execute(
+                "UPDATE usage_entries
+                 SET cwd = ?
+                 WHERE assistant_type = 'copilot'
+                   AND session_id = ?
+                   AND cwd IS NULL",
+                params![cwd, session_id],
+            )
+            .map_err(|e| format!("更新 Copilot CWD 失敗 (session {}): {}", session_id, e))?;
+    }
+
+    tx.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+         VALUES (?, 1, 0)",
+        params![COPILOT_CWD_BACKFILL_MIGRATION_KEY],
+    )
+    .map_err(|e| format!("寫入 Copilot CWD backfill marker 失敗: {}", e))?;
+
+    tx.commit()
+        .map_err(|e| format!("Copilot CWD backfill COMMIT 失敗: {}", e))?;
+
+    if updated > 0 {
+        println!("✅ 補填 Copilot CWD：{} 筆", updated);
+    }
+    Ok(())
+}
+
+fn mark_copilot_cwd_backfill_done(conn: &mut Connection) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+         VALUES (?, 1, 0)",
+        params![COPILOT_CWD_BACKFILL_MIGRATION_KEY],
+    )
+    .map_err(|e| format!("寫入 Copilot CWD backfill marker 失敗: {}", e))?;
     Ok(())
 }
 
@@ -5551,6 +5694,12 @@ pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
         eprintln!("❌ 同步 Copilot CLI agent reconciliation 失敗: {}", e);
     }
 
+    // 5b. Backfill CWD for Copilot rows written before CWD was resolved from
+    // session-store.db.sessions.
+    if let Err(e) = backfill_copilot_cwd(conn) {
+        eprintln!("❌ 補填 Copilot CWD 失敗: {}", e);
+    }
+
     // 6. Sync Codex CLI and Desktop
     if let Err(e) = sync_codex_usage_logs(conn) {
         eprintln!("❌ 同步 Codex 失敗: {}", e);
@@ -7391,6 +7540,30 @@ mod tests {
             )
             .unwrap();
         store
+            .execute(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    cwd TEXT,
+                    repository TEXT,
+                    host_type TEXT,
+                    branch TEXT,
+                    summary TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+        store
+    }
+
+    fn insert_test_session_cwd(store: &Connection, session_id: &str, cwd: &str) {
+        store
+            .execute(
+                "INSERT INTO sessions (id, cwd) VALUES (?, ?)",
+                params![session_id, cwd],
+            )
+            .unwrap();
     }
 
     fn insert_test_copilot_event(
@@ -10228,6 +10401,99 @@ mod tests {
         let _ = fs::remove_dir_all(base_dir);
     }
 
+    #[test]
+    fn sync_copilot_app_usage_logs_populates_cwd_from_session_store() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-cwd").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY, session_id TEXT, turn_index INTEGER,
+                    model TEXT, agent_id TEXT, initiator TEXT,
+                    input_tokens INTEGER, output_tokens INTEGER,
+                    cache_read_tokens INTEGER, cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER, duration_ms INTEGER,
+                    reasoning_effort TEXT, created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, cwd TEXT, repository TEXT,
+                    host_type TEXT, branch TEXT, summary TEXT,
+                    created_at TEXT, updated_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+        let session_id = "app-cwd-session";
+        session_store
+            .execute(
+                "INSERT INTO sessions (id, cwd) VALUES (?, '/Users/test/app-project')",
+                params![session_id],
+            )
+            .unwrap();
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms, reasoning_effort, created_at)
+                 VALUES (1, ?, 0, 'gpt-5', NULL, NULL, 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                params![session_id],
+            )
+            .unwrap();
+
+        let data_db = Connection::open(app_dir.join("data.db")).unwrap();
+        data_db
+            .execute(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT)",
+                [],
+            )
+            .unwrap();
+        data_db
+            .execute(
+                "INSERT INTO sessions (id, title) VALUES (?, 'App CWD Test')",
+                params![session_id],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let cwd: Option<String> = conn
+            .query_row(
+                "SELECT cwd FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ?",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cwd.as_deref(),
+            Some("/Users/test/app-project"),
+            "App row must have CWD from session-store.db.sessions"
+        );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
     /// Verify that a turn which receives additional API calls after the first
     /// sync is re-aggregated from the full event history and upserted, rather
     /// than being silently dropped by INSERT OR IGNORE.
@@ -12968,6 +13234,7 @@ mod tests {
         tokens_output: i64,
         tokens_reasoning: i64,
         tokens_cache_read: i64,
+        cwd: Option<String>,
     }
 
     /// Read the per-agent rows for a CLI session.
@@ -12977,7 +13244,7 @@ mod tests {
                 "SELECT session_id, model, parent_session_id, tokens_total,
                         agent_nickname, agent_role,
                         tokens_input, tokens_output, tokens_reasoning,
-                        tokens_cache_read
+                        tokens_cache_read, cwd
                  FROM usage_entries
                  WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
                    AND (session_id = ? OR session_id LIKE ? ESCAPE '\\')
@@ -12997,6 +13264,7 @@ mod tests {
                     tokens_output: row.get(7)?,
                     tokens_reasoning: row.get(8)?,
                     tokens_cache_read: row.get(9)?,
+                    cwd: row.get(10)?,
                 })
             })
             .unwrap();
@@ -13167,6 +13435,164 @@ mod tests {
         assert_eq!(sub2.tokens_output, 9223);
         assert_eq!(sub2.tokens_reasoning, 660);
         assert_eq!(sub2.tokens_cache_read, 0);
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_populates_cwd_from_sessions_table() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-cwd").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "cwd-test-session";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[session_id]);
+        build_validation_fixture_events(&store, session_id);
+        // Seed CWD in the sessions table.
+        insert_test_session_cwd(&store, session_id, "/Users/test/project");
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, session_id, 995262);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        let rows = read_cli_agent_rows(&conn, session_id);
+        assert_eq!(rows.len(), 3, "must produce 1 main + 2 subagent rows");
+        // Every per-agent row — main and subagents alike — must carry the
+        // session's CWD resolved from session-store.db.sessions.
+        for row in &rows {
+            assert_eq!(
+                row.cwd.as_deref(),
+                Some("/Users/test/project"),
+                "row {:?} must have CWD",
+                row.session_id
+            );
+        }
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_cwd_null_when_sessions_table_empty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-cwd-empty").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "cwd-null-session";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[session_id]);
+        build_validation_fixture_events(&store, session_id);
+        // No session row in the sessions table → CWD should remain NULL.
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, session_id, 995262);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        let rows = read_cli_agent_rows(&conn, session_id);
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            assert!(
+                row.cwd.is_none(),
+                "CWD must be NULL when sessions table has no entry"
+            );
+        }
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn backfill_copilot_cwd_updates_existing_null_rows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("backfill-cwd").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let store = create_test_copilot_session_store(&app_dir);
+        let session_a = "backfill-session-a";
+        let session_b = "backfill-session-b";
+        insert_test_session_cwd(&store, session_a, "/Users/test/projectA");
+        insert_test_session_cwd(&store, session_b, "/Users/test/projectB");
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Insert existing copilot rows with NULL cwd (simulating pre-fix state).
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, session_name,
+                turn_no, model, tokens_total, cwd
+             ) VALUES
+                ('copilot', 'copilot-cli', '2026-07-22T10:00:00Z', '2026-07-22', ?, 'A', 1, 'gpt-5', 100, NULL),
+                ('copilot', 'copilot-cli', '2026-07-22T10:01:00Z', '2026-07-22', ?, 'B', 1, 'gpt-5', 200, NULL),
+                ('copilot', 'copilot-app', '2026-07-22T10:02:00Z', '2026-07-22', ?, 'A2', 1, 'gpt-5', 300, NULL)",
+            params![session_a, session_b, session_a],
+        )
+        .unwrap();
+
+        // Also insert a row that already has a CWD — must not be overwritten.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, session_name,
+                turn_no, model, tokens_total, cwd
+             ) VALUES
+                ('copilot', 'copilot-cli', '2026-07-22T10:03:00Z', '2026-07-22', ?, 'C', 2, 'gpt-5', 400, '/existing')",
+            params![session_a],
+        )
+        .unwrap();
+
+        backfill_copilot_cwd(&mut conn).unwrap();
+
+        let cwd_a: Vec<Option<String>> = conn
+            .prepare("SELECT cwd FROM usage_entries WHERE session_id = ? ORDER BY id")
+            .unwrap()
+            .query_map(params![session_a], |row| row.get::<_, Option<String>>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(cwd_a.len(), 3);
+        // Two NULL rows for session_a are backfilled.
+        assert_eq!(cwd_a[0].as_deref(), Some("/Users/test/projectA"));
+        assert_eq!(cwd_a[1].as_deref(), Some("/Users/test/projectA"));
+        // The pre-existing CWD is preserved.
+        assert_eq!(cwd_a[2].as_deref(), Some("/existing"));
+
+        let cwd_b: Option<String> = conn
+            .query_row(
+                "SELECT cwd FROM usage_entries WHERE session_id = ?",
+                params![session_b],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cwd_b.as_deref(), Some("/Users/test/projectB"));
+
+        // Second run is a no-op (migration marker set).
+        backfill_copilot_cwd(&mut conn).unwrap();
 
         if let Some(value) = old_dir {
             std::env::set_var("COPILOT_DIR", value);
