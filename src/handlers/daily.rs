@@ -48,7 +48,7 @@ fn aggregate_usage_details(
             .clone()
             .unwrap_or_else(|| "legacy".to_string());
         let key = (source_kind, e.session_id.clone(), e.source_dir_key.clone());
-        let (list, _) = sessions_map
+        let (list, _stored_ast_type) = sessions_map
             .entry(key)
             .or_insert_with(|| (Vec::new(), ast_type.clone()));
         list.push(e.clone());
