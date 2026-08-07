@@ -95,12 +95,6 @@ fn aggregate_usage_details(
         summary.total_duration_ms += session_duration;
         summary.total_requests += session_requests;
 
-        let total_input_tokens = session_usage.usage.input_tokens;
-        let total_output_tokens = session_usage.usage.output_tokens;
-        let total_cache_read_tokens = session_usage.usage.cache_read_tokens;
-        let total_cache_write_tokens = session_usage.usage.cache_write_tokens;
-        let total_reasoning_tokens = session_usage.usage.reasoning_tokens;
-        let cost_usd = session_usage.usage.cost_usd;
         add_usage_to_day_summary(&mut summary, &session_usage.usage);
 
         sessions_summary.push(SessionSummary {
@@ -114,16 +108,16 @@ fn aggregate_usage_details(
             cwd: last_entry.cwd.unwrap_or_default(),
             model: session_usage.display_model,
             total_tokens: session_usage.usage.total_tokens,
-            total_input_tokens,
-            total_output_tokens,
-            total_cache_read_tokens,
-            total_cache_write_tokens,
-            total_reasoning_tokens,
+            total_input_tokens: session_usage.usage.input_tokens,
+            total_output_tokens: session_usage.usage.output_tokens,
+            total_cache_read_tokens: session_usage.usage.cache_read_tokens,
+            total_cache_write_tokens: session_usage.usage.cache_write_tokens,
+            total_reasoning_tokens: session_usage.usage.reasoning_tokens,
             max_turn_no: s_entries.iter().map(|e| e.turn_no).max().unwrap_or(1),
             timestamp: s_entries[0].timestamp.clone(),
             duration_ms: session_duration,
             total_requests: session_requests,
-            cost_usd,
+            cost_usd: session_usage.usage.cost_usd,
             parent_session_id: last_entry.parent_session_id.clone(),
             agent_nickname: last_entry.agent_nickname.clone(),
             agent_role: last_entry.agent_role.clone(),
@@ -1696,6 +1690,11 @@ mod tests {
                 .map(|session| session.total_reasoning_tokens)
                 .sum::<u64>()
         );
+        assert!(
+            (summary.total_cost_usd - sessions.iter().map(|session| session.cost_usd).sum::<f64>())
+                .abs()
+                < 1e-9
+        );
         assert_eq!(summary.total_sessions, sessions.len());
     }
 
@@ -1984,12 +1983,20 @@ mod tests {
                 "copilot",
             ),
         ];
-        let rules = [PricingRule {
-            model_name: "gpt-5".to_string(),
-            input_price: 1.0,
-            cache_input_price: 0.1,
-            output_price: 2.0,
-        }];
+        let rules = [
+            PricingRule {
+                model_name: "gpt-5".to_string(),
+                input_price: 1.0,
+                cache_input_price: 0.1,
+                output_price: 2.0,
+            },
+            PricingRule {
+                model_name: "gpt-5-mini".to_string(),
+                input_price: 0.5,
+                cache_input_price: 0.05,
+                output_price: 1.0,
+            },
+        ];
 
         let (summary, sessions, _) = aggregate_usage_details(&entries_with_type, &rules);
 
@@ -2066,12 +2073,20 @@ mod tests {
                 "antigravity",
             ),
         ];
-        let rules = [PricingRule {
-            model_name: "gemini-2.5".to_string(),
-            input_price: 1.0,
-            cache_input_price: 0.1,
-            output_price: 2.0,
-        }];
+        let rules = [
+            PricingRule {
+                model_name: "gemini-2.5-pro".to_string(),
+                input_price: 1.0,
+                cache_input_price: 0.1,
+                output_price: 2.0,
+            },
+            PricingRule {
+                model_name: "gemini-2.5-flash".to_string(),
+                input_price: 0.5,
+                cache_input_price: 0.05,
+                output_price: 1.0,
+            },
+        ];
 
         let (summary, sessions, _) = aggregate_usage_details(&entries_with_type, &rules);
 
