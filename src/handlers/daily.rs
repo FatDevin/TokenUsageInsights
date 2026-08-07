@@ -36,6 +36,9 @@ fn aggregate_usage_details(
     pricing_rules: &[PricingRule],
 ) -> (DaySummary, Vec<SessionSummary>, Vec<UsageEntry>) {
     let mut summary = DaySummary::default();
+    // Session identity = (source_kind, session_id, source_dir_key) so that rows from
+    // different sources (copilot-cli, copilot-app, vscode-chat) with the same session_id
+    // are not merged, and different COPILOT_APP_DIR values remain isolated.
     type SessionKey = (String, String, Option<String>);
     let mut sessions_map: HashMap<SessionKey, (Vec<UsageEntry>, String)> = HashMap::new();
     let mut entries = Vec::new();
