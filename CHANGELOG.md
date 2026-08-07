@@ -4,6 +4,10 @@
 
 ## [未發行]
 
+目前沒有尚未發行的變更。
+
+## [0.6.4] - 2026-08-08
+
 ### 修正
 
 - 修正 GitHub Copilot CLI 與 App 工作目錄 (CWD) 無法顯示的問題。CLI Agent 覆蓋原本含 CWD 的 hook rows 時硬編碼 `cwd = NULL`，App 路徑也從未設定 CWD。現在改從 `session-store.db.sessions` 表取得 CWD，並新增一次性回填遷移補齊既有資料。
@@ -11,6 +15,20 @@
 ### 資料影響
 
 - 新增 `migration:copilot_cwd_backfill_v1` 一次性遷移：掃描 `usage_entries` 中 `assistant_type = 'copilot'` 且 `cwd IS NULL` 的記錄，從 `session-store.db.sessions` 補填工作目錄，不影響其他助理資料。
+
+## [0.6.3] - 2026-08-07
+
+### 新增與改善
+
+- 新增 Claude Opus 5 模型定價規則。
+- 完成五語系文件（繁中、簡中、英文、日文、韓文）與網站介面本地化。
+- 整理一頁式介紹頁總結並完成 GitHub Pages 發佈設定。
+- 調整首頁 footer 版面與課程連結呈現。
+
+### 修正
+
+- 修正每日 Token 摘要重複計算的問題，避免同一 Session 跨多筆記錄時總量被加倍。
+- 容錯處理 VS Code Copilot 聊天記錄中的未成對 UTF-16 代理字元（lone surrogate），避免解析時發生 panic。
 
 ## [0.6.2] - 2026-08-01
 
