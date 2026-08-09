@@ -195,7 +195,11 @@ function updateUrlParams() {
     if (dateSelect && dateSelect.value) {
       url.searchParams.set('date', dateSelect.value);
     }
-    if (currentSessionCwdFilter) {
+    // 尚未依 Session 清單比對完成前，保留網址原始的 dir 參數
+    if (sessionCwdFilterFromUrl) {
+      const rawDir = initialUrlParams.get('dir');
+      if (rawDir) url.searchParams.set('dir', rawDir);
+    } else if (currentSessionCwdFilter) {
       url.searchParams.set('dir', currentSessionCwdFilter);
     }
     url.searchParams.set('chart', dailyChartMode);
@@ -2196,6 +2200,9 @@ function renderDashboard(data) {
   currentSessionSearchDataFingerprint = nextSearchFingerprint;
   currentSessions = [...allSessions];
   updateSessionCwdFilterOptions(currentSessions);
+  if (activeTab === 'daily') {
+    updateUrlParams();
+  }
 
   const dailyViewData = buildDailyViewData(data);
   const { summary, sessions } = dailyViewData;
