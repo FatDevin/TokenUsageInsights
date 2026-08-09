@@ -3458,11 +3458,24 @@ function updateSessionCwdFilterOptions(sessions) {
       if (uniqueDirectories.has(requested.directKey)) {
         resolvedKey = requested.directKey;
       } else {
-        const suffixMatches = directories.filter(directory => {
-          const displayKey = sessionCwdMatchKey(directory.displayPath);
-          return directory.matchKey.endsWith(requested.normalizedInput)
-            || displayKey.endsWith(requested.normalizedInput);
-        });
+        // 尾碼比對需對齊路徑分隔邊界，避免 TokenUsageInsights 誤配 myTokenUsageInsights
+        const lowerInput = requested.normalizedInput.toLocaleLowerCase('en-US');
+        const matchesPathBoundary = (key) => {
+          if (key.endsWith(requested.normalizedInput)) {
+            const boundary = key.charAt(key.length - requested.normalizedInput.length - 1);
+            return boundary === '' || boundary === '/' || boundary === '\\';
+          }
+          const lowerKey = key.toLocaleLowerCase('en-US');
+          if (lowerKey.endsWith(lowerInput)) {
+            const boundary = lowerKey.charAt(lowerKey.length - lowerInput.length - 1);
+            return boundary === '' || boundary === '/' || boundary === '\\';
+          }
+          return false;
+        };
+        const suffixMatches = directories.filter(directory => (
+          matchesPathBoundary(directory.matchKey)
+            || matchesPathBoundary(sessionCwdMatchKey(directory.displayPath))
+        ));
         if (suffixMatches.length === 1) {
           resolvedKey = suffixMatches[0].matchKey;
         }
