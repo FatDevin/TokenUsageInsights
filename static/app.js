@@ -5944,7 +5944,8 @@ function showNotification(message, type = 'info') {
     color = 'var(--neon-red)';
   }
 
-  toast.innerHTML = `<span class="toast-kind" style="color: ${color};">${icon}</span> <span style="color: ${color}; font-family: var(--font-display);">${message}</span>`;
+  toast.innerHTML = `<span class="toast-kind" style="color: ${color};">${icon}</span> <span style="color: ${color}; font-family: var(--font-display);"></span>`;
+  toast.lastElementChild.textContent = message;
   container.appendChild(toast);
 
   setTimeout(() => {
