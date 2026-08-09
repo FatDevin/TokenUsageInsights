@@ -104,6 +104,31 @@ Drive letters, paths containing spaces or non-ASCII characters, and UNC paths ar
 
 * * *
 
+## URL parameters (deep links)
+
+The dashboard supports URL query parameters for opening a specific state directly, making it easy to bookmark, share links, or jump in from other tools. When you switch agent, view, date, working directory, or chart type on the dashboard, the URL is automatically updated to reflect the current state.
+
+| Parameter | Applies to | Values | Description |
+| --- | --- | --- | --- |
+| `agent` | All views | `antigravity`, `copilot`, `codex`, `claude`, `cursor`, `grok` | Selects the coding agent to display. Aliases such as `claude-code` and `grok-build` are also supported |
+| `tab` | All views | `daily`, `monthly`, `yearly` | Selects the daily, monthly, or yearly view |
+| `date` | All views | `daily`: `YYYY-MM-DD`; `monthly`: `YYYY-MM`; `yearly`: `YYYY` | Selects the date, month, or year to display; the format follows `tab` automatically |
+| `dir` | `daily` | Full path, `~`-prefixed home path, or a unique path suffix (e.g. `TokenUsageInsights`) | Filters the daily view by working directory. Windows paths are case-insensitive; if no directory matches, all directories are shown |
+| `chart` | `daily` | `kline`, `trend` | Selects the daily chart type: candlestick (K-line) or trend chart |
+
+Examples (`http://localhost:3003` is the default URL; adjust to your actual `HOST`/`PORT`):
+
+```text
+http://localhost:3003/?agent=copilot&tab=monthly&date=2026-08
+http://localhost:3003/?agent=codex&tab=yearly&date=2026
+http://localhost:3003/?agent=claude&tab=daily&date=2026-08-09&chart=trend
+http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/TokenUsageInsights
+```
+
+> URL-encode paths that contain `~`, spaces, or non-ASCII characters (`~` can be encoded as `%7E`). Parameters that are not provided fall back to the state from your last visit (Cookie / localStorage).
+
+* * *
+
 ## Google Antigravity CLI setup
 
 Antigravity CLI requires connecting this project's Status Line script to `settings.json`. The script writes cumulative and incremental tokens after each conversation to:

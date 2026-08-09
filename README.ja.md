@@ -104,6 +104,31 @@ Windows ではデフォルトで次のネイティブパスを使用します：
 
 * * *
 
+## URL パラメータ（ディープリンク）
+
+ダッシュボードは URL クエリパラメータで特定の状態を直接開くことができ、ブックマークへの追加、リンクの共有、他のツールからの遷移に便利です。ダッシュボード上で Agent、ビュー、日付、作業ディレクトリ、グラフの種類を切り替えると、URL も現在の状態に自動的に更新されます。
+
+| パラメータ | 対象ビュー | 指定できる値 | 説明 |
+| --- | --- | --- | --- |
+| `agent` | すべて | `antigravity`、`copilot`、`codex`、`claude`、`cursor`、`grok` | 表示する Coding Agent を指定します。`claude-code`、`grok-build` などのエイリアスも利用可能です |
+| `tab` | すべて | `daily`、`monthly`、`yearly` | 日別（daily）、月別（monthly）、年別（yearly）ビューを指定します |
+| `date` | すべて | `daily`: `YYYY-MM-DD`、`monthly`: `YYYY-MM`、`yearly`: `YYYY` | 表示する日付・月・年を指定します。形式は `tab` に応じて自動的に対応します |
+| `dir` | `daily` | フルパス、`~` で始まるホームディレクトリのパス、または一意のパス末尾（例：`TokenUsageInsights`） | 日別ビューの作業ディレクトリフィルターを指定します。Windows パスは大文字小文字を区別しません。一致するディレクトリがない場合はすべて表示されます |
+| `chart` | `daily` | `kline`、`trend` | 日別ビューのグラフの種類（ローソク足チャートまたはトレンドチャート）を指定します |
+
+例（`http://localhost:3003` はデフォルトの URL です。実際の `HOST`/`PORT` に合わせて調整してください）：
+
+```text
+http://localhost:3003/?agent=copilot&tab=monthly&date=2026-08
+http://localhost:3003/?agent=codex&tab=yearly&date=2026
+http://localhost:3003/?agent=claude&tab=daily&date=2026-08-09&chart=trend
+http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/TokenUsageInsights
+```
+
+> パスに `~`、スペース、非 ASCII 文字が含まれる場合は URL エンコードしてください（`~` は `%7E` にエンコード可能）。指定されなかったパラメータは前回の閲覧状態（Cookie / localStorage）が引き継がれます。
+
+* * *
+
 ## Google Antigravity CLI の設定
 
 Antigravity CLI では、このプロジェクトの Status Line スクリプトを `settings.json` に接続する必要があります。スクリプトは各会話後の累計 Token と増分を次へ書き込みます：
