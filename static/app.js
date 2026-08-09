@@ -3458,19 +3458,15 @@ function updateSessionCwdFilterOptions(sessions) {
       if (uniqueDirectories.has(requested.directKey)) {
         resolvedKey = requested.directKey;
       } else {
-        // 尾碼比對需對齊路徑分隔邊界，避免 TokenUsageInsights 誤配 myTokenUsageInsights
+        // 尾碼比對需對齊路徑分隔邊界，避免 TokenUsageInsights 誤配 myTokenUsageInsights。
+        // 一律用不分大小寫比對（Windows 路徑不分大小寫；POSIX 的混用大小寫情境極少，且仍需唯一比對才會採用）。
+        // 當輸入恰好等於完整 key 時，邊界索引為 -1，charAt(-1) 回傳 ''，視為完全比對通過。
         const lowerInput = requested.normalizedInput.toLocaleLowerCase('en-US');
         const matchesPathBoundary = (key) => {
-          if (key.endsWith(requested.normalizedInput)) {
-            const boundary = key.charAt(key.length - requested.normalizedInput.length - 1);
-            return boundary === '' || boundary === '/' || boundary === '\\';
-          }
           const lowerKey = key.toLocaleLowerCase('en-US');
-          if (lowerKey.endsWith(lowerInput)) {
-            const boundary = lowerKey.charAt(lowerKey.length - lowerInput.length - 1);
-            return boundary === '' || boundary === '/' || boundary === '\\';
-          }
-          return false;
+          if (!lowerKey.endsWith(lowerInput)) return false;
+          const boundary = lowerKey.charAt(lowerKey.length - lowerInput.length - 1);
+          return boundary === '' || boundary === '/' || boundary === '\\';
         };
         const suffixMatches = directories.filter(directory => (
           matchesPathBoundary(directory.matchKey)
