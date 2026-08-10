@@ -2,11 +2,17 @@
 
 本文件記錄 TokenUsageInsights 各正式版本的實際變更。內容依 Git 標籤間的提交記錄與檔案差異整理，格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)，版本編號遵循 [Semantic Versioning](https://semver.org/lang/zh-TW/)。
 
-## [未發行]
+## [0.7.0] - 2026-08-11
 
 ### 新增與改善
 
 - 看板支援以網址查詢參數直接開啟指定狀態的畫面：`agent` 指定 Coding Agent、`tab` 指定日 / 月 / 年視圖、`date` 指定日期、月份或年份，並新增 `dir`（每日視圖工作目錄篩選，支援完整路徑、`~` 家目錄寫法與唯一路徑尾碼比對）與 `chart`（每日圖表類型 `kline` / `trend`）參數。切換 Agent、視圖、日期、工作目錄或圖表類型時網址會自動同步，方便加入書籤與分享連結。五種語系的 README 皆已補上用法說明。
+
+### 修正
+
+- 修正每日視圖工作目錄篩選的尾碼比對，改以路徑分隔邊界為準並統一不分大小寫，避免誤配較長的目錄名稱。
+- 通知訊息改用 `textContent` 寫入，消除 XSS 注入風險（CodeQL `js/xss-through-exception`）。
+- 補充 kimi-k3 模型價格規則，修復成本計算失敗的問題。
 
 ## [0.6.4] - 2026-08-08
 
