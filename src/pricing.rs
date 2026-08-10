@@ -624,4 +624,14 @@ mod tests {
         assert!((long_context - 0.402).abs() < 1e-12);
         assert!((grok_45 - 0.23).abs() < 1e-12);
     }
+
+    #[test]
+    fn kimi_k3_resolves_pricing_from_csv() {
+        let rules = load_pricing_rules();
+
+        let cost = calculate_usage_cost(&rules, Some("kimi-k3"), 1_000_000, 1_000_000, 0, 0, 0)
+            .expect("kimi-k3 should have a pricing rule");
+        // input 3.00 + output 15.00 = 18.00
+        assert!((cost - 18.0).abs() < 1e-12);
+    }
 }
