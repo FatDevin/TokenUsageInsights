@@ -104,6 +104,31 @@ Windows는 기본적으로 다음 네이티브 경로를 사용합니다.
 
 * * *
 
+## URL 매개변수(딥 링크)
+
+대시보드는 URL 쿼리 매개변수로 특정 상태를 바로 열 수 있어서, 북마크에 추가하거나 링크를 공유하거나 다른 도구에서 바로 이동하기에 편리합니다. 대시보드에서 Agent, 보기, 날짜, 작업 디렉터리, 차트 유형을 전환하면 URL도 현재 상태로 자동 업데이트됩니다.
+
+| 매개변수 | 적용 보기 | 사용 가능한 값 | 설명 |
+| --- | --- | --- | --- |
+| `agent` | 전체 | `antigravity`, `copilot`, `codex`, `claude`, `cursor`, `grok` | 표시할 Coding Agent를 지정합니다. `claude-code`, `grok-build` 같은 별칭도 지원합니다 |
+| `tab` | 전체 | `daily`, `monthly`, `yearly` | 일별(daily), 월별(monthly), 연별(yearly) 보기를 지정합니다 |
+| `date` | 전체 | `daily`: `YYYY-MM-DD`, `monthly`: `YYYY-MM`, `yearly`: `YYYY` | 표시할 날짜·월·연도를 지정하며, 형식은 `tab`에 따라 자동으로 매핑됩니다 |
+| `dir` | `daily` | 전체 경로, `~`로 시작하는 홈 디렉터리 경로, 또는 고유한 경로 접미사(예: `TokenUsageInsights`) | 일별 보기의 작업 디렉터리 필터를 지정합니다. Windows 경로는 대소문자를 구분하지 않으며, 일치하는 디렉터리가 없으면 전체를 표시합니다 |
+| `chart` | `daily` | `kline`, `trend` | 일별 보기의 차트 유형(캔들차트 또는 추세 차트)을 지정합니다 |
+
+예시(`http://localhost:3003`은 기본 URL이며, 실제 `HOST`/`PORT`에 맞게 조정하세요):
+
+```text
+http://localhost:3003/?agent=copilot&tab=monthly&date=2026-08
+http://localhost:3003/?agent=codex&tab=yearly&date=2026
+http://localhost:3003/?agent=claude&tab=daily&date=2026-08-09&chart=trend
+http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/TokenUsageInsights
+```
+
+> 경로에 `~`, 공백 또는 비 ASCII 문자가 포함된 경우 URL 인코딩을 먼저 적용하세요(`~`는 `%7E`로 인코딩 가능). 지정하지 않은 매개변수는 마지막으로 사용한 상태(Cookie / localStorage)를 이어받습니다.
+
+* * *
+
 ## Google Antigravity CLI 설정
 
 Antigravity CLI는 이 프로젝트의 Status Line 스크립트를 `settings.json`에 연결해야 합니다. 스크립트는 각 대화 후 누적 Token과 증분을 다음 위치에 기록합니다.

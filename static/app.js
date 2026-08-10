@@ -41,8 +41,12 @@ const DAILY_CHART_MA_WINDOW = 5;
 const DAILY_CHART_MAX_VISIBLE_CANDLES = 24;
 const utf8TextEncoder = new TextEncoder();
 
+const initialUrlParams = new URLSearchParams(window.location.search);
+const urlChartMode = String(initialUrlParams.get('chart') || '').trim().toLowerCase();
 const savedDailyChartMode = localStorage.getItem(DAILY_CHART_MODE_STORAGE_KEY);
-let dailyChartMode = savedDailyChartMode === 'trend' ? 'trend' : 'kline';
+let dailyChartMode = ['kline', 'trend'].includes(urlChartMode)
+  ? urlChartMode
+  : savedDailyChartMode === 'trend' ? 'trend' : 'kline';
 const savedDailyChartInterval = Number(localStorage.getItem(DAILY_CHART_INTERVAL_STORAGE_KEY));
 let dailyChartIntervalMinutes = DAILY_CHART_INTERVALS.includes(savedDailyChartInterval)
   ? savedDailyChartInterval
@@ -182,12 +186,23 @@ function updateUrlParams() {
   const url = new URL(window.location.href);
   url.searchParams.set('agent', currentAssistant);
   url.searchParams.set('tab', activeTab);
-  
+  url.searchParams.delete('date');
+  url.searchParams.delete('dir');
+  url.searchParams.delete('chart');
+
   if (activeTab === 'daily') {
     const dateSelect = document.getElementById('date-select');
     if (dateSelect && dateSelect.value) {
       url.searchParams.set('date', dateSelect.value);
     }
+    // 尚未依 Session 清單比對完成前，保留網址原始的 dir 參數
+    if (sessionCwdFilterFromUrl) {
+      const rawDir = initialUrlParams.get('dir');
+      if (rawDir) url.searchParams.set('dir', rawDir);
+    } else if (currentSessionCwdFilter) {
+      url.searchParams.set('dir', currentSessionCwdFilter);
+    }
+    url.searchParams.set('chart', dailyChartMode);
   } else if (activeTab === 'monthly') {
     const monthSelect = document.getElementById('month-select');
     if (monthSelect && monthSelect.value) {
@@ -199,7 +214,7 @@ function updateUrlParams() {
       url.searchParams.set('date', yearSelect.value);
     }
   }
-  
+
   window.history.replaceState(null, '', url.toString());
 }
 
@@ -225,6 +240,35 @@ let currentSessionAssistantType = '';
 let availableDates = [];
 let pricingRules = [];
 
+// Session table sorting state
+let currentSessions = [];
+let currentSortColumn = 'timestamp'; // Default sorted by starting time
+let currentSortDirection = 'desc';  // Default chronological order
+let currentSessionSearchContext = '';
+let currentSessionSearchDataFingerprint = '';
+let currentSessionSearchQuery = '';
+let currentSessionSearchMatches = null;
+let currentSessionSearchUnavailable = 0;
+let currentSessionSearchState = 'idle';
+let sessionSearchDebounceTimer = null;
+let sessionSearchAbortController = null;
+let currentSessionCwdFilter = '';
+let currentSessionHomeDir = '';
+let sessionCwdFilterFromUrl = false;
+
+// Monthly daily summary sorting state
+let monthlyDailySortColumn = 'date';
+let monthlyDailySortDirection = 'desc';
+let currentMonthlyChartData = [];
+
+// Yearly monthly summary sorting state
+let yearlyMonthlySortColumn = 'month';
+let yearlyMonthlySortDirection = 'desc';
+let currentYearlyBreakdown = [];
+let currentYearlyData = null;
+let yearlyChartInstance = null;
+let currentYearlyChartData = [];
+
 function getUtcDateString(date = new Date()) {
   const year = date.getUTCFullYear();
   const month = String(date.getUTCMonth() + 1).padStart(2, '0');
@@ -244,34 +288,6 @@ function renderSafeMarkdown(markdownText) {
 
   return DOMPurify.sanitize(parsedHtml);
 }
-
-// Session table sorting state
-let currentSessions = [];
-let currentSortColumn = 'timestamp'; // Default sorted by starting time
-let currentSortDirection = 'desc';  // Default chronological order
-let currentSessionSearchContext = '';
-let currentSessionSearchDataFingerprint = '';
-let currentSessionSearchQuery = '';
-let currentSessionSearchMatches = null;
-let currentSessionSearchUnavailable = 0;
-let currentSessionSearchState = 'idle';
-let sessionSearchDebounceTimer = null;
-let sessionSearchAbortController = null;
-let currentSessionCwdFilter = '';
-let currentSessionHomeDir = '';
-
-// Monthly daily summary sorting state
-let monthlyDailySortColumn = 'date';
-let monthlyDailySortDirection = 'desc';
-let currentMonthlyChartData = [];
-
-// Yearly monthly summary sorting state
-let yearlyMonthlySortColumn = 'month';
-let yearlyMonthlySortDirection = 'desc';
-let currentYearlyBreakdown = [];
-let currentYearlyData = null;
-let yearlyChartInstance = null;
-let currentYearlyChartData = [];
 
 // Live Auto-Refresh State
 let liveRefreshTimer = null;
@@ -596,8 +612,10 @@ function initApp() {
   if (sessionCwdFilter) {
     sessionCwdFilter.addEventListener('change', () => {
       currentSessionCwdFilter = sessionCwdFilter.value;
+      sessionCwdFilterFromUrl = false;
       sessionCwdFilter.title = sessionCwdFilter.selectedOptions[0]?.textContent
         || t('session_cwd_filter_aria_label');
+      updateUrlParams();
       resetDailyChartViewport();
       if (currentUsageData) {
         renderDashboard(currentUsageData);
@@ -2162,7 +2180,14 @@ function renderDashboard(data) {
   const nextSearchContext = `${currentAssistant}:${date}`;
   if (nextSearchContext !== currentSessionSearchContext) {
     resetSessionPromptSearch();
+    // 從網址帶入的工作目錄篩選需跨日期切換保留，待下方依實際 Session 清單比對
+    const urlDirRaw = initialUrlParams.get('dir');
+    const pendingUrlDirKey = resolveSessionCwdMatchKeyFromUrl(urlDirRaw, currentSessionHomeDir)?.directKey || null;
     resetSessionCwdFilter();
+    if (pendingUrlDirKey) {
+      currentSessionCwdFilter = pendingUrlDirKey;
+      sessionCwdFilterFromUrl = true;
+    }
     currentSessionSearchContext = nextSearchContext;
   }
   const nextSearchFingerprint = JSON.stringify(
@@ -2175,6 +2200,9 @@ function renderDashboard(data) {
   currentSessionSearchDataFingerprint = nextSearchFingerprint;
   currentSessions = [...allSessions];
   updateSessionCwdFilterOptions(currentSessions);
+  if (activeTab === 'daily') {
+    updateUrlParams();
+  }
 
   const dailyViewData = buildDailyViewData(data);
   const { summary, sessions } = dailyViewData;
@@ -2460,6 +2488,7 @@ function initDailyChartControls() {
     modeToggle.addEventListener('click', () => {
       dailyChartMode = dailyChartMode === 'kline' ? 'trend' : 'kline';
       localStorage.setItem(DAILY_CHART_MODE_STORAGE_KEY, dailyChartMode);
+      updateUrlParams();
       updateDailyChartControls();
       if (currentUsageData) {
         renderChart(buildDailyViewData(currentUsageData));
@@ -3310,8 +3339,28 @@ function abbreviateHomePath(value) {
 
 function resetSessionCwdFilter() {
   currentSessionCwdFilter = '';
+  sessionCwdFilterFromUrl = false;
   const select = document.getElementById('session-cwd-filter');
   if (select) select.value = '';
+}
+
+// 將網址的 dir 參數（完整路徑、~ 家目錄縮寫或尾碼片段）解析為篩選用的 match key
+function resolveSessionCwdMatchKeyFromUrl(rawValue, homeDir) {
+  const raw = String(rawValue || '').trim();
+  if (!raw) return null;
+
+  // 支援 ~ 與 ~/path 的家目錄縮寫寫法
+  let expanded = raw;
+  if (raw === '~' || raw.startsWith('~/') || raw.startsWith('~\\')) {
+    const normalizedHome = normalizeSessionCwd(homeDir);
+    if (normalizedHome) {
+      expanded = raw === '~' ? normalizedHome : normalizedHome + raw.slice(1);
+    }
+  }
+
+  const directKey = sessionCwdMatchKey(expanded);
+  if (!directKey) return null;
+  return { directKey, normalizedInput: normalizeSessionCwd(expanded) };
 }
 
 function getCwdFilteredSessions(sessions = currentSessions) {
@@ -3397,6 +3446,44 @@ function updateSessionCwdFilterOptions(sessions) {
     option.title = directory.displayPath;
     select.appendChild(option);
   });
+
+  if (sessionCwdFilterFromUrl) {
+    // 保留從網址帶入的篩選條件：先嘗試完整路徑比對，再以唯一尾碼比對
+    const requested = resolveSessionCwdMatchKeyFromUrl(
+      initialUrlParams.get('dir'),
+      currentSessionHomeDir
+    );
+    let resolvedKey = null;
+    if (requested) {
+      if (uniqueDirectories.has(requested.directKey)) {
+        resolvedKey = requested.directKey;
+      } else {
+        // 尾碼比對需對齊路徑分隔邊界，避免 TokenUsageInsights 誤配 myTokenUsageInsights。
+        // 一律用不分大小寫比對（Windows 路徑不分大小寫；POSIX 的混用大小寫情境極少，且仍需唯一比對才會採用）。
+        // 當輸入恰好等於完整 key 時，邊界索引為 -1，charAt(-1) 回傳 ''，視為完全比對通過。
+        const lowerInput = requested.normalizedInput.toLocaleLowerCase('en-US');
+        const matchesPathBoundary = (key) => {
+          const lowerKey = key.toLocaleLowerCase('en-US');
+          if (!lowerKey.endsWith(lowerInput)) return false;
+          const boundary = lowerKey.charAt(lowerKey.length - lowerInput.length - 1);
+          return boundary === '' || boundary === '/' || boundary === '\\';
+        };
+        const suffixMatches = directories.filter(directory => (
+          matchesPathBoundary(directory.matchKey)
+            || matchesPathBoundary(sessionCwdMatchKey(directory.displayPath))
+        ));
+        if (suffixMatches.length === 1) {
+          resolvedKey = suffixMatches[0].matchKey;
+        }
+      }
+    }
+    if (resolvedKey) {
+      currentSessionCwdFilter = resolvedKey;
+      select.title = uniqueDirectories.get(resolvedKey)?.displayPath
+        || t('session_cwd_filter_aria_label');
+    }
+    sessionCwdFilterFromUrl = false;
+  }
 
   select.disabled = directories.length === 0;
   select.value = currentSessionCwdFilter;
@@ -5857,7 +5944,8 @@ function showNotification(message, type = 'info') {
     color = 'var(--neon-red)';
   }
 
-  toast.innerHTML = `<span class="toast-kind" style="color: ${color};">${icon}</span> <span style="color: ${color}; font-family: var(--font-display);">${message}</span>`;
+  toast.innerHTML = `<span class="toast-kind" style="color: ${color};">${icon}</span> <span style="color: ${color}; font-family: var(--font-display);"></span>`;
+  toast.lastElementChild.textContent = message;
   container.appendChild(toast);
 
   setTimeout(() => {

@@ -104,6 +104,31 @@ Windows 默认使用以下原生路径：
 
 * * *
 
+## 网址参数（深层链接）
+
+看板支持通过网址查询参数（Query String）直接打开指定状态的画面，方便加入书签、分享链接，或从其他工具跳转过来。在看板上切换 Agent、视图、日期、工作目录或图表类型时，网址也会自动更新为当前的状态。
+
+| 参数 | 适用视图 | 可用值 | 说明 |
+| --- | --- | --- | --- |
+| `agent` | 全部 | `antigravity`、`copilot`、`codex`、`claude`、`cursor`、`grok` | 指定要显示的 Coding Agent。另支持 `claude-code`、`grok-build` 等别名写法 |
+| `tab` | 全部 | `daily`、`monthly`、`yearly` | 指定以日（每日）、月（月度）或年（年度）视图显示 |
+| `date` | 全部 | `daily`：`YYYY-MM-DD`；`monthly`：`YYYY-MM`；`yearly`：`YYYY` | 指定要显示的日期、月份或年份，格式会依 `tab` 自动对应 |
+| `dir` | `daily` | 完整路径、`~` 开头的家目录路径，或唯一的路径后缀（如 `TokenUsageInsights`） | 指定每日视图的工作目录筛选。Windows 路径不区分大小写；找不到匹配目录时会显示全部 |
+| `chart` | `daily` | `kline`、`trend` | 指定每日视图的图表类型：K 线图或趋势图 |
+
+示例（`http://localhost:3003` 为默认网址，请依实际 `HOST`/`PORT` 调整）：
+
+```text
+http://localhost:3003/?agent=copilot&tab=monthly&date=2026-08
+http://localhost:3003/?agent=codex&tab=yearly&date=2026
+http://localhost:3003/?agent=claude&tab=daily&date=2026-08-09&chart=trend
+http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/TokenUsageInsights
+```
+
+> 路径含有 `~`、空格或非 ASCII 字符时请先进行 URL 编码（`~` 可编码为 `%7E`）。未提供的参数会沿用上次浏览的状态（Cookie / localStorage）。
+
+* * *
+
 ## Google Antigravity CLI 设置
 
 Antigravity CLI 需要将本项目的 Status Line 脚本连接到 `settings.json`。脚本会把每次对话后的 Token 累计值与增量写入：
