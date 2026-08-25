@@ -634,4 +634,35 @@ mod tests {
         // input 3.00 + output 15.00 = 18.00
         assert!((cost - 18.0).abs() < 1e-12);
     }
+
+    #[test]
+    fn composer_2_5_speed_tiers_resolve_distinct_pricing_from_csv() {
+        let rules = load_pricing_rules();
+
+        let standard = calculate_usage_cost(
+            &rules,
+            Some("composer-2.5"),
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+        )
+        .expect("composer-2.5 should have a pricing rule");
+        // input 0.50 + cache read 0.20 + output 2.50 = 3.20
+        assert!((standard - 3.2).abs() < 1e-12);
+
+        let fast = calculate_usage_cost(
+            &rules,
+            Some("composer-2.5-fast"),
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+        )
+        .expect("composer-2.5-fast should have a pricing rule");
+        // input 3.00 + cache read 0.50 + output 15.00 = 18.50
+        assert!((fast - 18.5).abs() < 1e-12);
+    }
 }

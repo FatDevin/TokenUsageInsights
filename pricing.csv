@@ -99,6 +99,8 @@ gemma3,Local/OSS,1M Tokens,0.00,0.00,0.00,N/A
 qwen3-coder-next,Cloud,1M Tokens,0.144,0.036,0.574,N/A
 Cursor Agent,Cursor,1M Tokens,3.00,0.30,15.00,N/A
 cursor-small,Cursor,1M Tokens,0.10,0.00,0.10,N/A
+composer-2.5-fast,Cursor,1M Tokens,3.00,0.50,15.00,N/A
+composer-2.5,Cursor,1M Tokens,0.50,0.20,2.50,N/A
 claude-3-5-sonnet,Cursor,1M Tokens,3.00,0.30,15.00,N/A
 claude-3-5-haiku,Cursor,1M Tokens,0.80,0.08,4.00,N/A
 claude-3-opus,Cursor,1M Tokens,15.00,1.50,75.00,N/A
