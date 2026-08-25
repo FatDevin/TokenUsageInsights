@@ -2076,10 +2076,16 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // validated registry it is unsafe to classify any usage event as App.
     let data_db_path = app_dir.join("data.db");
     if !data_db_path.exists() {
-        eprintln!(
-            "⚠️ Copilot App 同步跳過：找不到 data.db ({})",
-            data_db_path.display()
-        );
+        // data.db is created by the Copilot App, not the CLI, so its absence
+        // is a normal state for CLI-only users. The sync loop runs every few
+        // seconds — log once per process instead of flooding the console.
+        static MISSING_DATA_DB_NOTICE: std::sync::Once = std::sync::Once::new();
+        MISSING_DATA_DB_NOTICE.call_once(|| {
+            eprintln!(
+                "ℹ️ Copilot App 同步跳過：找不到 data.db ({})，未安裝 Copilot App 時屬正常狀態",
+                data_db_path.display()
+            );
+        });
         return Ok(());
     }
     let data_db = match Connection::open_with_flags(
@@ -2969,15 +2975,15 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
     let cursor_key_prefix = format!("{}{}::", COPILOT_CLI_AGENT_CURSOR_PREFIX, source_key);
     let pending_key_prefix = format!("{}{}::", COPILOT_CLI_AGENT_PENDING_PREFIX, source_key);
 
-    // CLI reconciliation must not touch App sessions. The App registry
-    // (`data.db.sessions`) is authoritative; without it we cannot safely
-    // classify any session as CLI, so fall back to hook rows.
+    // CLI reconciliation must not touch App sessions. A missing data.db /
+    // sessions table yields an empty registry (normal for CLI-only users) —
+    // safe because a session only classifies as CLI when its transcript
+    // exists, so App sessions stay Unknown even with an empty registry.
+    // Genuine I/O or schema failures skip reconciliation, keeping hook rows.
     let data_db_path = copilot_dir.join("data.db");
     let app_session_ids: HashSet<String> = match load_copilot_app_session_registry(&data_db_path) {
         Ok(ids) => ids,
         Err(message) => {
-            // Missing data.db / sessions table is a normal state for CLI-only
-            // users; fall back silently. Other errors are surfaced.
             eprintln!("⚠️ Copilot CLI agent reconciliation 跳過：{}", message);
             return Ok(());
         }
@@ -3643,7 +3649,7 @@ fn mark_copilot_cwd_backfill_done(conn: &mut Connection) -> Result<(), String> {
 /// or schema failures so the caller can decide whether to fall back.
 fn load_copilot_app_session_registry(data_db_path: &Path) -> Result<HashSet<String>, String> {
     if !data_db_path.exists() {
-        return Err(format!("找不到 data.db ({})", data_db_path.display()));
+        return Ok(HashSet::new());
     }
     let data_db = Connection::open_with_flags(
         data_db_path,
@@ -3660,10 +3666,7 @@ fn load_copilot_app_session_registry(data_db_path: &Path) -> Result<HashSet<Stri
         )
         .unwrap_or(false);
     if !table_exists {
-        return Err(format!(
-            "data.db 缺少 sessions table ({})",
-            data_db_path.display()
-        ));
+        return Ok(HashSet::new());
     }
 
     let mut stmt = data_db
@@ -13435,6 +13438,51 @@ mod tests {
         assert_eq!(sub2.tokens_output, 9223);
         assert_eq!(sub2.tokens_reasoning, 660);
         assert_eq!(sub2.tokens_cache_read, 0);
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn cli_reconciler_proceeds_when_data_db_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-no-data-db").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "f33b0404-e2dc-48ff-aa55-25a700b8fa7e";
+        // CLI-only install: no data.db registry. The transcript still
+        // classifies the session as CLI, so reconciliation must proceed with
+        // an empty App registry instead of skipping.
+        let store = create_test_copilot_session_store(&app_dir);
+        let transcript_dir = app_dir.join("session-state").join(session_id);
+        fs::create_dir_all(&transcript_dir).unwrap();
+        fs::write(transcript_dir.join("events.jsonl"), "").unwrap();
+        build_validation_fixture_events(&store, session_id);
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, session_id, 995262);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        let rows = read_cli_agent_rows(&conn, session_id);
+        assert_eq!(
+            rows.len(),
+            3,
+            "reconciliation must run without data.db (1 main + 2 subagent rows)"
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.tokens_total).sum::<i64>(),
+            995262,
+            "combined per-agent total must equal hook session total"
+        );
 
         if let Some(value) = old_dir {
             std::env::set_var("COPILOT_DIR", value);
