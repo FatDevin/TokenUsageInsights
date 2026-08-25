@@ -2,6 +2,14 @@
 
 本文件記錄 TokenUsageInsights 各正式版本的實際變更。內容依 Git 標籤間的提交記錄與檔案差異整理，格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)，版本編號遵循 [Semantic Versioning](https://semver.org/lang/zh-TW/)。
 
+## [0.7.1] - 2026-08-25
+
+### 修正
+
+- 修正只安裝 GitHub Copilot CLI（未安裝 Copilot Desktop App）時，主控台每 5 秒重複輸出「找不到 data.db」警告造成洗版的問題。缺少 `data.db` 屬 CLI-only 用戶的正常狀態，現在改為整個執行期間僅提示一次，並註明屬正常狀態。
+- 修正 CLI-only 用戶的 Copilot CLI agent reconciliation 被整個跳過的問題。先前 `data.db` 不存在時會直接放棄校正，導致 subagent 用量永遠停留在 hook 合併列；現在改以空的 App session registry 照常執行拆分校正。App session 的歸類仍以 CLI transcript 存在與否把關，不會被誤判。
+- 補充 Cursor Composer 2.5 兩種速度層級（`composer-2.5`、`composer-2.5-fast`）的模型價格規則，修復對應 session 成本計算擲回「找不到可用的模型價格規則」的問題。先前計算失敗的 turn 不會自動補算，需重新匯入或重算該 session 才會顯示成本。
+
 ## [0.7.0] - 2026-08-11
 
 ### 新增與改善
