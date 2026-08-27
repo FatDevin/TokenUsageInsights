@@ -17,9 +17,9 @@ help:
 	@echo "Token 戰情室 Makefile"
 	@echo
 	@echo "常用指令："
-	@echo "  make run             啟動本機伺服器（預設 PORT=$(PORT)）"
-	@echo "  make dev             等同 run"
-	@echo "  make run-release     以 release 模式啟動（含建置）"
+	@echo "  make run             以 Release 版本啟動本機伺服器（含建置，預設 PORT=$(PORT)）"
+	@echo "  make dev             以 Debug 版本啟動（快速迭代用，預設 PORT=$(PORT)）"
+	@echo "  make run-release     等同 run"
 	@echo "  make build           建置 Debug 版本"
 	@echo "  make build-release   建置 Release 版本"
 	@echo "  make test            執行 Rust 測試"
@@ -39,13 +39,13 @@ help:
 	@echo "  make restart-service 重啟 service（需要 sudo）"
 	@echo "  make status          查詢 service 狀態（需要 sudo）"
 
-run:
+run: build-release
+	PORT=$(PORT) $(RELEASE_BIN)
+
+dev:
 	PORT=$(PORT) $(CARGO) run --bin $(PROJECT_NAME)
 
-dev: run
-
-run-release: build-release
-	PORT=$(PORT) $(RELEASE_BIN)
+run-release: run
 
 build:
 	$(CARGO) build

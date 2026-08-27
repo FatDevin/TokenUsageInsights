@@ -331,6 +331,61 @@ input {
   gap: var(--space-6);
   min-width: 0;
   padding: 0 var(--space-8) var(--space-8);
+  position: relative;
+}
+
+/* 資料載入提示層：僅覆蓋內容區、不攔截滑鼠與捲動 */
+#view-loading-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  pointer-events: none;
+  padding-top: clamp(96px, 22vh, 220px);
+}
+
+#view-loading-overlay.hidden {
+  display: none;
+}
+
+.view-loading-chip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 18px;
+  border: 1px solid var(--glass-border);
+  border-radius: 999px;
+  background: var(--card-bg);
+  box-shadow: var(--shadow-lg, 0 10px 30px rgba(0, 0, 0, 0.25));
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+
+.view-loading-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--glass-border);
+  border-top-color: var(--accent-cyan, #22d3ee);
+  border-radius: 50%;
+  animation: reload-spin 0.9s linear infinite;
+}
+
+.title-sync-icon {
+  display: inline-flex;
+  margin-right: 10px;
+  color: var(--accent-cyan, #22d3ee);
+  animation: reload-spin 0.9s linear infinite;
+}
+
+/* 載入期間將舊內容淡化並停用互動，資料抵達後立即替換 */
+#daily-view-container.is-loading,
+#monthly-view-container.is-loading,
+#yearly-view-container.is-loading {
+  opacity: 0.45;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
 }
 
 #daily-view-container,

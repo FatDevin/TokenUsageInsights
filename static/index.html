@@ -20,7 +20,7 @@
     document.documentElement.setAttribute('data-theme', savedTheme);
   </script>
   <!-- CSS Stylesheet -->
-  <link rel="stylesheet" href="/static/styles.css?v=27">
+  <link rel="stylesheet" href="/static/styles.css?v=29">
   <!-- Chart.js for beautiful charts -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <!-- Marked.js for rendering markdown response -->
@@ -378,6 +378,14 @@
 
       <!-- Empty State Placeholder -->
       <div id="empty-state-container" class="hidden"></div>
+
+      <!-- 資料載入提示層：切換期間或初次載入時顯示 -->
+      <div id="view-loading-overlay" class="hidden" aria-live="polite">
+        <div class="view-loading-chip">
+          <span class="view-loading-spinner" aria-hidden="true"></span>
+          <span class="view-loading-text" data-i18n="loading_data">資料載入中…</span>
+        </div>
+      </div>
 
 
 
@@ -1208,6 +1216,6 @@ cd TokenUsageInsights</code></pre>
   <div class="sidebar-overlay" id="sidebar-overlay"></div>
 
   <!-- Frontend Javascript logic -->
-  <script type="module" src="/static/app.js?v=54"></script>
+  <script type="module" src="/static/app.js?v=58"></script>
 </body>
 </html>

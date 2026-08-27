@@ -77,6 +77,11 @@ pub fn load_pricing_rules() -> Vec<PricingRule> {
     rules
 }
 
+/// 載入價格規則並完成一次性的標籤解析，供大量聚合的 API 重複使用。
+pub fn load_prepared_pricing_rules() -> PreparedPricingRules {
+    PreparedPricingRules::from_rules(load_pricing_rules())
+}
+
 /// Parsed long-context threshold marker from a pricing rule label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ThresholdRule {
@@ -184,45 +189,6 @@ fn rule_applies_to_context(
         .unwrap_or(true)
 }
 
-/// Prefer the most specific applicable model base, then a threshold row over
-/// an unthresholded default row, regardless of their order in the CSV.
-fn find_pricing_rule<'a>(
-    rules: &'a [PricingRule],
-    model_base: &str,
-    prompt_tokens: u64,
-    contains_match: bool,
-) -> Option<&'a PricingRule> {
-    let mut best_rule = None;
-    let mut best_base_len = 0;
-    let mut best_has_threshold = false;
-
-    for rule in rules {
-        let (rule_base, rule_threshold) = parse_threshold_rule(&rule.model_name);
-        if !rule_applies_to_context(
-            &rule_base,
-            rule_threshold,
-            model_base,
-            prompt_tokens,
-            contains_match,
-        ) {
-            continue;
-        }
-
-        let base_len = rule_base.len();
-        let has_threshold = rule_threshold.is_some();
-        let is_more_specific = base_len > best_base_len;
-        let is_same_base_with_threshold =
-            base_len == best_base_len && has_threshold && !best_has_threshold;
-        if best_rule.is_none() || is_more_specific || is_same_base_with_threshold {
-            best_rule = Some(rule);
-            best_base_len = base_len;
-            best_has_threshold = has_threshold;
-        }
-    }
-
-    best_rule
-}
-
 #[allow(dead_code)]
 pub fn normalize_model_name(name: &str) -> String {
     name.to_lowercase()
@@ -231,7 +197,192 @@ pub fn normalize_model_name(name: &str) -> String {
         .collect()
 }
 
-pub fn calculate_cost(
+/// 已解析的單筆價格規則：把模型標籤的閾值解析與 Claude 判定提前算好，
+/// 讓每筆 usage 的計價不必重複做字串剖析。
+#[derive(Debug, Clone)]
+struct PreparedRule {
+    base: String,
+    threshold: Option<ThresholdRule>,
+    is_claude: bool,
+}
+
+/// 預先解析完成的價格規則集。
+///
+/// `find_pricing_rule` 原本每比對一個模型就對所有規則重新做一次
+/// `parse_threshold_rule`（每次都有多次字串配置），在數萬筆 usage 的
+/// 月報聚合下會佔掉絕大多數 CPU 時間；此型別把解析成本降為一次。
+#[derive(Debug, Clone)]
+pub struct PreparedPricingRules {
+    rules: Vec<PricingRule>,
+    parsed: Vec<PreparedRule>,
+}
+
+impl PreparedPricingRules {
+    pub fn from_rules(rules: Vec<PricingRule>) -> Self {
+        let parsed = rules
+            .iter()
+            .map(|rule| {
+                let (base, threshold) = parse_threshold_rule(&rule.model_name);
+                let is_claude = rule.model_name.to_ascii_lowercase().contains("claude");
+                PreparedRule {
+                    base,
+                    threshold,
+                    is_claude,
+                }
+            })
+            .collect();
+        Self { rules, parsed }
+    }
+
+    /// 與自由函式 `calculate_usage_cost` 相同的參數與錯誤語意，但走預先解析的規則。
+    #[allow(clippy::too_many_arguments)]
+    pub fn calculate_usage_cost(
+        &self,
+        model_name: Option<&str>,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write_5m: u64,
+        cache_write_1h: u64,
+    ) -> Result<f64, String> {
+        if input == 0
+            && output == 0
+            && cache_read == 0
+            && cache_write_5m == 0
+            && cache_write_1h == 0
+        {
+            return Ok(0.0);
+        }
+
+        let model_name = model_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| "缺少模型名稱，無法估算成本".to_string())?;
+        self.calculate_cost(
+            model_name,
+            input,
+            output,
+            cache_read,
+            cache_write_5m,
+            cache_write_1h,
+        )
+    }
+
+    fn find_rule_index(
+        &self,
+        model_base: &str,
+        prompt_tokens: u64,
+        contains_match: bool,
+    ) -> Option<usize> {
+        let mut best_rule = None;
+        let mut best_base_len = 0;
+        let mut best_has_threshold = false;
+
+        for (index, prepared) in self.parsed.iter().enumerate() {
+            if !rule_applies_to_context(
+                &prepared.base,
+                prepared.threshold,
+                model_base,
+                prompt_tokens,
+                contains_match,
+            ) {
+                continue;
+            }
+
+            let base_len = prepared.base.len();
+            let has_threshold = prepared.threshold.is_some();
+            let is_more_specific = base_len > best_base_len;
+            let is_same_base_with_threshold =
+                base_len == best_base_len && has_threshold && !best_has_threshold;
+            if best_rule.is_none() || is_more_specific || is_same_base_with_threshold {
+                best_rule = Some(index);
+                best_base_len = base_len;
+                best_has_threshold = has_threshold;
+            }
+        }
+
+        best_rule
+    }
+
+    /// 與 `calculate_cost` 相同的計價邏輯，但規則標籤只解析一次。
+    pub fn calculate_cost(
+        &self,
+        model_name: &str,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write_5m: u64,
+        cache_write_1h: u64,
+    ) -> Result<f64, String> {
+        if input == 0
+            && output == 0
+            && cache_read == 0
+            && cache_write_5m == 0
+            && cache_write_1h == 0
+        {
+            return Ok(0.0);
+        }
+
+        let (m_base, _) = parse_threshold_rule(model_name);
+        if m_base.is_empty() {
+            return Err(format!(
+                "模型名稱為空，無法估算成本。來源模型：{}",
+                model_name
+            ));
+        }
+
+        let is_claude_model = self.parsed.iter().any(|prepared| {
+            !prepared.base.is_empty()
+                && (prepared.base == m_base
+                    || m_base.contains(&prepared.base)
+                    || prepared.base.contains(&m_base))
+                && prepared.is_claude
+        });
+        let (priced_cache_write_5m, priced_cache_write_1h) = if is_claude_model {
+            (cache_write_5m, cache_write_1h)
+        } else {
+            (0, 0)
+        };
+        // Provider long-context tiers apply to prompt tokens. Output tokens do not
+        // increase the prompt size; cached reads and Claude cache writes do.
+        let prompt_tokens = input
+            .saturating_add(cache_read)
+            .saturating_add(priced_cache_write_5m)
+            .saturating_add(priced_cache_write_1h);
+
+        // 1. Exact base name match (threshold-aware)
+        let matched_index = self
+            .find_rule_index(&m_base, prompt_tokens, false)
+            // 2. Fallback: contains base name match
+            .or_else(|| self.find_rule_index(&m_base, prompt_tokens, true));
+
+        if let Some(index) = matched_index {
+            let r = &self.rules[index];
+            let input_cost = (input as f64 / 1_000_000.0) * r.input_price;
+            let cache_cost = (cache_read as f64 / 1_000_000.0) * r.cache_input_price;
+            let cache_write_5m_cost =
+                (priced_cache_write_5m as f64 / 1_000_000.0) * r.input_price * 1.25;
+            let cache_write_1h_cost =
+                (priced_cache_write_1h as f64 / 1_000_000.0) * r.input_price * 2.0;
+            let output_cost = (output as f64 / 1_000_000.0) * r.output_price;
+            Ok(input_cost + cache_cost + cache_write_5m_cost + cache_write_1h_cost + output_cost)
+        } else {
+            Err(format!("找不到可用的模型價格規則：{}", model_name))
+        }
+    }
+}
+
+/// 便利建構子：直接由規則清單建立。
+impl From<Vec<PricingRule>> for PreparedPricingRules {
+    fn from(rules: Vec<PricingRule>) -> Self {
+        Self::from_rules(rules)
+    }
+}
+
+/// 測試用相容介面：直接以 `&[PricingRule]` 計價（每次呼叫都會解析規則，
+/// 正式程式碼請改用 `PreparedPricingRules`）。
+#[cfg(test)]
+fn calculate_cost(
     rules: &[PricingRule],
     model_name: &str,
     input: u64,
@@ -240,55 +391,18 @@ pub fn calculate_cost(
     cache_write_5m: u64,
     cache_write_1h: u64,
 ) -> Result<f64, String> {
-    let (m_base, _) = parse_threshold_rule(model_name);
-    if m_base.is_empty() {
-        return Err(format!(
-            "模型名稱為空，無法估算成本。來源模型：{}",
-            model_name
-        ));
-    }
-
-    let is_claude_model = rules.iter().any(|rule| {
-        let (rule_base, _) = parse_threshold_rule(&rule.model_name);
-        !rule_base.is_empty()
-            && (rule_base == m_base || m_base.contains(&rule_base) || rule_base.contains(&m_base))
-            && rule.model_name.to_ascii_lowercase().contains("claude")
-    });
-    let (priced_cache_write_5m, priced_cache_write_1h) = if is_claude_model {
-        (cache_write_5m, cache_write_1h)
-    } else {
-        (0, 0)
-    };
-    // Provider long-context tiers apply to prompt tokens. Output tokens do not
-    // increase the prompt size; cached reads and Claude cache writes do.
-    let prompt_tokens = input
-        .saturating_add(cache_read)
-        .saturating_add(priced_cache_write_5m)
-        .saturating_add(priced_cache_write_1h);
-
-    // 1. Exact base name match (threshold-aware)
-    let mut rule = find_pricing_rule(rules, &m_base, prompt_tokens, false);
-
-    // 2. Fallback: contains base name match
-    if rule.is_none() {
-        rule = find_pricing_rule(rules, &m_base, prompt_tokens, true);
-    }
-
-    if let Some(r) = rule {
-        let input_cost = (input as f64 / 1_000_000.0) * r.input_price;
-        let cache_cost = (cache_read as f64 / 1_000_000.0) * r.cache_input_price;
-        let cache_write_5m_cost =
-            (priced_cache_write_5m as f64 / 1_000_000.0) * r.input_price * 1.25;
-        let cache_write_1h_cost =
-            (priced_cache_write_1h as f64 / 1_000_000.0) * r.input_price * 2.0;
-        let output_cost = (output as f64 / 1_000_000.0) * r.output_price;
-        Ok(input_cost + cache_cost + cache_write_5m_cost + cache_write_1h_cost + output_cost)
-    } else {
-        Err(format!("找不到可用的模型價格規則：{}", model_name))
-    }
+    PreparedPricingRules::from_rules(rules.to_vec()).calculate_cost(
+        model_name,
+        input,
+        output,
+        cache_read,
+        cache_write_5m,
+        cache_write_1h,
+    )
 }
 
-pub fn calculate_usage_cost(
+#[cfg(test)]
+fn calculate_usage_cost(
     rules: &[PricingRule],
     model_name: Option<&str>,
     input: u64,

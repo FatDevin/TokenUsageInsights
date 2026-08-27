@@ -14,7 +14,7 @@ use std::{
 
 use super::*;
 use crate::db::{self, TokenStats};
-use crate::pricing::{load_pricing_rules, PricingRule};
+use crate::pricing::{load_prepared_pricing_rules, PreparedPricingRules};
 use crate::timeline::{
     parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
     parse_copilot_timeline_filtered, parse_cursor_timeline, parse_grok_timeline,
@@ -33,7 +33,7 @@ fn add_usage_to_day_summary(summary: &mut DaySummary, usage: &UsageAggregation) 
 
 fn aggregate_usage_details(
     entries_with_type: &[(crate::db::UsageDayExportRecord, String)],
-    pricing_rules: &[PricingRule],
+    pricing_rules: &PreparedPricingRules,
 ) -> (DaySummary, Vec<SessionSummary>, Vec<UsageEntry>) {
     let mut summary = DaySummary::default();
     // Session identity = (source_kind, session_id, source_dir_key) so that rows from
@@ -971,7 +971,7 @@ pub async fn get_usage_details(
             .into_response();
     }
 
-    let pricing_rules = load_pricing_rules();
+    let pricing_rules = load_prepared_pricing_rules();
     let (summary, sessions_summary, entries) =
         aggregate_usage_details(&entries_with_type, &pricing_rules);
 
@@ -1579,6 +1579,7 @@ pub async fn get_session_details(
 mod tests {
     use super::*;
     use crate::db::UsageDayExportRecord;
+    use crate::pricing::PricingRule;
     use rusqlite::Connection;
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{collections::HashMap, fs, path::PathBuf};
@@ -2001,7 +2002,10 @@ mod tests {
             },
         ];
 
-        let (summary, sessions, _) = aggregate_usage_details(&entries_with_type, &rules);
+        let (summary, sessions, _) = aggregate_usage_details(
+            &entries_with_type,
+            &PreparedPricingRules::from_rules(rules.into()),
+        );
 
         assert_daily_summary_matches_session_totals(&summary, &sessions);
     }
@@ -2091,7 +2095,10 @@ mod tests {
             },
         ];
 
-        let (summary, sessions, _) = aggregate_usage_details(&entries_with_type, &rules);
+        let (summary, sessions, _) = aggregate_usage_details(
+            &entries_with_type,
+            &PreparedPricingRules::from_rules(rules.into()),
+        );
 
         assert_daily_summary_matches_session_totals(&summary, &sessions);
     }
@@ -2551,7 +2558,8 @@ mod tests {
                 },
             ),
         ];
-        let session_usage = summarize_session_usage(&rules, &entries);
+        let session_usage =
+            summarize_session_usage(&PreparedPricingRules::from_rules(rules.into()), &entries);
         let mut summary = DaySummary::default();
 
         add_usage_to_day_summary(&mut summary, &session_usage.usage);

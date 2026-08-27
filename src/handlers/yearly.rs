@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::*;
 use crate::db;
-use crate::pricing::load_pricing_rules;
+use crate::pricing::load_prepared_pricing_rules;
 
 /// API 12: 獲取可用的有使用記錄年份
 pub async fn get_available_years(Path(assistant): Path<String>) -> impl IntoResponse {
@@ -76,7 +76,7 @@ pub async fn get_yearly_details(
             .into_response();
     }
 
-    let pricing_rules = load_pricing_rules();
+    let pricing_rules = load_prepared_pricing_rules();
     let mut monthly_map: HashMap<String, Vec<(UsageEntry, String)>> = HashMap::new();
     let mut sessions_map: HashMap<String, (Vec<UsageEntry>, String)> = HashMap::new();
 

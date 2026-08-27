@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=34';
+import i18n from './i18n.js?v=35';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -338,6 +338,13 @@ const expandedModelDrilldowns = new Map();
 let cachedCodexResets = null;
 let isQueryingCodexResets = false;
 
+// 各報表載入請求的序號：快速切換日期/月份/年份時，僅讓最新一次請求的結果生效
+let dailyRequestSeq = 0;
+let monthlyRequestSeq = 0;
+let yearlyRequestSeq = 0;
+let monthlyInFlightTarget = null;
+let yearlyInFlightTarget = null;
+
 // i18n localization dictionary is now loaded from /static/i18n.js
 
 function t(key, assistant = currentAssistant) {
@@ -371,8 +378,40 @@ function cardIconMarkup(name, extraClass = '') {
 function setTitleMarkup(iconName, textHtml) {
   const titleEl = document.getElementById('current-date-title');
   if (titleEl) {
-    titleEl.innerHTML = `<span class="title-text">${textHtml}</span>`;
+    // iconName 為 'sync' 表示資料仍在載入，標題加上旋轉圖示提示
+    const spinner = iconName === 'sync' ? iconMarkup('sync', 'title-sync-icon') : '';
+    titleEl.innerHTML = `${spinner}<span class="title-text">${textHtml}</span>`;
   }
+}
+
+// =========================================================================
+// 視窗載入狀態：切換日期/月份/年份時立即給予回饋，資料抵達後再更新內容
+// =========================================================================
+function getActiveViewContainer() {
+  if (activeTab === 'monthly') return document.getElementById('monthly-view-container');
+  if (activeTab === 'yearly') return document.getElementById('yearly-view-container');
+  return document.getElementById('daily-view-container');
+}
+
+function showViewLoading(dim = true) {
+  // 同一期間重整（即時監控、重新整理按鈕）只靠標題同步圖示提示，不遮蔽內容
+  if (!dim) return;
+  const overlay = document.getElementById('view-loading-overlay');
+  const view = getActiveViewContainer();
+  if (view) view.classList.add('is-loading');
+  if (overlay) {
+    overlay.classList.remove('hidden');
+    const label = overlay.querySelector('.view-loading-text');
+    if (label) label.textContent = t('loading_data');
+  }
+}
+
+function hideViewLoading() {
+  const overlay = document.getElementById('view-loading-overlay');
+  if (overlay) overlay.classList.add('hidden');
+  ['daily-view-container', 'monthly-view-container', 'yearly-view-container'].forEach(id => {
+    document.getElementById(id)?.classList.remove('is-loading');
+  });
 }
 
 function setDisclosureIcon(target, expanded) {
@@ -1568,10 +1607,45 @@ async function fetchDates(selectedDate = null, keepDate = false, assistant = cur
       toggleEmptyState(false, resolvedAssistant);
     }
 
-    // 載入所選日期的數據（keepDate 時即使不在清單也直接請求，讓後端回 404）
-    // 若目前在 monthly tab，不呼叫 loadUsageData（避免 showNoDataForDate 蓋掉月報畫面）
-    if (!keepDate || activeTab === 'daily') {
+    // 依目前分頁載入對應資料：
+    // - 日報：載入所選日期（keepDate 時即使不在清單也直接請求，讓後端回 404）
+    // - 月/年報：開機時 options 尚未建立，交給 fetchMonths/fetchYears 載入；
+    //   清單已存在時（如空狀態的「重新整理」）直接重載當前期間。
+    //   不可在此呼叫日報 API，否則網址上的 month/year 參數會被誤當日期請求，
+    //   404 後閃現「無資料」蓋掉月/年報畫面
+    if (activeTab === 'daily') {
       await loadUsageData(dateToLoad, resolvedAssistant);
+    } else if (!keepDate) {
+      if (activeTab === 'monthly') {
+        const monthSelect = document.getElementById('month-select');
+        // HTML 初始的「載入中...」佔位選項代表清單尚未由 fetchMonths 建立，交給開機流程處理
+        const monthsPending = monthSelect?.querySelector('option[data-i18n="loading"]');
+        if (monthSelect && !monthsPending) {
+          const targetMonth = monthSelect.value || getUrlDateForTab('monthly');
+          if (targetMonth) {
+            // 同一期間已在載入（開機時 fetchMonths 已觸發）就不重複請求
+            if (monthlyInFlightTarget !== targetMonth) {
+              await loadMonthlyData(targetMonth);
+            }
+          } else {
+            // 先前月份清單為空（如空狀態後重試），重新拉清單並載入
+            await fetchMonths();
+          }
+        }
+      } else if (activeTab === 'yearly') {
+        const yearSelect = document.getElementById('year-select');
+        const yearsPending = yearSelect?.querySelector('option[data-i18n="loading"]');
+        if (yearSelect && !yearsPending) {
+          const targetYear = yearSelect.value || getUrlDateForTab('yearly');
+          if (targetYear) {
+            if (yearlyInFlightTarget !== targetYear) {
+              await loadYearlyData(targetYear);
+            }
+          } else {
+            await fetchYears();
+          }
+        }
+      }
     }
 
   } catch (err) {
@@ -1598,11 +1672,15 @@ async function loadUsageData(date, assistant = currentAssistant) {
   }
   const resolvedAssistant = normalizeAssistant(assistant);
   updateUrlParams();
+  const mySeq = ++dailyRequestSeq;
+  // 同日期重整（即時監控、重新整理）不遮蔽內容，僅在標題顯示同步圖示
+  const dimView = !currentUsageData || currentUsageData.date !== date;
+  showViewLoading(dimView);
   try {
-    // 顯示加載動畫 (可在此擴展)
     setTitleMarkup('sync', date);
 
     const res = await fetch(`/api/${resolvedAssistant}/usage/${date}`);
+    if (mySeq !== dailyRequestSeq) return;
     if (currentAssistant !== resolvedAssistant) return;
     if (res.status === 404) {
       // 顯示「此 Agent 當日無資料」提示畫面，不改變日期
@@ -1612,6 +1690,7 @@ async function loadUsageData(date, assistant = currentAssistant) {
     }
     
     const data = await res.json();
+    if (mySeq !== dailyRequestSeq) return;
     if (currentAssistant !== resolvedAssistant) return;
     toggleEmptyState(false, resolvedAssistant);
     renderDashboard(data);
@@ -1619,7 +1698,9 @@ async function loadUsageData(date, assistant = currentAssistant) {
 
   } catch (err) {
     console.error('載入使用量失敗:', err);
-    showNotification(t('load_failed'), 'error');
+    if (mySeq === dailyRequestSeq) showNotification(t('load_failed'), 'error');
+  } finally {
+    if (mySeq === dailyRequestSeq) hideViewLoading();
   }
 }
 
@@ -4709,23 +4790,34 @@ async function loadYearlyData(year) {
     return;
   }
   updateUrlParams();
+  const mySeq = ++yearlyRequestSeq;
+  const dimView = !currentYearlyData || currentYearlyData.year !== year;
+  yearlyInFlightTarget = year;
+  showViewLoading(dimView);
   try {
     setTitleMarkup('sync', year);
 
     const res = await fetch(`/api/${currentAssistant}/yearly/${year}`);
+    if (mySeq !== yearlyRequestSeq) return;
     if (res.status === 404) {
       showNotification(t('year_not_found'), 'error');
       return;
     }
     
     const data = await res.json();
+    if (mySeq !== yearlyRequestSeq) return;
     modelSessionDetailsCache.clear();
     toggleEmptyState(false);
     renderYearlyDashboard(data);
 
   } catch (err) {
     console.error('載入年份彙整失敗:', err);
-    showNotification(t('yearly_load_failed'), 'error');
+    if (mySeq === yearlyRequestSeq) showNotification(t('yearly_load_failed'), 'error');
+  } finally {
+    if (mySeq === yearlyRequestSeq) {
+      yearlyInFlightTarget = null;
+      hideViewLoading();
+    }
   }
 }
 
@@ -5475,23 +5567,34 @@ async function loadMonthlyData(month) {
     return;
   }
   updateUrlParams();
+  const mySeq = ++monthlyRequestSeq;
+  const dimView = !currentMonthlyData || currentMonthlyData.year_month !== month;
+  monthlyInFlightTarget = month;
+  showViewLoading(dimView);
   try {
     setTitleMarkup('sync', month);
 
     const res = await fetch(`/api/${currentAssistant}/monthly/${month}`);
+    if (mySeq !== monthlyRequestSeq) return;
     if (res.status === 404) {
       showNotification(t('month_not_found'), 'error');
       return;
     }
     
     const data = await res.json();
+    if (mySeq !== monthlyRequestSeq) return;
     modelSessionDetailsCache.clear();
     toggleEmptyState(false);
     renderMonthlyDashboard(data);
 
   } catch (err) {
     console.error('載入月份彙整失敗:', err);
-    showNotification(t('monthly_load_failed'), 'error');
+    if (mySeq === monthlyRequestSeq) showNotification(t('monthly_load_failed'), 'error');
+  } finally {
+    if (mySeq === monthlyRequestSeq) {
+      monthlyInFlightTarget = null;
+      hideViewLoading();
+    }
   }
 }
 

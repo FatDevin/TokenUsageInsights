@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::*;
 use crate::db;
-use crate::pricing::{load_pricing_rules, PricingRule};
+use crate::pricing::{load_prepared_pricing_rules, PreparedPricingRules};
 
 #[derive(serde::Deserialize)]
 pub struct ModelSessionsQuery {
@@ -82,7 +82,7 @@ fn collect_model_session_details(
     entries_with_type: &[(UsageEntry, String, String)],
     requested_model: &str,
     requested_mode: Option<ModelSessionMode>,
-    pricing_rules: &[PricingRule],
+    pricing_rules: &PreparedPricingRules,
 ) -> Vec<ModelSessionDetail> {
     type SessionIdentity = (String, String, String);
     let mut sessions_map: HashMap<SessionIdentity, Vec<UsageEntry>> = HashMap::new();
@@ -262,7 +262,7 @@ pub async fn get_model_sessions(
             &entries,
             &model_for_query,
             mode_for_query,
-            &load_pricing_rules(),
+            &load_prepared_pricing_rules(),
         ))
     })
     .await
@@ -355,7 +355,7 @@ pub async fn get_monthly_details(
             .into_response();
     }
 
-    let pricing_rules = load_pricing_rules();
+    let pricing_rules = load_prepared_pricing_rules();
     let mut daily_map: HashMap<String, Vec<(UsageEntry, String)>> = HashMap::new();
     let mut sessions_map: HashMap<String, (Vec<UsageEntry>, String)> = HashMap::new();
 
@@ -496,6 +496,7 @@ pub async fn get_monthly_details(
 mod tests {
     use super::*;
     use crate::db::TokenStats;
+    use crate::pricing::PricingRule;
 
     fn model_entry(
         session_id: &str,
@@ -616,7 +617,7 @@ mod tests {
             &entries,
             "composer-2.5",
             Some(ModelSessionMode::Agent),
-            &rules,
+            &PreparedPricingRules::from_rules(rules.into()),
         );
 
         assert_eq!(details.len(), 2);
@@ -678,7 +679,8 @@ mod tests {
             ),
         );
 
-        let summaries = summarize_models_by_mode(&sessions, &[]);
+        let summaries =
+            summarize_models_by_mode(&sessions, &PreparedPricingRules::from_rules(Vec::new()));
 
         assert_eq!(summaries.len(), 2);
         assert!(summaries.iter().any(|summary| {
@@ -730,7 +732,7 @@ mod tests {
             &entries,
             "composer-2.5",
             Some(ModelSessionMode::Ide),
-            &[],
+            &PreparedPricingRules::from_rules(Vec::new()),
         );
 
         assert_eq!(details.len(), 1);
@@ -768,7 +770,12 @@ mod tests {
             ),
         ];
 
-        let details = collect_model_session_details(&entries, "gpt-5", None, &[]);
+        let details = collect_model_session_details(
+            &entries,
+            "gpt-5",
+            None,
+            &PreparedPricingRules::from_rules(Vec::new()),
+        );
 
         assert_eq!(details.len(), 2);
         assert!(details

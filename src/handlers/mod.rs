@@ -1,6 +1,6 @@
 use crate::{
     db::{TokenStats, UsageEntry},
-    pricing::{calculate_usage_cost, PricingRule},
+    pricing::PreparedPricingRules,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -96,7 +96,7 @@ fn entry_model(entry: &UsageEntry) -> Option<&str> {
 
 fn record_usage(
     result: &mut SessionUsageAggregation,
-    pricing_rules: &[PricingRule],
+    pricing_rules: &PreparedPricingRules,
     entry: &UsageEntry,
     tokens: &TokenStats,
 ) {
@@ -107,8 +107,7 @@ fn record_usage(
         if let Some(reported_cost) = entry.cost.as_ref().and_then(|cost| cost.reported_cost_usd) {
             reported_cost
         } else {
-            match calculate_usage_cost(
-                pricing_rules,
+            match pricing_rules.calculate_usage_cost(
                 model,
                 tokens.input,
                 tokens.output,
@@ -148,7 +147,7 @@ fn record_usage(
 }
 
 pub(crate) fn summarize_session_usage(
-    pricing_rules: &[PricingRule],
+    pricing_rules: &PreparedPricingRules,
     entries: &[UsageEntry],
 ) -> SessionUsageAggregation {
     let has_delta_usage = entries
@@ -217,7 +216,7 @@ pub(crate) fn cursor_session_mode(
 
 pub(crate) fn summarize_models_by_mode(
     sessions: &HashMap<String, (Vec<UsageEntry>, String)>,
-    pricing_rules: &[PricingRule],
+    pricing_rules: &PreparedPricingRules,
 ) -> Vec<MonthlyModelSummary> {
     type ModelStats = (usize, u64, u64, u64, u64, f64);
 
@@ -476,6 +475,8 @@ pub struct YearListResponse {
 mod tests {
     use super::*;
     use crate::db;
+    use crate::pricing::PreparedPricingRules;
+    use crate::pricing::PricingRule;
     use std::env;
     use std::fs;
     use std::sync::OnceLock;
@@ -556,7 +557,8 @@ mod tests {
             usage_entry(3, "<synthetic>", token_stats(0, 0, 0), true),
         ];
 
-        let result = summarize_session_usage(&rules, &entries);
+        let result =
+            summarize_session_usage(&PreparedPricingRules::from_rules(rules.into()), &entries);
 
         assert!((result.usage.cost_usd - 1.74).abs() < 1e-9);
         assert_eq!(result.usage.total_tokens, 465_000);
@@ -588,7 +590,8 @@ mod tests {
             usage_entry(2, "<synthetic>", token_stats(0, 0, 0), false),
         ];
 
-        let result = summarize_session_usage(&rules, &entries);
+        let result =
+            summarize_session_usage(&PreparedPricingRules::from_rules(rules.into()), &entries);
 
         assert!((result.usage.cost_usd - 1.6).abs() < 1e-9);
         assert_eq!(result.display_model, "claude-opus-4-8");
@@ -619,7 +622,8 @@ mod tests {
             true,
         )];
 
-        let result = summarize_session_usage(&rules, &entries);
+        let result =
+            summarize_session_usage(&PreparedPricingRules::from_rules(rules.into()), &entries);
 
         assert_eq!(result.usage.cache_write_tokens, 2_500_000);
         assert_eq!(result.usage.cache_write_5m_tokens, 1_500_000);
@@ -648,7 +652,8 @@ mod tests {
             reported_cost_usd: Some(0.0123),
         });
 
-        let result = summarize_session_usage(&rules, &[entry]);
+        let result =
+            summarize_session_usage(&PreparedPricingRules::from_rules(rules.into()), &[entry]);
 
         assert!((result.usage.cost_usd - 0.0123).abs() < 1e-9);
         assert!((result.models[0].usage.cost_usd - 0.0123).abs() < 1e-9);
@@ -678,7 +683,8 @@ mod tests {
             true,
         )];
 
-        let result = summarize_session_usage(&rules, &entries);
+        let result =
+            summarize_session_usage(&PreparedPricingRules::from_rules(rules.into()), &entries);
 
         assert_eq!(result.usage.cache_write_tokens, 1_000_000);
         assert_eq!(result.usage.cache_write_5m_tokens, 0);
