@@ -2,6 +2,12 @@
 
 本文件記錄 TokenUsageInsights 各正式版本的實際變更。內容依 Git 標籤間的提交記錄與檔案差異整理，格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)，版本編號遵循 [Semantic Versioning](https://semver.org/lang/zh-TW/)。
 
+## [0.7.2] - 2026-08-27
+
+### 修正
+
+- 補充 Gemini 3.7 Flash 模型（含 Base、Medium、High、Low 四種思考層級變體）的標準費率規則，修復對應 session 成本計算擲回「找不到可用的模型價格規則」的問題。新增單元測試驗證思考層級定價，並附上 API 定價研究文件。
+
 ## [0.7.1] - 2026-08-25
 
 ### 修正
