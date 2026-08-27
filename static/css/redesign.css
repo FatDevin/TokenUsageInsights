@@ -673,6 +673,16 @@ input {
   min-width: 940px;
 }
 
+/* 月/年報表堆疊後雖為全寬，仍不得沿用 940px 最小寬度，
+   維持卡片可收縮、必要時交給 table-wrapper 內部捲動。 */
+.monthly-breakdown-grid .premium-table {
+  min-width: 0;
+}
+
+.monthly-breakdown-grid > .glass-card {
+  min-width: 0;
+}
+
 .premium-table th.model-column,
 .premium-table td.model-column {
   width: 210px;

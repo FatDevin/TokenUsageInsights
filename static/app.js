@@ -5041,7 +5041,7 @@ function renderYearlyProjectsTable(projects) {
 
     tr.innerHTML = `
       <td style="text-align: center;"><span class="badge ${idx < 3 ? 'highlight' : ''}">${idx + 1}</span></td>
-      <td class="cwd-cell" title="${escapeHtml(p.cwd)}" style="max-width: 250px;">${escapeHtml(p.cwd)}</td>
+      <td class="cwd-cell" title="${escapeHtml(p.cwd)}">${escapeHtml(p.cwd)}</td>
       <td><span class="badge">${p.sessions_count} Sessions</span></td>
       <td style="font-weight: 700; color: var(--accent-cyan);">
         ${formatToken(p.total_tokens)}
@@ -5760,7 +5760,7 @@ function renderMonthlyProjectsTable(projects) {
 
     tr.innerHTML = `
       <td style="text-align: center;"><span class="badge ${idx < 3 ? 'highlight' : ''}">${idx + 1}</span></td>
-      <td class="cwd-cell" title="${escapeHtml(p.cwd)}" style="max-width: 250px;">${escapeHtml(p.cwd)}</td>
+      <td class="cwd-cell" title="${escapeHtml(p.cwd)}">${escapeHtml(p.cwd)}</td>
       <td><span class="badge">${p.sessions_count} Sessions</span></td>
       <td style="font-weight: 700; color: var(--accent-cyan);">
         ${formatToken(p.total_tokens)}

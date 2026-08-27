@@ -186,15 +186,11 @@ input:checked + .slider-round:before {
 }
 
 /* Monthly Breakdown layout */
+/* 專案目錄與模型佔比上下堆疊：並排會把表格擠到換行，全寬才有可讀性 */
 .monthly-breakdown-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr;
   gap: 24px;
-}
-@media (max-width: 1024px) {
-  .monthly-breakdown-grid {
-    grid-template-columns: 1fr;
-  }
 }
 
 /* Reload Button Styling */
