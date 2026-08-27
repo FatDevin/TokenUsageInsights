@@ -384,6 +384,29 @@ mod tests {
     }
 
     #[test]
+    fn gemini_3_7_flash_thinking_levels_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in ["Gemini 3.7 Flash (High)", "Gemini 3.7 Flash (Low)"] {
+            let cost = calculate_usage_cost(
+                &rules,
+                Some(model_name),
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+            )
+            .unwrap();
+
+            assert!(
+                (cost - 9.15).abs() < 1e-9,
+                "unexpected Gemini 3.7 Flash cost for {model_name}: {cost}"
+            );
+        }
+    }
+
+    #[test]
     fn gemini_3_6_flash_thinking_levels_use_packaged_pricing() {
         let rules = load_pricing_rules();
 
