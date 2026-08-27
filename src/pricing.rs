@@ -384,6 +384,22 @@ mod tests {
     }
 
     #[test]
+    fn glm_5_3_flash_uses_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in ["glm-5.3-flash", "glm-5.3-flash:cloud", "GLM-5.3-Flash"] {
+            let cost =
+                calculate_usage_cost(&rules, Some(model_name), 1_000_000, 0, 1_000_000, 0, 0)
+                    .unwrap();
+
+            assert!(
+                (cost - 0.18).abs() < 1e-9,
+                "unexpected glm-5.3-flash cost for {model_name}: {cost}"
+            );
+        }
+    }
+
+    #[test]
     fn gemini_3_7_flash_thinking_levels_use_packaged_pricing() {
         let rules = load_pricing_rules();
 
