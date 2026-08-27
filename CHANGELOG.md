@@ -2,6 +2,12 @@
 
 本文件記錄 TokenUsageInsights 各正式版本的實際變更。內容依 Git 標籤間的提交記錄與檔案差異整理，格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)，版本編號遵循 [Semantic Versioning](https://semver.org/lang/zh-TW/)。
 
+## [0.7.3] - 2026-08-27
+
+### 修正
+
+- 補充 GLM-5.3-Flash 模型的標準費率規則，修復對應 session 成本計算擲回「找不到可用的模型價格規則」的問題。定價採 Z.ai 官方標準牌價（輸入 0.15、快取輸入 0.03、輸出 0.50 美元／每百萬 tokens），並新增單元測試驗證 `glm-5.3-flash`、`glm-5.3-flash:cloud`（Ollama 雲端路由）與 `GLM-5.3-Flash`（大小寫變體）三種名稱格式皆能正確套用定價。
+
 ## [0.7.2] - 2026-08-27
 
 ### 修正
