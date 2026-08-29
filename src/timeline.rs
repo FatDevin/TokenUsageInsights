@@ -2560,9 +2560,7 @@ fn parse_pi_family_timeline(
                                 }
                             }
                             Some("thinking") => {
-                                if let Some(text) =
-                                    block.get("thinking").and_then(|v| v.as_str())
-                                {
+                                if let Some(text) = block.get("thinking").and_then(|v| v.as_str()) {
                                     reasoning_parts.push(text.to_string());
                                 }
                             }
@@ -2820,7 +2818,10 @@ mod pi_family_tests {
             } if tool_name == "bash" => Some((stdout.clone(), status.clone())),
             _ => None,
         });
-        assert_eq!(tool_step, Some(("file.txt".to_string(), "success".to_string())));
+        assert_eq!(
+            tool_step,
+            Some(("file.txt".to_string(), "success".to_string()))
+        );
     }
 
     #[test]

@@ -5693,7 +5693,10 @@ fn sync_pi_family_usage_logs(
         let metadata = match fs::metadata(&filepath) {
             Ok(metadata) => metadata,
             Err(error) => {
-                eprintln!("讀取 {assistant_label} session 檔案 {:?} 失敗: {}", filepath, error);
+                eprintln!(
+                    "讀取 {assistant_label} session 檔案 {:?} 失敗: {}",
+                    filepath, error
+                );
                 continue;
             }
         };
@@ -5738,7 +5741,10 @@ fn sync_pi_family_usage_logs(
         let parsed_entries = match parse_file(&filepath) {
             Ok(entries) => entries,
             Err(error) => {
-                eprintln!("解析 {assistant_label} session 檔案 {:?} 失敗: {}", filepath, error);
+                eprintln!(
+                    "解析 {assistant_label} session 檔案 {:?} 失敗: {}",
+                    filepath, error
+                );
                 continue;
             }
         };
@@ -16595,7 +16601,10 @@ mod tests {
     #[test]
     fn sync_pi_usage_logs_persists_turn_and_reported_cost() {
         let root = temp_jsonl_path("pi-sync");
-        let session_dir = root.join("agent").join("sessions").join("--tmp--pi-project");
+        let session_dir = root
+            .join("agent")
+            .join("sessions")
+            .join("--tmp--pi-project");
         fs::create_dir_all(&session_dir).unwrap();
         fs::write(
             session_dir.join("2024-12-03T14-00-00_abc.jsonl"),

@@ -172,7 +172,10 @@ pub(crate) fn parse_session_usage_file(
         let Ok(entry_value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let entry_type = entry_value.get("type").and_then(Value::as_str).unwrap_or("");
+        let entry_type = entry_value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
 
         if entry_type == "session_info" {
             if let Some(name) = entry_value.get("name").and_then(Value::as_str) {

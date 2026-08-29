@@ -220,7 +220,9 @@ fn resolve_pi_family_transcript_path(
     }
 
     if !path.exists() {
-        return Err(format!("找不到該 {assistant_label} session 的本地日誌檔案。"));
+        return Err(format!(
+            "找不到該 {assistant_label} session 的本地日誌檔案。"
+        ));
     }
 
     let base_root = base_dir
@@ -231,7 +233,9 @@ fn resolve_pi_family_transcript_path(
         .map_err(|_| format!("無法解析 {assistant_label} session 日誌路徑。"))?;
 
     if !canonical_path.starts_with(&base_root) {
-        return Err(format!("{assistant_label} session 日誌路徑不在預期目錄內。"));
+        return Err(format!(
+            "{assistant_label} session 日誌路徑不在預期目錄內。"
+        ));
     }
     if canonical_path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
         return Err(format!("{assistant_label} session 日誌格式不受支援。"));
