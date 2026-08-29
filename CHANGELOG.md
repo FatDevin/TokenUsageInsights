@@ -2,7 +2,7 @@
 
 本文件記錄 TokenUsageInsights 各正式版本的實際變更。內容依 Git 標籤間的提交記錄與檔案差異整理，格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)，版本編號遵循 [Semantic Versioning](https://semver.org/lang/zh-TW/)。
 
-## [未發行]
+## [0.7.5] - 2026-08-30
 
 ### 新增與改善
 
@@ -11,6 +11,7 @@
 - 「AGENT 類型」側欄圖示改為 4 欄 × 2 列的格線排列（`repeat(4, minmax(0, 1fr))`），因應圖示數量增加到 8 個仍維持整齊排版。
 - 各 Agent 專屬副標題（首頁描述文字）現在會將該 Agent 的產品名稱以品牌色標示（新增 `agent-name-highlight` 樣式與 `highlightAgentName()`），並修正 Pi／OMP 繁簡中文副標題缺漏「的」字的文法問題。
 - 5 份 README（README.md／README.zh-CN.md／README.en.md／README.ja.md／README.ko.md）同步補上 Pi Coding Agent 與 OMP 的說明段落（總覽、setup 需求表、Windows 原生路徑表、專屬設定章節、環境變數表）。
+- 靜態檔案伺服器（`/static` 與 fallback 路由）一律附加 `Cache-Control: no-cache` 標頭，強制瀏覽器每次都向伺服器重新驗證（仍透過既有的 ETag／Last-Modified 條件式請求機制回傳 304，不增加頻寬成本），避免部署更新後使用者因瀏覽器快取仍看到舊版 JS／CSS。
 
 ### 修正
 
