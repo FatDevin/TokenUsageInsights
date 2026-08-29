@@ -1,6 +1,6 @@
 # Token 戦情室
 
-**Token 戦情室は、ローカル優先の AI Coding Agent の Token 使用量とセッション復元ダッシュボードです。** Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Grok Build のローカル記録を読み取り、日別・月別・年別の Token 消費量、キャッシュ使用量、推論 Token、推定コスト、モデル分布、プロジェクトディレクトリ分布、完全な Session タイムラインをまとめて表示します。
+**Token 戦情室は、ローカル優先の AI Coding Agent の Token 使用量とセッション復元ダッシュボードです。** Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Grok Build、Pi Coding Agent、OMP のローカル記録を読み取り、日別・月別・年別の Token 消費量、キャッシュ使用量、推論 Token、推定コスト、モデル分布、プロジェクトディレクトリ分布、完全な Session タイムラインをまとめて表示します。
 
 このプロジェクトが AI プロバイダー API を代わりに呼び出してデータを取得することはありません。主なデータソースはローカルログ、Status Line コレクターファイル、ローカル SQLite です。
 
@@ -44,8 +44,10 @@ http://localhost:3003
 | Codex Desktop / CLI | 不要 | `~/.codex/sessions`、`~/.codex/archived_sessions` | Codex のアクティブおよびアーカイブ済みローカル Session を直接スキャン |
 | Claude Code | 不要 | `~/.claude/projects` | Claude Code のローカルプロジェクト Session を直接スキャン |
 | Grok Build | 不要 | `~/.grok/sessions` | Grok Build が自動保存する `updates.jsonl` Session stream を直接スキャン |
+| Pi Coding Agent | 不要 | `~/.pi/agent/sessions` | Pi Coding Agent が自動保存するローカル Session JSONL ファイルを直接スキャン |
+| OMP | 不要 | `~/.omp/agent/sessions` | OMP が自動保存するローカル Session JSONL ファイルを直接スキャン |
 
-**VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Grok Build だけを使用する場合は、1 行のインストールコマンドを実行してダッシュボードを開くだけで利用できます。**
+**VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Grok Build、Pi Coding Agent、OMP だけを使用する場合は、1 行のインストールコマンドを実行してダッシュボードを開くだけで利用できます。**
 
 ### Windows ネイティブでの利用
 
@@ -62,6 +64,8 @@ Windows ではデフォルトで次のネイティブパスを使用します：
 | Claude Code | `%USERPROFILE%\.claude` |
 | Cursor | `%USERPROFILE%\.cursor` |
 | Grok Build | `%USERPROFILE%\.grok` |
+| Pi Coding Agent | `%USERPROFILE%\.pi` |
+| OMP | `%USERPROFILE%\.omp` |
 
 ダッシュボードの設定ガイドは Windows で PowerShell のコピー、設定、診断コマンドを表示します。PowerShell collector は .NET JSON とファイル API を使用し、Bash、`jq`、`sed`、`awk` に依存しません。
 
@@ -110,7 +114,7 @@ Windows ではデフォルトで次のネイティブパスを使用します：
 
 | パラメータ | 対象ビュー | 指定できる値 | 説明 |
 | --- | --- | --- | --- |
-| `agent` | すべて | `antigravity`、`copilot`、`codex`、`claude`、`cursor`、`grok` | 表示する Coding Agent を指定します。`claude-code`、`grok-build` などのエイリアスも利用可能です |
+| `agent` | すべて | `antigravity`、`copilot`、`codex`、`claude`、`cursor`、`grok`、`pi`、`omp` | 表示する Coding Agent を指定します。`claude-code`、`grok-build`、`pi-coding-agent` などのエイリアスも利用可能です |
 | `tab` | すべて | `daily`、`monthly`、`yearly` | 日別（daily）、月別（monthly）、年別（yearly）ビューを指定します |
 | `date` | すべて | `daily`: `YYYY-MM-DD`、`monthly`: `YYYY-MM`、`yearly`: `YYYY` | 表示する日付・月・年を指定します。形式は `tab` に応じて自動的に対応します |
 | `dir` | `daily` | フルパス、`~` で始まるホームディレクトリのパス、または一意のパス末尾（例：`TokenUsageInsights`） | 日別ビューの作業ディレクトリフィルターを指定します。Windows パスは大文字小文字を区別しません。一致するディレクトリがない場合はすべて表示されます |
@@ -354,6 +358,48 @@ Grok Build Session は context token snapshot だけを提供する場合も、p
 
 * * *
 
+## Pi Coding Agent の設定
+
+**Pi Coding Agent に Hook、Status Line、追加の収集スクリプトは必要ありません。** ダッシュボードは次のディレクトリを直接スキャンします：
+
+```text
+~/.pi/agent/sessions
+```
+
+Pi Coding Agent はツリー構造のディレクトリ配下に Session をローカル JSONL ファイルとして自動保存し、ダッシュボードはそれらの Session 記録を直接読み取ります。
+
+使用方法：
+
+1. Pi Coding Agent を通常どおり使い、少なくとも 1 つの Session を作成します。
+2. ダッシュボードを起動または再読み込みします。
+3. 左側で Pi Coding Agent を選択します。
+4. 右上の同期ボタンをクリックするか、バックグラウンド同期を待ちます。
+
+Pi Coding Agent のコストは、各 Session が各 turn ごとに報告する `usage.cost` と関連 usage データから常に直接読み取られます。Pi は turn ごとの権威ある token / cost 情報をネイティブに提供するため、Grok Build のような context snapshot 推定へのフォールバックはありません。
+
+* * *
+
+## OMP の設定
+
+**OMP に Hook、Status Line、追加の収集スクリプトは必要ありません。** ダッシュボードは次のディレクトリを直接スキャンします：
+
+```text
+~/.omp/agent/sessions
+```
+
+OMP は Pi Coding Agent のオープンソースフォーク（<https://github.com/can1357/oh-my-pi>）で、まったく同じ JSONL 形式で Session を永続化します。ダッシュボードはそれらのローカル Session 記録を直接読み取ります。
+
+使用方法：
+
+1. OMP を通常どおり使い、少なくとも 1 つの Session を作成します。
+2. ダッシュボードを起動または再読み込みします。
+3. 左側で OMP を選択します。
+4. 右上の同期ボタンをクリックするか、バックグラウンド同期を待ちます。
+
+OMP のコストは、各 Session が各 turn ごとに報告する `usage.cost` と関連 usage データから常に直接読み取られます。OMP は turn ごとの権威ある token / cost 情報をネイティブに提供するため、Grok Build のような context snapshot 推定へのフォールバックはありません。
+
+* * *
+
 ## ローカルデータの同期方法
 
 サービス起動時にバックエンドがローカル SQLite を初期化し、直ちに 1 回同期します。起動後は 5 秒ごとにバックグラウンド同期も行います。
@@ -378,7 +424,7 @@ GET /api/:assistant/sync
 
 CLI ツールはソースからビルドする上級者向けです。Release パッケージには現在 CLI 実行ファイルは含まれません。
 
-`--agent` はアシスタント（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok`）を指定します。
+`--agent` はアシスタント（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp`）を指定します。
 
 ### ソースから CLI を使用
 
@@ -436,6 +482,8 @@ cargo build --release --bin token-usage-insights-cli
 | `CURSOR_DIR` | `~/.cursor` | Cursor データディレクトリ |
 | `CURSOR_STATE_DB` | プラットフォームにより自動検出 | Cursor `User/globalStorage/state.vscdb` のパス。読み取り専用で `agentKv` モデル情報を取得するために使用 |
 | `GROK_DIR` | `~/.grok` | Grok Build データディレクトリ |
+| `PI_DIR` | `~/.pi` | Pi Coding Agent データディレクトリ |
+| `OMP_DIR` | `~/.omp` | OMP データディレクトリ |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | カンマ区切りの許可 CORS オリジン |
 
 > **デフォルトのバインド先は `0.0.0.0` で、同じローカルネットワーク上の他のデバイスからダッシュボードに接続できる可能性があります。ローカルだけで閲覧する場合は `HOST` を `127.0.0.1` に設定してください。**

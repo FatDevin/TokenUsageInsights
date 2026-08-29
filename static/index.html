@@ -72,6 +72,14 @@
             <img class="assistant-logo" src="/static/grok-logo.svg" alt="Grok Build" />
             <span class="agent-name-tooltip">Grok Build</span>
           </button>
+          <button class="assistant-badge-btn" data-value="pi" title="Pi Coding Agent" aria-label="Pi Coding Agent">
+            <img class="assistant-logo" src="/static/pi-logo.svg" alt="Pi Coding Agent" />
+            <span class="agent-name-tooltip">Pi Coding Agent</span>
+          </button>
+          <button class="assistant-badge-btn" data-value="omp" title="OMP" aria-label="OMP">
+            <img class="assistant-logo" src="/static/omp-logo.svg" alt="OMP" />
+            <span class="agent-name-tooltip">OMP</span>
+          </button>
         </div>
       </div>
 
@@ -1108,6 +1116,50 @@ cd TokenUsageInsights</code></pre>
           <p class="modal-text" data-i18n="grok_setup_step_3_desc">若本機 session 含 provider usage，會優先使用該資料；若只有 context token snapshot，畫面會以 xAI API list price 顯示估算，並標示來源，不代表訂閱方案的週配額。</p>
         </div>
       </div>
+
+      <!-- Pi Coding Agent Setup Content -->
+      <div class="modal-body" id="setup-body-pi" style="display: none;">
+        <div class="modal-text">
+          <p data-i18n="pi_setup_modal_intro">本看板會讀取 Pi Coding Agent 自動保存的本地 session stream。Pi Coding Agent 不需要額外安裝狀態列腳本。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="pi_setup_step_1"><span>01</span> 1. 確認 Pi Coding Agent 已在使用</h3>
+          <p class="modal-text" data-i18n="pi_setup_step_1_desc">在終端機中使用過 Pi Coding Agent 後，session 會自動保存至 <code>~/.pi/agent/sessions</code>。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="pi_setup_step_2"><span>02</span> 2. 偵測本機資料路徑</h3>
+          <p class="modal-text" data-i18n="pi_setup_step_2_desc">目前偵測到的 Pi Coding Agent session 目錄為：<code id="lbl-detected-home-pi">~/.pi/agent/sessions</code>。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="pi_setup_step_3"><span>03</span> 3. 了解計費資料來源</h3>
+          <p class="modal-text" data-i18n="pi_setup_step_3_desc">Pi 的每個 session turn 都會回報自己的 <code>usage.cost</code>，本看板會直接讀取該欄位作為權威成本資料，無需額外估算。</p>
+        </div>
+      </div>
+
+      <!-- OMP Setup Content -->
+      <div class="modal-body" id="setup-body-omp" style="display: none;">
+        <div class="modal-text">
+          <p data-i18n="omp_setup_modal_intro">本看板會讀取 OMP 自動保存的本地 session stream。OMP 不需要額外安裝狀態列腳本。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="omp_setup_step_1"><span>01</span> 1. 確認 OMP 已在使用</h3>
+          <p class="modal-text" data-i18n="omp_setup_step_1_desc">在終端機中使用過 OMP 後，session 會自動保存至 <code>~/.omp/agent/sessions</code>。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="omp_setup_step_2"><span>02</span> 2. 偵測本機資料路徑</h3>
+          <p class="modal-text" data-i18n="omp_setup_step_2_desc">目前偵測到的 OMP session 目錄為：<code id="lbl-detected-home-omp">~/.omp/agent/sessions</code>。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="omp_setup_step_3"><span>03</span> 3. 了解計費資料來源</h3>
+          <p class="modal-text" data-i18n="omp_setup_step_3_desc">OMP 的每個 session turn 都會回報自己的 <code>usage.cost</code>，本看板會直接讀取該欄位作為權威成本資料，無需額外估算。</p>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1186,6 +1238,8 @@ cd TokenUsageInsights</code></pre>
             <option value="claude">Claude Code</option>
             <option value="cursor">Cursor</option>
             <option value="grok">Grok Build</option>
+            <option value="pi">Pi Coding Agent</option>
+            <option value="omp">OMP</option>
           </select>
         </label>
         <div id="usage-import-validation" class="usage-import-validation" role="status"></div>

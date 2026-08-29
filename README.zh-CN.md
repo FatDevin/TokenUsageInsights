@@ -1,6 +1,6 @@
 # Token 战情室
 
-**Token 战情室是本地优先的 AI Coding Agent Token 使用量与会话还原看板。** 它会读取本机上的 Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code 与 Grok Build 记录，集中呈现每日、月度、年度的 Token 消耗、缓存使用、推理 Token、估算费用、模型分布、项目目录分布与完整 Session 时间轴。
+**Token 战情室是本地优先的 AI Coding Agent Token 使用量与会话还原看板。** 它会读取本机上的 Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Grok Build、Pi Coding Agent 与 OMP 记录，集中呈现每日、月度、年度的 Token 消耗、缓存使用、推理 Token、估算费用、模型分布、项目目录分布与完整 Session 时间轴。
 
 本项目不会代你调用 AI 供应商 API 查询数据；核心数据来源是本地日志、Status Line 收集文件与本地 SQLite。
 
@@ -44,8 +44,10 @@ http://localhost:3003
 | Codex Desktop / CLI | 不需要 | `~/.codex/sessions`、`~/.codex/archived_sessions` | 看板会直接扫描 Codex 活动中与已归档的本地 Session 记录 |
 | Claude Code | 不需要 | `~/.claude/projects` | 看板会直接扫描 Claude Code 的本地项目 Session 记录 |
 | Grok Build | 不需要 | `~/.grok/sessions` | 看板会直接扫描 Grok Build 自动保存的 `updates.jsonl` Session stream |
+| Pi Coding Agent | 不需要 | `~/.pi/agent/sessions` | 看板会直接扫描 Pi Coding Agent 自动保存的本地 Session JSONL 文件 |
+| OMP | 不需要 | `~/.omp/agent/sessions` | 看板会直接扫描 OMP 自动保存的本地 Session JSONL 文件 |
 
-**只使用 VS Code Copilot、Codex Desktop、Codex CLI、Claude Code 或 Grok Build 时，执行一行安装命令并打开看板即可。**
+**只使用 VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Grok Build、Pi Coding Agent 或 OMP 时，执行一行安装命令并打开看板即可。**
 
 ### Windows 原生使用
 
@@ -62,6 +64,8 @@ Windows 默认使用以下原生路径：
 | Claude Code | `%USERPROFILE%\.claude` |
 | Cursor | `%USERPROFILE%\.cursor` |
 | Grok Build | `%USERPROFILE%\.grok` |
+| Pi Coding Agent | `%USERPROFILE%\.pi` |
+| OMP | `%USERPROFILE%\.omp` |
 
 看板内的设置指南会在 Windows 显示 PowerShell 复制、设置与诊断命令。PowerShell collector 使用 .NET JSON 与文件 API，不依赖 Bash、`jq`、`sed` 或 `awk`。
 
@@ -110,7 +114,7 @@ Windows 默认使用以下原生路径：
 
 | 参数 | 适用视图 | 可用值 | 说明 |
 | --- | --- | --- | --- |
-| `agent` | 全部 | `antigravity`、`copilot`、`codex`、`claude`、`cursor`、`grok` | 指定要显示的 Coding Agent。另支持 `claude-code`、`grok-build` 等别名写法 |
+| `agent` | 全部 | `antigravity`、`copilot`、`codex`、`claude`、`cursor`、`grok`、`pi`、`omp` | 指定要显示的 Coding Agent。另支持 `claude-code`、`grok-build`、`pi-coding-agent` 等别名写法 |
 | `tab` | 全部 | `daily`、`monthly`、`yearly` | 指定以日（每日）、月（月度）或年（年度）视图显示 |
 | `date` | 全部 | `daily`：`YYYY-MM-DD`；`monthly`：`YYYY-MM`；`yearly`：`YYYY` | 指定要显示的日期、月份或年份，格式会依 `tab` 自动对应 |
 | `dir` | `daily` | 完整路径、`~` 开头的家目录路径，或唯一的路径后缀（如 `TokenUsageInsights`） | 指定每日视图的工作目录筛选。Windows 路径不区分大小写；找不到匹配目录时会显示全部 |
@@ -354,6 +358,48 @@ Grok Build Session 可能只提供 context token snapshot，也可能包含 prov
 
 * * *
 
+## Pi Coding Agent 设置
+
+**Pi Coding Agent 不需要安装 Hook、Status Line 或额外收集脚本。** 看板会直接扫描：
+
+```text
+~/.pi/agent/sessions
+```
+
+Pi Coding Agent 会以树状目录结构自动将 Session 保存为本地 JSONL 文件；看板会直接读取这些 Session 记录。
+
+使用方式：
+
+1. 先正常使用 Pi Coding Agent 创建至少一个 Session。
+2. 启动或刷新本项目看板。
+3. 在左侧选择 Pi Coding Agent。
+4. 按右上角同步按钮，或等待后台同步。
+
+Pi Coding Agent 的成本始终直接读取自 Session 每个 turn 自行报告的 `usage.cost` 与相关 usage 数据，不会像 Grok Build 那样回退到 context snapshot 估算；因为 Pi 原生就会提供权威的 token 与成本信息。
+
+* * *
+
+## OMP 设置
+
+**OMP 不需要安装 Hook、Status Line 或额外收集脚本。** 看板会直接扫描：
+
+```text
+~/.omp/agent/sessions
+```
+
+OMP 是 Pi Coding Agent 的开源分支（<https://github.com/can1357/oh-my-pi>），并使用完全相同的 JSONL 格式持久化 Session。看板会直接读取这些本地 Session 记录。
+
+使用方式：
+
+1. 先正常使用 OMP 创建至少一个 Session。
+2. 启动或刷新本项目看板。
+3. 在左侧选择 OMP。
+4. 按右上角同步按钮，或等待后台同步。
+
+OMP 的成本始终直接读取自 Session 每个 turn 自行报告的 `usage.cost` 与相关 usage 数据，不会像 Grok Build 那样回退到 context snapshot 估算；因为 OMP 原生就会提供权威的 token 与成本信息。
+
+* * *
+
 ## 本地数据同步方式
 
 启动服务时，后端会初始化本地 SQLite 并立即同步一次数据。服务启动后，也会每 5 秒进行一次后台同步。
@@ -378,7 +424,7 @@ GET /api/:assistant/sync
 
 CLI 工具仅提供给从源代码构建的高级用户；Release 安装包目前不包含 CLI 可执行文件。
 
-`--agent` 用于指定助理（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok`）。
+`--agent` 用于指定助理（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp`）。
 
 ### 从源代码使用 CLI
 
@@ -436,6 +482,8 @@ cargo build --release --bin token-usage-insights-cli
 | `CURSOR_DIR` | `~/.cursor` | Cursor 数据目录 |
 | `CURSOR_STATE_DB` | 按平台自动检测 | Cursor `User/globalStorage/state.vscdb` 路径，用于只读获取 `agentKv` 模型信息 |
 | `GROK_DIR` | `~/.grok` | Grok Build 数据目录 |
+| `PI_DIR` | `~/.pi` | Pi Coding Agent 数据目录 |
+| `OMP_DIR` | `~/.omp` | OMP 数据目录 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 允许的 CORS 来源，以逗号分隔 |
 
 > **默认绑定 `0.0.0.0`，同一局域网内的其他设备可能连接到看板。只需在本机浏览时，请将 `HOST` 设置为 `127.0.0.1`。**

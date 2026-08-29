@@ -18,7 +18,7 @@ use crate::pricing::{load_prepared_pricing_rules, PreparedPricingRules};
 use crate::timeline::{
     parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
     parse_copilot_timeline_filtered, parse_cursor_timeline, parse_grok_timeline,
-    parse_vscode_timeline, TimelineItem,
+    parse_omp_timeline, parse_pi_timeline, parse_vscode_timeline, TimelineItem,
 };
 
 fn add_usage_to_day_summary(summary: &mut DaySummary, usage: &UsageAggregation) {
@@ -204,6 +204,37 @@ fn resolve_codex_transcript_path(
 
     if !canonical_path.starts_with(codex_root) {
         return Err("Codex 會話日誌路徑不在預期目錄內。".to_string());
+    }
+
+    Ok(canonical_path)
+}
+
+fn resolve_pi_family_transcript_path(
+    base_dir: &StdPath,
+    assistant_label: &str,
+    transcript_path_db: &str,
+) -> Result<PathBuf, String> {
+    let mut path = PathBuf::from(transcript_path_db);
+    if path.is_relative() {
+        path = base_dir.join(path);
+    }
+
+    if !path.exists() {
+        return Err(format!("找不到該 {assistant_label} session 的本地日誌檔案。"));
+    }
+
+    let base_root = base_dir
+        .canonicalize()
+        .map_err(|_| format!("無法存取 {assistant_label} 根目錄。"))?;
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|_| format!("無法解析 {assistant_label} session 日誌路徑。"))?;
+
+    if !canonical_path.starts_with(&base_root) {
+        return Err(format!("{assistant_label} session 日誌路徑不在預期目錄內。"));
+    }
+    if canonical_path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+        return Err(format!("{assistant_label} session 日誌格式不受支援。"));
     }
 
     Ok(canonical_path)
@@ -648,6 +679,26 @@ fn resolve_session_file_path(
             resolve_grok_transcript_path(&db::get_grok_dir(), session_id, path)
                 .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
         }
+        "pi" => {
+            let path = transcript_path_db.ok_or_else(|| {
+                SessionFileErrorExt::new(
+                    StatusCode::NOT_FOUND,
+                    "找不到 Pi Coding Agent session 日誌檔案路徑。".to_string(),
+                )
+            })?;
+            resolve_pi_family_transcript_path(&db::get_pi_dir(), "Pi Coding Agent", path)
+                .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
+        }
+        "omp" => {
+            let path = transcript_path_db.ok_or_else(|| {
+                SessionFileErrorExt::new(
+                    StatusCode::NOT_FOUND,
+                    "找不到 OMP session 日誌檔案路徑。".to_string(),
+                )
+            })?;
+            resolve_pi_family_transcript_path(&db::get_omp_dir(), "OMP", path)
+                .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
+        }
         _ => Err(SessionFileErrorExt::new(
             StatusCode::BAD_REQUEST,
             "不支援的助理類型",
@@ -723,6 +774,8 @@ fn parse_session_timeline_file(
         "claude" => parse_claude_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "cursor" => parse_cursor_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "grok" => parse_grok_timeline(reader, db_entries, &mut timeline, &mut metadata),
+        "pi" => parse_pi_timeline(reader, db_entries, &mut timeline, &mut metadata),
+        "omp" => parse_omp_timeline(reader, db_entries, &mut timeline, &mut metadata),
         _ => return Err((StatusCode::BAD_REQUEST, "不支援的助理類型".to_string())),
     }
 
@@ -858,6 +911,12 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
     let grok_dir = db::get_grok_dir();
     let grok_exists = grok_dir.join("sessions").exists();
 
+    let pi_dir = db::get_pi_dir();
+    let pi_exists = pi_dir.join("agent").join("sessions").exists();
+
+    let omp_dir = db::get_omp_dir();
+    let omp_exists = omp_dir.join("agent").join("sessions").exists();
+
     Json(SetupInfoResponse {
         platform: std::env::consts::OS.to_string(),
         workspace_dir,
@@ -920,6 +979,30 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
             dir_path: grok_dir.to_string_lossy().into_owned(),
             data_path: grok_dir.join("sessions").to_string_lossy().into_owned(),
             exists: grok_exists,
+            script_path: "".to_string(),
+            source_script_path: "".to_string(),
+            settings_path: "".to_string(),
+        },
+        pi: AssistantSetupStatus {
+            dir_path: pi_dir.to_string_lossy().into_owned(),
+            data_path: pi_dir
+                .join("agent")
+                .join("sessions")
+                .to_string_lossy()
+                .into_owned(),
+            exists: pi_exists,
+            script_path: "".to_string(),
+            source_script_path: "".to_string(),
+            settings_path: "".to_string(),
+        },
+        omp: AssistantSetupStatus {
+            dir_path: omp_dir.to_string_lossy().into_owned(),
+            data_path: omp_dir
+                .join("agent")
+                .join("sessions")
+                .to_string_lossy()
+                .into_owned(),
+            exists: omp_exists,
             script_path: "".to_string(),
             source_script_path: "".to_string(),
             settings_path: "".to_string(),

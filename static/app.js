@@ -81,6 +81,12 @@ const assistantAliasMap = {
   'grok-build': 'grok',
   'grok_build': 'grok',
   'grokbuild': 'grok',
+  'pi-coding-agent': 'pi',
+  'pi_coding_agent': 'pi',
+  'picodingagent': 'pi',
+  'oh-my-pi': 'omp',
+  'oh_my_pi': 'omp',
+  'ohmypi': 'omp',
 };
 
 const assistantMeta = {
@@ -91,6 +97,8 @@ const assistantMeta = {
     alt: 'Antigravity',
     badgeStyle: 'background: rgba(47, 184, 197, 0.13); color: #2fb8c5; border: 1px solid rgba(47, 184, 197, 0.26); display: inline-flex; align-items: center;',
     senderName: 'ANTIGRAVITY AGENT',
+    highlightColor: '#2fb8c5',
+    nameHighlights: ['Antigravity CLI'],
   },
   copilot: {
     logo: '/static/githubcopilot.webp',
@@ -99,6 +107,8 @@ const assistantMeta = {
     alt: 'Copilot',
     badgeStyle: 'background: rgba(185, 43, 39, 0.15); color: #b92b27; border: 1px solid rgba(185, 43, 39, 0.3); display: inline-flex; align-items: center;',
     senderName: 'COPILOT AGENT',
+    highlightColor: '#b92b27',
+    nameHighlights: ['GitHub Copilot'],
   },
   codex: {
     logo: '/static/codex.webp',
@@ -107,6 +117,8 @@ const assistantMeta = {
     alt: 'Codex',
     badgeStyle: 'background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.3); display: inline-flex; align-items: center;',
     senderName: 'CODEX AGENT',
+    highlightColor: '#10b981',
+    nameHighlights: ['Codex Desktop', 'Codex CLI'],
   },
   claude: {
     logo: '/static/claude-code-logo.svg',
@@ -115,6 +127,8 @@ const assistantMeta = {
     alt: 'Claude Code',
     badgeStyle: 'background: rgba(79, 126, 168, 0.15); color: #7aa7cf; border: 1px solid rgba(79, 126, 168, 0.3); display: inline-flex; align-items: center;',
     senderName: 'CLAUDE CODE AGENT',
+    highlightColor: '#7aa7cf',
+    nameHighlights: ['Claude Code'],
   },
   cursor: {
     logo: '/static/cursor-logo.svg',
@@ -123,6 +137,8 @@ const assistantMeta = {
     alt: 'Cursor',
     badgeStyle: 'background: rgba(139, 92, 246, 0.15); color: #a78bfa; border: 1px solid rgba(139, 92, 246, 0.3); display: inline-flex; align-items: center;',
     senderName: 'CURSOR AGENT',
+    highlightColor: '#a78bfa',
+    nameHighlights: ['Cursor'],
   },
   grok: {
     logo: '/static/grok-logo.svg',
@@ -131,6 +147,28 @@ const assistantMeta = {
     alt: 'Grok Build',
     badgeStyle: 'background: rgba(239, 68, 68, 0.13); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.28); display: inline-flex; align-items: center;',
     senderName: 'GROK BUILD AGENT',
+    highlightColor: '#f87171',
+    nameHighlights: ['Grok Build'],
+  },
+  pi: {
+    logo: '/static/pi-logo.svg',
+    label: 'Pi Coding Agent',
+    shortLabel: 'Pi',
+    alt: 'Pi Coding Agent',
+    badgeStyle: 'background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.3); display: inline-flex; align-items: center;',
+    senderName: 'PI AGENT',
+    highlightColor: '#818cf8',
+    nameHighlights: ['Pi coding agent', 'Pi Coding Agent'],
+  },
+  omp: {
+    logo: '/static/omp-logo.svg',
+    label: 'OMP',
+    shortLabel: 'OMP',
+    alt: 'OMP',
+    badgeStyle: 'background: rgba(13, 148, 136, 0.15); color: #2dd4bf; border: 1px solid rgba(13, 148, 136, 0.3); display: inline-flex; align-items: center;',
+    senderName: 'OMP AGENT',
+    highlightColor: '#2dd4bf',
+    nameHighlights: ['OMP'],
   },
 };
 
@@ -365,6 +403,22 @@ function t(key, assistant = currentAssistant) {
   return key;
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Wraps the agent's product name (e.g. "GitHub Copilot", "Grok Build") inside
+// a translated string with a colored <span> so it stands out at a glance,
+// using each assistant's own brand color from assistantMeta.
+function highlightAgentName(text, assistant = currentAssistant) {
+  const meta = getAssistantMeta(assistant);
+  const terms = meta.nameHighlights;
+  const color = meta.highlightColor;
+  if (!text || !color || !terms || !terms.length) return text;
+  const pattern = new RegExp(terms.map(escapeRegExp).join('|'), 'g');
+  return text.replace(pattern, (match) => `<span class="agent-name-highlight" style="color: ${color};">${match}</span>`);
+}
+
 function iconMarkup(name, extraClass = '') {
   const classes = ['icon-glyph', `icon-${name}`, extraClass].filter(Boolean).join(' ');
   return `<span class="${classes}" aria-hidden="true"></span>`;
@@ -512,6 +566,8 @@ const setupModalTitleKeys = {
   claude: 'claude_setup_modal_title',
   cursor: 'cursor_setup_modal_title',
   grok: 'grok_setup_modal_title',
+  pi: 'pi_setup_modal_title',
+  omp: 'omp_setup_modal_title',
 };
 
 function getSetupModalTitleKey(assistant) {
@@ -535,6 +591,8 @@ function setSetupModalBody(assistant) {
     claude: 'setup-body-claude',
     cursor: 'setup-body-cursor',
     grok: 'setup-body-grok',
+    pi: 'setup-body-pi',
+    omp: 'setup-body-omp',
   };
   const bodyElements = Object.values(bodyIds)
     .filter((bodyId, index, ids) => ids.indexOf(bodyId) === index)
@@ -562,6 +620,13 @@ function updateLanguageUI() {
     const key = el.getAttribute('data-i18n');
     el.innerHTML = t(key);
   });
+
+  // The header subtitle mentions the active agent's product name; highlight
+  // it in that agent's own brand color so it's easy to spot at a glance.
+  const headerDescriptionEl = document.querySelector('[data-i18n="header_description"]');
+  if (headerDescriptionEl) {
+    headerDescriptionEl.innerHTML = highlightAgentName(t('header_description'));
+  }
 
   document.querySelectorAll('[data-i18n-title]').forEach(el => {
     const key = el.getAttribute('data-i18n-title');
@@ -6325,6 +6390,12 @@ async function loadSetupInfo(assistant = currentAssistant) {
     } else if (resolvedAssistant === 'grok') {
       const homeLabelGrok = document.getElementById('lbl-detected-home-grok');
       if (homeLabelGrok) homeLabelGrok.textContent = abbreviateHomePath(data.grok?.data_path || '');
+    } else if (resolvedAssistant === 'pi') {
+      const homeLabelPi = document.getElementById('lbl-detected-home-pi');
+      if (homeLabelPi) homeLabelPi.textContent = abbreviateHomePath(data.pi?.data_path || '');
+    } else if (resolvedAssistant === 'omp') {
+      const homeLabelOmp = document.getElementById('lbl-detected-home-omp');
+      if (homeLabelOmp) homeLabelOmp.textContent = abbreviateHomePath(data.omp?.data_path || '');
     }
 
     // Apply updated language translations

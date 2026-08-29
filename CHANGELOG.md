@@ -2,6 +2,24 @@
 
 本文件記錄 TokenUsageInsights 各正式版本的實際變更。內容依 Git 標籤間的提交記錄與檔案差異整理，格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)，版本編號遵循 [Semantic Versioning](https://semver.org/lang/zh-TW/)。
 
+## [未發行]
+
+### 新增與改善
+
+- 新增支援兩個 Agent 類型：**Pi Coding Agent**（<https://pi.dev/>）與 **OMP**（<https://omp.sh/>，Pi 的開源分支）。兩者共用相同的樹狀結構 JSONL session 格式（`<dir>/agent/sessions/**/*.jsonl`），新增 `src/pi.rs` 共用解析器與 `src/omp.rs` 薄封裝，並整合進資料庫同步（`sync_pi_usage_logs` / `sync_omp_usage_logs`）、API handlers、Session 時間軸重建與 CLI 工具；兩者的成本一律直接讀取 session 每個 turn 自行回報的 `usage.cost`，不需要額外的 `pricing.csv` 估算。
+- 前端新增 Pi／OMP 的 Agent 徽章、原創 Logo（`pi-logo.svg`／`omp-logo.svg`，避免使用官方商標圖檔）、設定精靈內容，並補齊 zh-TW／zh-CN／en／ja／ko 五語系文案。
+- 「AGENT 類型」側欄圖示改為 4 欄 × 2 列的格線排列（`repeat(4, minmax(0, 1fr))`），因應圖示數量增加到 8 個仍維持整齊排版。
+- 各 Agent 專屬副標題（首頁描述文字）現在會將該 Agent 的產品名稱以品牌色標示（新增 `agent-name-highlight` 樣式與 `highlightAgentName()`），並修正 Pi／OMP 繁簡中文副標題缺漏「的」字的文法問題。
+- 5 份 README（README.md／README.zh-CN.md／README.en.md／README.ja.md／README.ko.md）同步補上 Pi Coding Agent 與 OMP 的說明段落（總覽、setup 需求表、Windows 原生路徑表、專屬設定章節、環境變數表）。
+
+### 修正
+
+- 修復 OMP session 檔案因在 `{"type":"session",...}` 標頭前多一行 `{"type":"title",...}`，導致 `read_session_header()` 只讀取檔案第一行而抓不到 `cwd`／`session_id`，畫面顯示為「Unknown CWD」的問題；改為掃描前 10 行尋找 `type == "session"` 的項目。
+- 修復 OMP 的 `model_change` 事件使用 `"model"` 欄位（Pi 使用 `"modelId"`）而未被 Session 時間軸解析辨識，導致「Model changed to X」系統訊息遺漏的問題。
+- 修復 Pi／OMP usage 資料中的 `usage.reasoning`（推理 Token 數）未被解析、恆為 0 的問題。
+
+以上變更均已通過 `cargo build --release --all-targets`（零警告）、`cargo test`（346 項全數通過）、`cargo clippy --all-targets --all-features`（零警告），並以本機真實 `~/.pi`、`~/.omp` 資料驗證同步結果正確。
+
 ## [0.7.4] - 2026-08-28
 
 ### 新增與改善

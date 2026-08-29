@@ -2448,6 +2448,408 @@ pub fn parse_grok_timeline(
     );
 }
 
+/// Shared timeline reconstruction for the Pi Coding Agent
+/// (<https://pi.dev/>) and its fork OMP (<https://omp.sh/>), which persist
+/// sessions using the identical tree-structured JSONL format. See
+/// `crate::pi` for the format reference and the DB-sync-side parser.
+fn parse_pi_family_timeline(
+    reader: BufReader<File>,
+    db_entries: &HashMap<u32, (TokenStats, String)>,
+    timeline: &mut Vec<TimelineItem>,
+    metadata: &mut HashMap<String, serde_json::Value>,
+    session_label: &str,
+) {
+    let mut turn_no = 1u32;
+    let mut current_model = UNKNOWN_MODEL.to_string();
+    let mut tool_indices: HashMap<String, usize> = HashMap::new();
+    let mut session_started = false;
+
+    for line_res in reader.lines() {
+        let Ok(line) = line_res else {
+            continue;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let timestamp = entry
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if entry_type == "session" {
+            if !session_started {
+                timeline.push(TimelineItem::SystemStatus {
+                    timestamp: timestamp.clone(),
+                    status_type: "session_start".to_string(),
+                    message: format!("{session_label} session started"),
+                });
+                session_started = true;
+            }
+            if let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str()) {
+                metadata.insert(
+                    "cwd".to_string(),
+                    serde_json::Value::String(cwd.to_string()),
+                );
+            }
+            continue;
+        }
+
+        if entry_type == "compaction" {
+            if let Some(summary) = entry.get("summary").and_then(|v| v.as_str()) {
+                timeline.push(TimelineItem::SystemStatus {
+                    timestamp,
+                    status_type: "compaction".to_string(),
+                    message: summary.to_string(),
+                });
+            }
+            continue;
+        }
+
+        if entry_type == "model_change" {
+            // Pi uses `modelId`, while OMP's fork uses `model` for the same
+            // event; accept either key name.
+            let model_id = entry
+                .get("modelId")
+                .or_else(|| entry.get("model"))
+                .and_then(|v| v.as_str());
+            if let Some(model_id) = model_id {
+                current_model = model_id.to_string();
+                timeline.push(TimelineItem::SystemStatus {
+                    timestamp,
+                    status_type: "model_change".to_string(),
+                    message: format!("Model changed to {model_id}"),
+                });
+            }
+            continue;
+        }
+
+        if entry_type != "message" {
+            continue;
+        }
+        let Some(message) = entry.get("message") else {
+            continue;
+        };
+        let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
+
+        match role {
+            "user" => {
+                let prompt = value_to_text(message.get("content"));
+                if !prompt.is_empty() {
+                    timeline.push(TimelineItem::UserPrompt {
+                        timestamp,
+                        prompt,
+                        context: None,
+                        turn_no,
+                    });
+                }
+            }
+            "assistant" => {
+                let mut reply_parts = Vec::new();
+                let mut reasoning_parts = Vec::new();
+                if let Some(content) = message.get("content").and_then(|v| v.as_array()) {
+                    for block in content {
+                        match block.get("type").and_then(|v| v.as_str()) {
+                            Some("text") => {
+                                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                    reply_parts.push(text.to_string());
+                                }
+                            }
+                            Some("thinking") => {
+                                if let Some(text) =
+                                    block.get("thinking").and_then(|v| v.as_str())
+                                {
+                                    reasoning_parts.push(text.to_string());
+                                }
+                            }
+                            Some("toolCall") => {
+                                let call_id = block
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let tool_name = block
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("tool_call")
+                                    .to_string();
+                                let arguments = block
+                                    .get("arguments")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                let index = timeline.len();
+                                if !call_id.is_empty() {
+                                    tool_indices.insert(call_id.clone(), index);
+                                }
+                                timeline.push(TimelineItem::ToolStep {
+                                    timestamp: timestamp.clone(),
+                                    tool_name,
+                                    arguments,
+                                    env: None,
+                                    exit_code: None,
+                                    stdout: String::new(),
+                                    stderr: String::new(),
+                                    tool_call_id: (!call_id.is_empty()).then_some(call_id),
+                                    status: "running".to_string(),
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                if let Some(model) = message.get("model").and_then(|v| v.as_str()) {
+                    current_model = model.to_string();
+                }
+                let (tokens, model) = db_entries
+                    .get(&turn_no)
+                    .map(|(stats, model)| (Some(stats.clone()), model.clone()))
+                    .unwrap_or((None, current_model.clone()));
+                current_model = model.clone();
+
+                let reply = reply_parts.join("");
+                let reasoning = (!reasoning_parts.is_empty()).then(|| reasoning_parts.join(""));
+                if !reply.is_empty() || tokens.is_some() {
+                    timeline.push(TimelineItem::AgentReply {
+                        timestamp,
+                        reply,
+                        reasoning,
+                        turn_no,
+                        model,
+                        tokens,
+                        duration_ms: None,
+                        reasoning_effort: None,
+                    });
+                }
+                turn_no += 1;
+            }
+            "toolResult" => {
+                let call_id = message
+                    .get("toolCallId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let is_error = message
+                    .get("isError")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let text = value_to_text(message.get("content"));
+                let (stdout, stderr) = if is_error {
+                    (String::new(), text)
+                } else {
+                    (text, String::new())
+                };
+                if let Some(index) = tool_indices.get(call_id).copied() {
+                    if let Some(TimelineItem::ToolStep {
+                        stdout: current_stdout,
+                        stderr: current_stderr,
+                        exit_code,
+                        status,
+                        ..
+                    }) = timeline.get_mut(index)
+                    {
+                        if !stdout.is_empty() {
+                            *current_stdout = stdout;
+                        }
+                        if !stderr.is_empty() {
+                            *current_stderr = stderr;
+                        }
+                        *status = if is_error {
+                            "failed".to_string()
+                        } else {
+                            "success".to_string()
+                        };
+                        *exit_code = Some(if is_error { 1 } else { 0 });
+                    }
+                } else {
+                    let tool_name = message
+                        .get("toolName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tool_result")
+                        .to_string();
+                    timeline.push(TimelineItem::ToolStep {
+                        timestamp,
+                        tool_name,
+                        arguments: serde_json::Value::Null,
+                        env: None,
+                        exit_code: Some(if is_error { 1 } else { 0 }),
+                        stdout,
+                        stderr,
+                        tool_call_id: (!call_id.is_empty()).then(|| call_id.to_string()),
+                        status: if is_error {
+                            "failed".to_string()
+                        } else {
+                            "success".to_string()
+                        },
+                    });
+                }
+            }
+            "bashExecution" => {
+                let command = message
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let output = message
+                    .get("output")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let exit_code = message
+                    .get("exitCode")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32);
+                let cancelled = message
+                    .get("cancelled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let status = if cancelled {
+                    "failed".to_string()
+                } else {
+                    match exit_code {
+                        Some(0) => "success".to_string(),
+                        Some(_) => "failed".to_string(),
+                        None => "running".to_string(),
+                    }
+                };
+                timeline.push(TimelineItem::ToolStep {
+                    timestamp,
+                    tool_name: "bash".to_string(),
+                    arguments: serde_json::json!({ "command": command }),
+                    env: None,
+                    exit_code,
+                    stdout: output,
+                    stderr: String::new(),
+                    tool_call_id: None,
+                    status,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    metadata.insert(
+        "selected_model".to_string(),
+        serde_json::Value::String(current_model),
+    );
+}
+
+pub fn parse_pi_timeline(
+    reader: BufReader<File>,
+    db_entries: &HashMap<u32, (TokenStats, String)>,
+    timeline: &mut Vec<TimelineItem>,
+    metadata: &mut HashMap<String, serde_json::Value>,
+) {
+    parse_pi_family_timeline(reader, db_entries, timeline, metadata, "Pi Coding Agent")
+}
+
+pub fn parse_omp_timeline(
+    reader: BufReader<File>,
+    db_entries: &HashMap<u32, (TokenStats, String)>,
+    timeline: &mut Vec<TimelineItem>,
+    metadata: &mut HashMap<String, serde_json::Value>,
+) {
+    parse_pi_family_timeline(reader, db_entries, timeline, metadata, "OMP")
+}
+
+#[cfg(test)]
+mod pi_family_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn make_reader(lines: &[&str]) -> BufReader<File> {
+        let path = std::env::temp_dir().join(format!(
+            "token-usage-insights-pi-timeline-test-{}-{}",
+            std::process::id(),
+            lines.len()
+        ));
+        let mut file = File::create(&path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        let file = File::open(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        BufReader::new(file)
+    }
+
+    #[test]
+    fn parse_pi_timeline_reconstructs_prompt_reply_and_tool_call() {
+        let reader = make_reader(&[
+            r#"{"type":"session","version":3,"id":"sess-1","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/tmp/project"}"#,
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2024-12-03T14:00:01.000Z","message":{"role":"user","content":"List files"}}"#,
+            r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2024-12-03T14:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Sure"},{"type":"toolCall","id":"call_1","name":"bash","arguments":{"command":"ls"}}],"model":"claude-sonnet-4-5","usage":{"input":10,"output":5,"totalTokens":15,"cost":{"total":0.001}}}}"#,
+            r#"{"type":"message","id":"m3","parentId":"m2","timestamp":"2024-12-03T14:00:03.000Z","message":{"role":"toolResult","toolCallId":"call_1","toolName":"bash","content":[{"type":"text","text":"file.txt"}],"isError":false}}"#,
+        ]);
+        let mut db_entries = HashMap::new();
+        db_entries.insert(
+            1u32,
+            (
+                TokenStats {
+                    input: 10,
+                    output: 5,
+                    cache_read: None,
+                    cache_write: None,
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: None,
+                    total: 15,
+                },
+                "claude-sonnet-4-5".to_string(),
+            ),
+        );
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+
+        parse_pi_timeline(reader, &db_entries, &mut timeline, &mut metadata);
+
+        let has_prompt = timeline.iter().any(|item| matches!(item, TimelineItem::UserPrompt { prompt, .. } if prompt == "List files"));
+        assert!(has_prompt);
+        let has_reply = timeline
+            .iter()
+            .any(|item| matches!(item, TimelineItem::AgentReply { reply, .. } if reply == "Sure"));
+        assert!(has_reply);
+        let tool_step = timeline.iter().find_map(|item| match item {
+            TimelineItem::ToolStep {
+                tool_name,
+                stdout,
+                status,
+                ..
+            } if tool_name == "bash" => Some((stdout.clone(), status.clone())),
+            _ => None,
+        });
+        assert_eq!(tool_step, Some(("file.txt".to_string(), "success".to_string())));
+    }
+
+    #[test]
+    fn parse_omp_timeline_reads_model_change_with_model_field() {
+        // OMP's model_change events use the `model` key instead of Pi's
+        // `modelId` key for the same event type.
+        let reader = make_reader(&[
+            r#"{"type":"title","v":1,"title":"","updatedAt":"2024-12-03T14:00:00.000Z"}"#,
+            r#"{"type":"session","version":3,"id":"omp-sess-1","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/tmp/omp-project"}"#,
+            r#"{"type":"model_change","id":"m0","parentId":null,"timestamp":"2024-12-03T14:00:00.500Z","model":"ollama/glm-5.3-flash:cloud"}"#,
+        ]);
+        let db_entries = HashMap::new();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+
+        parse_omp_timeline(reader, &db_entries, &mut timeline, &mut metadata);
+
+        assert_eq!(
+            metadata.get("cwd").and_then(|v| v.as_str()),
+            Some("/tmp/omp-project")
+        );
+        let has_model_change = timeline.iter().any(|item| {
+            matches!(item, TimelineItem::SystemStatus { status_type, message, .. }
+                if status_type == "model_change" && message.contains("ollama/glm-5.3-flash:cloud"))
+        });
+        assert!(has_model_change);
+    }
+}
+
 #[cfg(test)]
 mod grok_tests {
     use super::*;

@@ -467,6 +467,24 @@ pub fn get_grok_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+pub fn get_pi_dir() -> PathBuf {
+    if let Some(path) = crate::paths::env_path("PI_DIR") {
+        return path;
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".pi"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+pub fn get_omp_dir() -> PathBuf {
+    if let Some(path) = crate::paths::env_path("OMP_DIR") {
+        return path;
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".omp"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn move_file_with_copy_fallback(source: &Path, destination: &Path) -> Result<(), String> {
     if let Err(rename_error) = fs::rename(source, destination) {
         let copied = fs::copy(source, destination).map_err(|copy_error| {
@@ -540,7 +558,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS usage_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            assistant_type TEXT NOT NULL, -- 'antigravity', 'copilot', 'codex', 'claude', 'cursor', 'grok'
+            assistant_type TEXT NOT NULL, -- 'antigravity', 'copilot', 'codex', 'claude', 'cursor', 'grok', 'pi', 'omp'
             timestamp TEXT NOT NULL,
             date TEXT NOT NULL,
             session_id TEXT NOT NULL,
@@ -5657,6 +5675,184 @@ pub(crate) fn sync_grok_usage_logs(conn: &mut Connection, grok_dir: &Path) -> Re
     Ok(())
 }
 
+/// Shared incremental sync routine for the Pi Coding Agent and its fork OMP,
+/// both of which persist sessions as append-only JSONL files under
+/// `<dir>/agent/sessions/` using the identical tree-structured format. Each
+/// assistant message entry already carries a complete, self-contained
+/// token/cost snapshot for its turn, so (unlike Grok) no cross-line delta
+/// accumulation is required; `tokens` and `delta_tokens` are therefore equal.
+fn sync_pi_family_usage_logs(
+    conn: &mut Connection,
+    assistant_type: &str,
+    assistant_label: &str,
+    session_files: Vec<PathBuf>,
+    dir: &Path,
+    parse_file: impl Fn(&Path) -> Result<Vec<UsageEntry>, String>,
+) -> Result<(), String> {
+    for filepath in session_files {
+        let metadata = match fs::metadata(&filepath) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                eprintln!("讀取 {assistant_label} session 檔案 {:?} 失敗: {}", filepath, error);
+                continue;
+            }
+        };
+        let current_size = metadata.len();
+        let state_name = portable_relative_path(dir, &filepath);
+        let state_key = format!("{assistant_type}:{state_name}");
+        let last_synced_size: u64 = conn
+            .query_row(
+                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
+                params![state_key],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if current_size == last_synced_size {
+            continue;
+        }
+
+        // Sessions append JSONL records. Wait for the current record to be
+        // complete before advancing sync_state, otherwise a partial final
+        // line could be skipped permanently on the next incremental pass.
+        if current_size > 0 {
+            let mut file = match File::open(&filepath) {
+                Ok(file) => file,
+                Err(error) => {
+                    eprintln!(
+                        "開啟 {assistant_label} session 檔案 {:?} 失敗: {}",
+                        filepath, error
+                    );
+                    continue;
+                }
+            };
+            if file.seek(SeekFrom::End(-1)).is_err() {
+                continue;
+            }
+            let mut last_byte = [0u8; 1];
+            if file.read_exact(&mut last_byte).is_err() || last_byte[0] != b'\n' {
+                continue;
+            }
+        }
+
+        let parsed_entries = match parse_file(&filepath) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!("解析 {assistant_label} session 檔案 {:?} 失敗: {}", filepath, error);
+                continue;
+            }
+        };
+
+        let transcript_path = filepath.to_string_lossy().into_owned();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("{assistant_label} transaction BEGIN 失敗: {error}"))?;
+        tx.execute(
+            "DELETE FROM usage_entries
+             WHERE assistant_type = ?1 AND transcript_path = ?2",
+            params![assistant_type, transcript_path],
+        )
+        .map_err(|error| format!("清除舊 {assistant_label} session 資料失敗: {error}"))?;
+
+        for entry in &parsed_entries {
+            let tokens = entry.tokens.as_ref();
+            let delta = entry.delta_tokens.as_ref();
+            let cost = entry.cost.as_ref();
+            let source_kind = entry.source_kind.as_deref().unwrap_or(assistant_type);
+            let usage_identity = entry
+                .model_id
+                .as_deref()
+                .filter(|model| !model.trim().is_empty())
+                .map(|model| format!("model:{model}"))
+                .unwrap_or_default();
+            tx.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, usage_identity, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                    tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
+                    delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                    duration_ms, premium_requests, reported_cost_usd, reasoning_effort
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?
+                )",
+                params![
+                    assistant_type,
+                    source_kind,
+                    usage_identity,
+                    entry.timestamp,
+                    entry.timestamp.get(0..10).unwrap_or("unknown"),
+                    entry.session_id,
+                    entry.session_name.as_deref(),
+                    entry.transcript_path.as_deref(),
+                    entry.cwd.as_deref(),
+                    entry.version.as_deref(),
+                    entry.turn_no as i64,
+                    entry.model.as_deref(),
+                    entry.model_id.as_deref(),
+                    tokens.map(|value| value.input as i64),
+                    tokens.map(|value| value.output as i64),
+                    tokens.and_then(|value| value.cache_read.map(|v| v as i64)),
+                    tokens.and_then(|value| value.cache_write.map(|v| v as i64)),
+                    tokens.and_then(|value| value.reasoning.map(|v| v as i64)),
+                    tokens.map(|value| value.total as i64),
+                    delta.map(|value| value.input as i64),
+                    delta.map(|value| value.output as i64),
+                    delta.and_then(|value| value.cache_read.map(|v| v as i64)),
+                    delta.and_then(|value| value.cache_write.map(|v| v as i64)),
+                    delta.and_then(|value| value.reasoning.map(|v| v as i64)),
+                    delta.map(|value| value.total as i64),
+                    cost.and_then(|value| value.total_api_duration_ms.map(|v| v as i64)),
+                    cost.and_then(|value| value.total_premium_requests.map(|v| v as i64)),
+                    cost.and_then(|value| value.reported_cost_usd),
+                    entry.reasoning_effort.as_deref(),
+                ],
+            )
+            .map_err(|error| format!("寫入 {assistant_label} 資料庫失敗: {error}"))?;
+        }
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, ?)",
+            params![state_key, current_size as i64, now],
+        )
+        .map_err(|error| format!("更新 {assistant_label} sync state 失敗: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("提交 {assistant_label} transaction 失敗: {error}"))?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn sync_pi_usage_logs(conn: &mut Connection, pi_dir: &Path) -> Result<(), String> {
+    let session_files = crate::pi::find_session_files(pi_dir);
+    sync_pi_family_usage_logs(
+        conn,
+        "pi",
+        "Pi Coding Agent",
+        session_files,
+        pi_dir,
+        |path| crate::pi::parse_session_usage_file(path, crate::pi::SOURCE_KIND),
+    )
+}
+
+pub(crate) fn sync_omp_usage_logs(conn: &mut Connection, omp_dir: &Path) -> Result<(), String> {
+    let session_files = crate::omp::find_session_files(omp_dir);
+    sync_pi_family_usage_logs(
+        conn,
+        "omp",
+        "OMP",
+        session_files,
+        omp_dir,
+        crate::omp::parse_session_usage_file,
+    )
+}
+
 /// Unified sync function triggering sync for all supported assistants
 pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // 1. Sync Cursor metadata first so model and mode attribution is available
@@ -5717,6 +5913,18 @@ pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
     let grok_dir = get_grok_dir();
     if let Err(e) = sync_grok_usage_logs(conn, &grok_dir) {
         eprintln!("❌ 同步 Grok Build 失敗: {}", e);
+    }
+
+    // 9. Sync Pi Coding Agent sessions
+    let pi_dir = get_pi_dir();
+    if let Err(e) = sync_pi_usage_logs(conn, &pi_dir) {
+        eprintln!("❌ 同步 Pi Coding Agent 失敗: {}", e);
+    }
+
+    // 10. Sync OMP sessions (Pi fork)
+    let omp_dir = get_omp_dir();
+    if let Err(e) = sync_omp_usage_logs(conn, &omp_dir) {
+        eprintln!("❌ 同步 OMP 失敗: {}", e);
     }
     Ok(())
 }
@@ -16380,6 +16588,109 @@ mod tests {
             )
             .unwrap();
         assert!((imported_cost - 0.00024).abs() < f64::EPSILON);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_pi_usage_logs_persists_turn_and_reported_cost() {
+        let root = temp_jsonl_path("pi-sync");
+        let session_dir = root.join("agent").join("sessions").join("--tmp--pi-project");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("2024-12-03T14-00-00_abc.jsonl"),
+            concat!(
+                r#"{"type":"session","version":3,"id":"pi-sess-1","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/tmp/pi-project"}"#, "\n",
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2024-12-03T14:00:01.000Z","message":{"role":"user","content":"Hello"}}"#, "\n",
+                r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2024-12-03T14:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Hi!"}],"provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":100,"output":50,"cacheRead":10,"totalTokens":150,"cost":{"total":0.0031}},"stopReason":"stop"}}"#, "\n"
+            ),
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_pi_usage_logs(&mut conn, &root).unwrap();
+
+        let (count, source_kind, delta_input, delta_total, reported_cost, model): (
+            u64,
+            String,
+            u64,
+            u64,
+            f64,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT COUNT(*), source_kind, delta_input, delta_total, reported_cost_usd, model
+                 FROM usage_entries WHERE assistant_type = 'pi'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(source_kind, crate::pi::SOURCE_KIND);
+        assert_eq!(delta_input, 100);
+        assert_eq!(delta_total, 150);
+        assert!((reported_cost - 0.0031).abs() < f64::EPSILON);
+        assert_eq!(model, "claude-sonnet-4-5");
+
+        let date_rows = get_usage_entries_by_date(&conn, "2024-12-03", "pi").unwrap();
+        assert_eq!(date_rows.len(), 1);
+
+        // Re-syncing an unchanged file must not duplicate rows.
+        sync_pi_usage_logs(&mut conn, &root).unwrap();
+        let count_after_resync: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE assistant_type = 'pi'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_after_resync, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_omp_usage_logs_persists_turn_with_omp_source_kind() {
+        let root = temp_jsonl_path("omp-sync");
+        let session_dir = root
+            .join("agent")
+            .join("sessions")
+            .join("--tmp--omp-project");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("2024-12-03T14-00-00_def.jsonl"),
+            concat!(
+                r#"{"type":"session","version":3,"id":"omp-sess-1","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/tmp/omp-project"}"#, "\n",
+                r#"{"type":"message","id":"m2","parentId":null,"timestamp":"2024-12-03T14:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Hi!"}],"provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":5,"totalTokens":15,"cost":{"total":0.0005}},"stopReason":"stop"}}"#, "\n"
+            ),
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_omp_usage_logs(&mut conn, &root).unwrap();
+
+        let (count, source_kind, reported_cost): (u64, String, f64) = conn
+            .query_row(
+                "SELECT COUNT(*), source_kind, reported_cost_usd
+                 FROM usage_entries WHERE assistant_type = 'omp'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(source_kind, crate::omp::SOURCE_KIND);
+        assert!((reported_cost - 0.0005).abs() < f64::EPSILON);
 
         let _ = fs::remove_dir_all(root);
     }

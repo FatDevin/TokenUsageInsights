@@ -13,9 +13,15 @@ mod db;
 #[path = "../grok.rs"]
 #[allow(dead_code)]
 mod grok;
+#[path = "../omp.rs"]
+#[allow(dead_code)]
+mod omp;
 #[path = "../paths.rs"]
 #[allow(dead_code)]
 mod paths;
+#[path = "../pi.rs"]
+#[allow(dead_code)]
+mod pi;
 #[path = "../vscode.rs"]
 #[allow(dead_code)]
 mod vscode;
@@ -28,7 +34,7 @@ const HELP_TEXT: &str = r#"Token 使用量 CLI 匯入 / 匯出工具
   import  匯入 JSON 檔內的所有資料（每筆資料依 timestamp 決定日期）
 
 共用參數:
-  --agent <name>      助理名稱: antigravity / copilot / codex / claude / cursor / grok
+  --agent <name>      助理名稱: antigravity / copilot / codex / claude / cursor / grok / pi / omp
                      亦可使用 claude-code / claude_code / claudecode（會正規化為 claude）
 
 匯出:
@@ -373,6 +379,8 @@ fn normalize_assistant_name(assistant: &str) -> String {
         "claude-code" | "claude_code" | "claudecode" => "claude".to_string(),
         "cursor" => "cursor".to_string(),
         "grok-build" | "grok_build" | "grokbuild" => "grok".to_string(),
+        "pi-coding-agent" | "pi_coding_agent" | "picodingagent" => "pi".to_string(),
+        "oh-my-pi" | "oh_my_pi" | "ohmypi" => "omp".to_string(),
         _ => normalized,
     }
 }
@@ -396,7 +404,7 @@ fn validate_import_source_assistant(
 fn is_supported_assistant(assistant: &str) -> bool {
     matches!(
         normalize_assistant_name(assistant).as_str(),
-        "antigravity" | "copilot" | "codex" | "claude" | "cursor" | "grok"
+        "antigravity" | "copilot" | "codex" | "claude" | "cursor" | "grok" | "pi" | "omp"
     )
 }
 
@@ -450,7 +458,7 @@ fn print_export_help() {
   token-usage-insights-cli export --agent <name> --date YYYY[-MM[-DD]] --out <path>
 
 參數:
-  --agent <name>    助理名稱（antigravity/copilot/codex/claude/cursor/grok）
+  --agent <name>    助理名稱（antigravity/copilot/codex/claude/cursor/grok/pi/omp）
   --date <period>     匯出年份、月份或日期
   --out <path>      輸出檔案路徑，不指定則輸出到 stdout
   --help, -h        顯示此說明
@@ -464,7 +472,7 @@ fn print_import_help() {
   token-usage-insights-cli import --agent <name> --file <path>
 
 參數:
-  --agent <name>      助理名稱（antigravity/copilot/codex/claude/cursor/grok）
+  --agent <name>      助理名稱（antigravity/copilot/codex/claude/cursor/grok/pi/omp）
   --file <path>       匯入檔案
   --date <label>       相容舊版，僅作為匯入紀錄標籤，不影響資料日期
   --help, -h          顯示此說明

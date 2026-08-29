@@ -1,6 +1,6 @@
 # Token War Room
 
-**Token War Room is a local-first dashboard for AI coding-agent token usage and session reconstruction.** It reads local records from Google Antigravity CLI, GitHub Copilot CLI, GitHub Copilot Chat (VS Code), Codex Desktop, Codex CLI, Claude Code, and Grok Build, presenting daily, monthly, and yearly token consumption, cache usage, reasoning tokens, estimated costs, model distribution, project-directory distribution, and complete session timelines in one place.
+**Token War Room is a local-first dashboard for AI coding-agent token usage and session reconstruction.** It reads local records from Google Antigravity CLI, GitHub Copilot CLI, GitHub Copilot Chat (VS Code), Codex Desktop, Codex CLI, Claude Code, Grok Build, Pi Coding Agent, and OMP, presenting daily, monthly, and yearly token consumption, cache usage, reasoning tokens, estimated costs, model distribution, project-directory distribution, and complete session timelines in one place.
 
 This project does not call AI provider APIs on your behalf. Its core data sources are local logs, Status Line collector files, and local SQLite.
 
@@ -44,8 +44,10 @@ http://localhost:3003
 | Codex Desktop / CLI | Not required | `~/.codex/sessions`, `~/.codex/archived_sessions` | The dashboard scans active and archived local Codex sessions directly |
 | Claude Code | Not required | `~/.claude/projects` | The dashboard scans local Claude Code project sessions directly |
 | Grok Build | Not required | `~/.grok/sessions` | The dashboard scans the `updates.jsonl` session streams saved automatically by Grok Build |
+| Pi Coding Agent | Not required | `~/.pi/agent/sessions` | The dashboard scans the local session JSONL files saved automatically by Pi Coding Agent |
+| OMP | Not required | `~/.omp/agent/sessions` | The dashboard scans the local session JSONL files saved automatically by OMP |
 
-**If you only use VS Code Copilot, Codex Desktop, Codex CLI, Claude Code, or Grok Build, run the one-line installation command and open the dashboard.**
+**If you only use VS Code Copilot, Codex Desktop, Codex CLI, Claude Code, Grok Build, Pi Coding Agent, or OMP, run the one-line installation command and open the dashboard.**
 
 ### Native Windows usage
 
@@ -62,6 +64,8 @@ Windows uses the following native paths by default:
 | Claude Code | `%USERPROFILE%\.claude` |
 | Cursor | `%USERPROFILE%\.cursor` |
 | Grok Build | `%USERPROFILE%\.grok` |
+| Pi Coding Agent | `%USERPROFILE%\.pi` |
+| OMP | `%USERPROFILE%\.omp` |
 
 The dashboard's setup guide shows PowerShell copy, configuration, and diagnostic commands on Windows. The PowerShell collector uses .NET JSON and file APIs and does not depend on Bash, `jq`, `sed`, or `awk`.
 
@@ -110,7 +114,7 @@ The dashboard supports URL query parameters for opening a specific state directl
 
 | Parameter | Applies to | Values | Description |
 | --- | --- | --- | --- |
-| `agent` | All views | `antigravity`, `copilot`, `codex`, `claude`, `cursor`, `grok` | Selects the coding agent to display. Aliases such as `claude-code` and `grok-build` are also supported |
+| `agent` | All views | `antigravity`, `copilot`, `codex`, `claude`, `cursor`, `grok`, `pi`, `omp` | Selects the coding agent to display. Aliases such as `claude-code`, `grok-build`, and `pi-coding-agent` are also supported |
 | `tab` | All views | `daily`, `monthly`, `yearly` | Selects the daily, monthly, or yearly view |
 | `date` | All views | `daily`: `YYYY-MM-DD`; `monthly`: `YYYY-MM`; `yearly`: `YYYY` | Selects the date, month, or year to display; the format follows `tab` automatically |
 | `dir` | `daily` | Full path, `~`-prefixed home path, or a unique path suffix (e.g. `TokenUsageInsights`) | Filters the daily view by working directory. Windows paths are case-insensitive; if no directory matches, all directories are shown |
@@ -354,6 +358,48 @@ A Grok Build session may provide only a context token snapshot, or may also incl
 
 * * *
 
+## Pi Coding Agent setup
+
+**Pi Coding Agent requires no hooks, a Status Line, or an additional collector script.** The dashboard scans this directory directly:
+
+```text
+~/.pi/agent/sessions
+```
+
+Pi Coding Agent automatically saves sessions as local JSONL files in a tree-structured directory layout, and the dashboard reads those session records directly.
+
+Usage:
+
+1. Use Pi Coding Agent normally to create at least one session.
+2. Start or refresh the dashboard.
+3. Select Pi Coding Agent on the left.
+4. Click the sync button in the upper-right corner, or wait for background sync.
+
+Pi Coding Agent cost is always read directly from each session's own per-turn `usage.cost` and related usage data. Unlike Grok Build, there is no context-snapshot estimation fallback because Pi natively reports authoritative token and cost usage per turn.
+
+* * *
+
+## OMP setup
+
+**OMP requires no hooks, a Status Line, or an additional collector script.** The dashboard scans this directory directly:
+
+```text
+~/.omp/agent/sessions
+```
+
+OMP is an open-source fork of Pi Coding Agent (<https://github.com/can1357/oh-my-pi>) and persists sessions using the identical JSONL format. The dashboard reads those local session records directly.
+
+Usage:
+
+1. Use OMP normally to create at least one session.
+2. Start or refresh the dashboard.
+3. Select OMP on the left.
+4. Click the sync button in the upper-right corner, or wait for background sync.
+
+OMP cost is always read directly from each session's own per-turn `usage.cost` and related usage data. Unlike Grok Build, there is no context-snapshot estimation fallback because OMP natively reports authoritative token and cost usage per turn.
+
+* * *
+
 ## Local data synchronization
 
 When the service starts, the backend initializes local SQLite and performs an immediate data sync. After startup, it also syncs in the background every 5 seconds.
@@ -378,7 +424,7 @@ This triggers a full incremental sync of local logs.
 
 The CLI tool is provided only for advanced users who build from source; release packages currently do not include the CLI executable.
 
-`--agent` specifies the assistant (`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok`).
+`--agent` specifies the assistant (`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp`).
 
 ### Use the CLI from source
 
@@ -436,6 +482,8 @@ Paths specified by environment variables are authoritative and do not need to be
 | `CURSOR_DIR` | `~/.cursor` | Cursor data directory |
 | `CURSOR_STATE_DB` | Auto-detected by platform | Cursor `User/globalStorage/state.vscdb` path, used to read `agentKv` model information in read-only mode |
 | `GROK_DIR` | `~/.grok` | Grok Build data directory |
+| `PI_DIR` | `~/.pi` | Pi Coding Agent data directory |
+| `OMP_DIR` | `~/.omp` | OMP data directory |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | Comma-separated allowed CORS origins |
 
 > **The default binding is `0.0.0.0`, so other devices on the same local network may connect to the dashboard. For local-only browsing, set `HOST` to `127.0.0.1`.**
