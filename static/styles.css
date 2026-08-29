@@ -1,7 +1,7 @@
 @import '/static/css/variables.css';
 @import '/static/css/timeline.css?v=3';
 @import '/static/css/components.css?v=1';
-@import '/static/css/redesign.css?v=25';
+@import '/static/css/redesign.css?v=26';
 /* Compact native locale selector for the five supported UI languages. */
 .lang-select-label {
   display: inline-flex;

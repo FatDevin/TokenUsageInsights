@@ -1,6 +1,6 @@
 use axum::{
     extract::DefaultBodyLimit,
-    http::{header::CONTENT_TYPE, Method},
+    http::{header::CACHE_CONTROL, header::CONTENT_TYPE, HeaderValue, Method},
     routing::{delete, get, post},
     Router,
 };
@@ -10,6 +10,7 @@ use std::{
 };
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 
 mod db;
 mod grok;
@@ -170,8 +171,27 @@ async fn main() {
         .route("/api/:assistant/sync", get(trigger_manual_sync))
         .route("/api/:assistant/rate-limit", get(get_rate_limit))
         // 靜態檔案路由
-        .nest_service("/static", ServeDir::new(&static_dir))
-        .fallback_service(ServeDir::new(&static_dir))
+        // 一律附加 Cache-Control: no-cache，強制瀏覽器每次都向伺服器驗證
+        // （ServeDir 會自動處理 ETag/Last-Modified 條件式請求，未變更的
+        // 檔案仍會回 304 節省頻寬），避免部署更新後使用者仍看到瀏覽器
+        // 快取的舊版 JS/CSS（即使忘記更新 ?v=N 版本號也不受影響）。
+        .nest_service(
+            "/static",
+            tower::ServiceBuilder::new()
+                .layer(SetResponseHeaderLayer::overriding(
+                    CACHE_CONTROL,
+                    HeaderValue::from_static("no-cache"),
+                ))
+                .service(ServeDir::new(&static_dir)),
+        )
+        .fallback_service(
+            tower::ServiceBuilder::new()
+                .layer(SetResponseHeaderLayer::overriding(
+                    CACHE_CONTROL,
+                    HeaderValue::from_static("no-cache"),
+                ))
+                .service(ServeDir::new(&static_dir)),
+        )
         .layer(build_cors_layer());
 
     let port = std::env::var("PORT")
