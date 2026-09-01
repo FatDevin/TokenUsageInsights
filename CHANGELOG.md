@@ -2,6 +2,36 @@
 
 本文件記錄 TokenUsageInsights 各正式版本的實際變更。內容依 Git 標籤間的提交記錄與檔案差異整理，格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)，版本編號遵循 [Semantic Versioning](https://semver.org/lang/zh-TW/)。
 
+## [0.8.0] - 2026-09-02
+
+### 新增與改善
+
+- 新增支援 **Muse Code**（由 Meta 提供的 Muse Spark 模型驅動的 Coding Agent），完整涵蓋 Token 使用量分析與 Session 還原。新增 `src/muse.rs` 解析器，讀取 `~/.local/share/muse/sessions/YYYY/MM/DD/<session_id>/session.jsonl` 的 `model_completed` 事件並還原 `input / cached / output / reasoning` Token；以 `runtime.user_intent.accepted` 首句提示產生會話名稱，並支援日期分片掃描與 `MUSE_DIR` 環境變數自訂。
+- 資料庫同步新增 `get_muse_dir()` 與 `sync_muse_usage_logs()`，沿用 `pi / omp / grok` 共用的 `sync_pi_family_usage_logs` 增量機制（`sync_state` + `transcript_path` 去重），確保重跑不重複寫入。
+- 前端新增 Muse Code 徽章（`static/index.html`）、`assistantMeta.muse`（`Muse Code` 品牌色 `#3b82f6` 整段高亮）與 `assistantAliasMap` 別名（`muse-code` / `muse_code` / `musecode` 等），並在 `static/i18n.js` 為 zh-TW / zh-CN / en / ja / ko 五語系補齊 `muse_header_description` 與 `assistant_muse`，使副標題正確顯示為「本地監控與分析您的 Muse Code 的 Token 消耗與會話詳細數據」並以品牌色標示。
+- `pricing.csv` 依官方 `model-catalog` 新增 `muse-spark-1.2`（輸入 1.25 / 快取 0.15 / 輸出 4.25）與 `muse-spark-1.2-contributor`（0.10 / 0.002 / 0.20），單位 1M Tokens，對應 Meta 公開成本。
+- CLI 工具 `src/bin/token-usage-insights-cli.rs` 同步支援 `--agent muse` 的匯入／匯出、別名正規化與說明文件；同步更新 `static/app.js` 的 Agent 切換與搜尋邏輯。
+
+### 修正
+
+- 修正 Muse 在 macOS 上因 `dirs::data_local_dir()` 指向 `~/Library/Application Support` 而漏掃 `~/.local/share/muse/sessions` 的問題；`get_muse_dir()` 改為優先檢查 `~/.local/share/muse/sessions` 是否存在，避免資料為 0。
+- 修正 Muse `recorded_at` 時間戳單位錯誤（誤以 nanoseconds 解析導致 date 落在 1970-01-21），改以 microseconds 優先並加入 2020-2100 合理性檢查，同步修正 `src/timeline.rs` 的同類轉換，使 `2026-09-01` 等日期的統計與時間軸正常顯示。
+- 修正先前 `pricing.csv` 中 Muse 模型的佔位價格，改為與官方成本一致。
+
+### 資料影響
+
+- `usage_entries` 新增 `assistant_type='muse'` 與 `source_kind='muse-code'` 的資料；既有 8 個 Agent 的資料與索引（`assistant_type, source_kind, session_id, turn_no, usage_identity`）保持不變，無需遷移。
+- 既有 `muse` 的錯誤日期資料（1970）會在下次增量同步時由 `sync_state` 重新寫入正確日期，無需手動清理（已於驗證期間清理）。
+
+### 相容性
+
+- 新增選用環境變數 `MUSE_DIR`，未設定時自動偵測 `~/.local/share/muse`；既有 `ANTIGRAVITY_DIR`、`COPILOT_DIR` 等維持相容。
+- `GET /api/:assistant/*` 對 `muse` 完全相容，既有前端路由與匯入匯出流程不受影響。
+
+### 其他
+
+- 完成 `cargo fmt` / `cargo clippy --all-targets --all-features` / `cargo test`（143 項）零警告驗證，並以本機真實 `~/.local/share/muse` 資料（220 筆 turn，`GET /api/muse/usage/2026-09-01`）驗證統計與費用估算正確。
+
 ## [0.7.5] - 2026-08-30
 
 ### 新增與改善
@@ -419,7 +449,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.6.1...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.7.5...v0.8.0
 [0.6.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.4.1...v0.5.0
