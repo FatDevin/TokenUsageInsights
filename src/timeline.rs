@@ -1,6 +1,7 @@
 use crate::db::{parse_cursor_timestamp, TokenStats};
 use crate::grok::{display_model_name, timestamp_to_rfc3339, value_to_text, UNKNOWN_MODEL};
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -2751,6 +2752,235 @@ pub fn parse_omp_timeline(
     metadata: &mut HashMap<String, serde_json::Value>,
 ) {
     parse_pi_family_timeline(reader, db_entries, timeline, metadata, "OMP")
+}
+
+pub fn parse_muse_timeline(
+    reader: BufReader<File>,
+    db_entries: &HashMap<u32, (TokenStats, String)>,
+    timeline: &mut Vec<TimelineItem>,
+    metadata: &mut HashMap<String, serde_json::Value>,
+) {
+    let mut turn_no: u32 = 1;
+    let mut current_model = "muse-spark-1.2".to_string();
+    let mut tool_indices: HashMap<String, usize> = HashMap::new();
+
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let payload_type = value
+            .get("payload_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let payload = value.get("payload");
+        let timestamp = value
+            .get("recorded_at")
+            .and_then(|v| v.as_u64())
+            .map(|us| {
+                // Muse recorded_at is microseconds (16 digits) -> 2026-09-02
+                let secs = us / 1_000_000;
+                let nanos = ((us % 1_000_000) * 1000) as u32;
+                if let Some(dt) =
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, nanos)
+                {
+                    if secs > 1_577_836_800 && secs < 4_102_444_800 {
+                        return dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    }
+                }
+                let secs2 = us / 1_000_000_000;
+                let nanos2 = (us % 1_000_000_000) as u32;
+                chrono::DateTime::<chrono::Utc>::from_timestamp(secs2 as i64, nanos2)
+                    .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+
+        if payload_type == "runtime.user_intent.accepted" {
+            if let Some(p) = payload {
+                let prompt = p
+                    .get("model_messages")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|msg| msg.get("content"))
+                    .map(|content| {
+                        if let Some(text) = content.as_str() {
+                            text.to_string()
+                        } else if let Some(arr) = content.as_array() {
+                            arr.iter()
+                                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        } else {
+                            String::new()
+                        }
+                    })
+                    .or_else(|| {
+                        p.get("refill_blocks")
+                            .and_then(|v| v.as_array())
+                            .and_then(|arr| arr.first())
+                            .and_then(|b| b.get("text").and_then(|t| t.as_str()))
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_default();
+                if !prompt.trim().is_empty() {
+                    timeline.push(TimelineItem::UserPrompt {
+                        timestamp: timestamp.clone(),
+                        prompt,
+                        context: None,
+                        turn_no,
+                    });
+                }
+            }
+            continue;
+        }
+
+        if payload_type == "runtime.session" {
+            let Some(p) = payload else { continue };
+            let kind = p.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            if kind != "run" {
+                // also handle metadata for cwd
+                continue;
+            }
+            let event = p.get("event");
+            let ek = event
+                .and_then(|e| e.get("kind"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            match ek {
+                "assistant_tool_calls_committed" => {
+                    let tool_calls = event
+                        .and_then(|e| e.get("tool_calls"))
+                        .and_then(|v| v.as_array());
+                    if let Some(calls) = tool_calls {
+                        for call in calls {
+                            let call_id = call
+                                .get("call_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let name = call
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("tool")
+                                .to_string();
+                            let args = call.get("args").cloned().unwrap_or(serde_json::Value::Null);
+                            let args_val = if let Value::String(s) = &args {
+                                serde_json::from_str(s).unwrap_or(Value::String(s.clone()))
+                            } else {
+                                args.clone()
+                            };
+                            let idx = timeline.len();
+                            if !call_id.is_empty() {
+                                tool_indices.insert(call_id.clone(), idx);
+                            }
+                            timeline.push(TimelineItem::ToolStep {
+                                timestamp: timestamp.clone(),
+                                tool_name: name,
+                                arguments: args_val,
+                                env: None,
+                                exit_code: None,
+                                stdout: String::new(),
+                                stderr: String::new(),
+                                tool_call_id: if call_id.is_empty() {
+                                    None
+                                } else {
+                                    Some(call_id)
+                                },
+                                status: "running".to_string(),
+                            });
+                        }
+                    }
+                }
+                "tool_result_batch_committed" => {
+                    let results = event
+                        .and_then(|e| e.get("results"))
+                        .and_then(|v| v.as_array());
+                    if let Some(results) = results {
+                        for result in results {
+                            let call_id = result
+                                .get("tool_call_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let text = result
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if let Some(&idx) = tool_indices.get(call_id) {
+                                if let Some(TimelineItem::ToolStep {
+                                    stdout,
+                                    stderr,
+                                    exit_code,
+                                    status,
+                                    ..
+                                }) = timeline.get_mut(idx)
+                                {
+                                    *stdout = text.clone();
+                                    *stderr = String::new();
+                                    *exit_code = Some(0);
+                                    *status = "success".to_string();
+                                }
+                            } else {
+                                timeline.push(TimelineItem::ToolStep {
+                                    timestamp: timestamp.clone(),
+                                    tool_name: "tool_result".to_string(),
+                                    arguments: serde_json::Value::Null,
+                                    env: None,
+                                    exit_code: Some(0),
+                                    stdout: text,
+                                    stderr: String::new(),
+                                    tool_call_id: if call_id.is_empty() {
+                                        None
+                                    } else {
+                                        Some(call_id.to_string())
+                                    },
+                                    status: "success".to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+                "model_completed" => {
+                    if let Some(_usage) = event.and_then(|e| e.get("usage")) {
+                        let model = event
+                            .and_then(|e| e.get("model"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&current_model)
+                            .to_string();
+                        current_model = model.clone();
+                        let (tokens, _) = db_entries
+                            .get(&turn_no)
+                            .map(|(s, m)| (Some(s.clone()), m.clone()))
+                            .unwrap_or((None, model.clone()));
+                        timeline.push(TimelineItem::AgentReply {
+                            timestamp: timestamp.clone(),
+                            reply: String::new(),
+                            reasoning: None,
+                            turn_no,
+                            model,
+                            tokens,
+                            duration_ms: event
+                                .and_then(|e| e.get("duration_ms"))
+                                .and_then(|v| v.as_u64()),
+                            reasoning_effort: None,
+                        });
+                        turn_no += 1;
+                    }
+                }
+                "reasoning_summary_committed" | "reasoning_summary_delta" => {
+                    // ignore, could add as reasoning but AgentReply already covers
+                }
+                _ => {}
+            }
+        }
+    }
+
+    metadata.insert(
+        "selected_model".to_string(),
+        serde_json::Value::String(current_model),
+    );
+    metadata.insert("cwd".to_string(), serde_json::Value::String(String::new()));
 }
 
 #[cfg(test)]

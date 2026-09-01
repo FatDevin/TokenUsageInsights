@@ -15,6 +15,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 mod db;
 mod grok;
 mod handlers;
+mod muse;
 mod omp;
 mod paths;
 mod pi;

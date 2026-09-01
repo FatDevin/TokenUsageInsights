@@ -485,6 +485,35 @@ pub fn get_omp_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+pub fn get_muse_dir() -> PathBuf {
+    if let Some(path) = crate::paths::env_path("MUSE_DIR") {
+        return path;
+    }
+    // Muse stores sessions under ~/.local/share/muse on both Linux and macOS,
+    // while `dirs::data_local_dir()` on macOS points to ~/Library/Application Support.
+    // Prefer the XDG location if it exists to avoid missing data on macOS.
+    if let Some(home) = dirs::home_dir() {
+        let xdg_path = home.join(".local").join("share").join("muse");
+        if xdg_path.join("sessions").exists() || xdg_path.exists() {
+            return xdg_path;
+        }
+    }
+    if let Some(data_dir) = dirs::data_local_dir() {
+        let candidate = data_dir.join("muse");
+        if candidate.join("sessions").exists() || candidate.exists() {
+            return candidate;
+        }
+        // Return XDG fallback for consistency even if not yet created
+        if let Some(home) = dirs::home_dir() {
+            return home.join(".local").join("share").join("muse");
+        }
+        return candidate;
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".local").join("share").join("muse"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn move_file_with_copy_fallback(source: &Path, destination: &Path) -> Result<(), String> {
     if let Err(rename_error) = fs::rename(source, destination) {
         let copied = fs::copy(source, destination).map_err(|copy_error| {
@@ -5859,6 +5888,18 @@ pub(crate) fn sync_omp_usage_logs(conn: &mut Connection, omp_dir: &Path) -> Resu
     )
 }
 
+pub(crate) fn sync_muse_usage_logs(conn: &mut Connection, muse_dir: &Path) -> Result<(), String> {
+    let session_files = crate::muse::find_session_files(muse_dir);
+    sync_pi_family_usage_logs(
+        conn,
+        "muse",
+        "Muse",
+        session_files,
+        muse_dir,
+        crate::muse::parse_session_usage_file,
+    )
+}
+
 /// Unified sync function triggering sync for all supported assistants
 pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // 1. Sync Cursor metadata first so model and mode attribution is available
@@ -5931,6 +5972,12 @@ pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
     let omp_dir = get_omp_dir();
     if let Err(e) = sync_omp_usage_logs(conn, &omp_dir) {
         eprintln!("❌ 同步 OMP 失敗: {}", e);
+    }
+
+    // 11. Sync Muse sessions
+    let muse_dir = get_muse_dir();
+    if let Err(e) = sync_muse_usage_logs(conn, &muse_dir) {
+        eprintln!("❌ 同步 Muse 失敗: {}", e);
     }
     Ok(())
 }

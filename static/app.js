@@ -87,6 +87,11 @@ const assistantAliasMap = {
   'oh-my-pi': 'omp',
   'oh_my_pi': 'omp',
   'ohmypi': 'omp',
+  'muse-code': 'muse',
+  'muse_code': 'muse',
+  'musecode': 'muse',
+  'code-muse': 'muse',
+  'code_muse': 'muse',
 };
 
 const assistantMeta = {
@@ -169,6 +174,16 @@ const assistantMeta = {
     senderName: 'OMP AGENT',
     highlightColor: '#2dd4bf',
     nameHighlights: ['OMP'],
+  },
+  muse: {
+    logo: '/static/favicon-v2.png',
+    label: 'Muse Code',
+    shortLabel: 'Muse',
+    alt: 'Muse Code',
+    badgeStyle: 'background: rgba(0, 122, 255, 0.15); color: #3b82f6; border: 1px solid rgba(0, 122, 255, 0.3); display: inline-flex; align-items: center;',
+    senderName: 'MUSE AGENT',
+    highlightColor: '#3b82f6',
+    nameHighlights: ['Muse Code'],
   },
 };
 

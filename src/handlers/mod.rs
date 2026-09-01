@@ -23,6 +23,9 @@ pub fn normalize_assistant_name(assistant: &str) -> String {
         "grok-build" | "grok_build" | "grokbuild" | "grok" => "grok".to_string(),
         "pi-coding-agent" | "pi_coding_agent" | "picodingagent" | "pi" => "pi".to_string(),
         "omp" | "oh-my-pi" | "oh_my_pi" | "ohmypi" => "omp".to_string(),
+        "muse" | "muse-code" | "muse_code" | "musecode" | "code-muse" | "code_muse" => {
+            "muse".to_string()
+        }
         _ => normalized,
     }
 }
@@ -30,7 +33,7 @@ pub fn normalize_assistant_name(assistant: &str) -> String {
 pub fn is_supported_assistant(assistant: &str) -> bool {
     matches!(
         normalize_assistant_name(assistant).as_str(),
-        "antigravity" | "copilot" | "codex" | "claude" | "cursor" | "grok" | "pi" | "omp"
+        "antigravity" | "copilot" | "codex" | "claude" | "cursor" | "grok" | "pi" | "omp" | "muse"
     )
 }
 
@@ -292,6 +295,7 @@ pub struct SetupInfoResponse {
     pub grok: AssistantSetupStatus,
     pub pi: AssistantSetupStatus,
     pub omp: AssistantSetupStatus,
+    pub muse: AssistantSetupStatus,
 }
 
 #[derive(Serialize)]

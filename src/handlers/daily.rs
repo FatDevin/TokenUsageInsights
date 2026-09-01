@@ -18,7 +18,8 @@ use crate::pricing::{load_prepared_pricing_rules, PreparedPricingRules};
 use crate::timeline::{
     parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
     parse_copilot_timeline_filtered, parse_cursor_timeline, parse_grok_timeline,
-    parse_omp_timeline, parse_pi_timeline, parse_vscode_timeline, TimelineItem,
+    parse_muse_timeline, parse_omp_timeline, parse_pi_timeline, parse_vscode_timeline,
+    TimelineItem,
 };
 
 fn add_usage_to_day_summary(summary: &mut DaySummary, usage: &UsageAggregation) {
@@ -703,6 +704,16 @@ fn resolve_session_file_path(
             resolve_pi_family_transcript_path(&db::get_omp_dir(), "OMP", path)
                 .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
         }
+        "muse" => {
+            let path = transcript_path_db.ok_or_else(|| {
+                SessionFileErrorExt::new(
+                    StatusCode::NOT_FOUND,
+                    "找不到 Muse session 日誌檔案路徑。".to_string(),
+                )
+            })?;
+            resolve_pi_family_transcript_path(&db::get_muse_dir(), "Muse", path)
+                .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
+        }
         _ => Err(SessionFileErrorExt::new(
             StatusCode::BAD_REQUEST,
             "不支援的助理類型",
@@ -780,6 +791,7 @@ fn parse_session_timeline_file(
         "grok" => parse_grok_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "pi" => parse_pi_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "omp" => parse_omp_timeline(reader, db_entries, &mut timeline, &mut metadata),
+        "muse" => parse_muse_timeline(reader, db_entries, &mut timeline, &mut metadata),
         _ => return Err((StatusCode::BAD_REQUEST, "不支援的助理類型".to_string())),
     }
 
@@ -921,6 +933,9 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
     let omp_dir = db::get_omp_dir();
     let omp_exists = omp_dir.join("agent").join("sessions").exists();
 
+    let muse_dir = db::get_muse_dir();
+    let muse_exists = muse_dir.join("sessions").exists();
+
     Json(SetupInfoResponse {
         platform: std::env::consts::OS.to_string(),
         workspace_dir,
@@ -1007,6 +1022,14 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
                 .to_string_lossy()
                 .into_owned(),
             exists: omp_exists,
+            script_path: "".to_string(),
+            source_script_path: "".to_string(),
+            settings_path: "".to_string(),
+        },
+        muse: AssistantSetupStatus {
+            dir_path: muse_dir.to_string_lossy().into_owned(),
+            data_path: muse_dir.join("sessions").to_string_lossy().into_owned(),
+            exists: muse_exists,
             script_path: "".to_string(),
             source_script_path: "".to_string(),
             settings_path: "".to_string(),
