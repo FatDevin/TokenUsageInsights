@@ -2,6 +2,18 @@
 
 本文件記錄 TokenUsageInsights 各正式版本的實際變更。內容依 Git 標籤間的提交記錄與檔案差異整理，格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)，版本編號遵循 [Semantic Versioning](https://semver.org/lang/zh-TW/)。
 
+## [0.8.1] - 2026-09-06
+
+### 新增與改善
+
+- 補充 Google 於 2026-09-02 正式發布的 **Gemini 3.8 Flash** 模型標準費率規則（含 Base、Medium、High、Low 四種思考層級變體），修復 Antigravity 使用量記錄出現 `Gemini 3.8 Flash (High)` 時因缺少價格條目導致的「找不到可用的模型價格規則」錯誤。費率採 Google 官方標準牌價（輸入 1.50、快取輸入 0.15、輸出 7.50 美元／每百萬 tokens；批次 API 0.75/0.075/3.75 美元）。
+- 新增單元測試驗證 `Gemini 3.8 Flash` 各思考層級與 API 識別碼 `gemini-3.8-flash` 皆能正確套用費率，並加入實際 turn Token 用量的回歸斷言。
+- 新增 Gemini 3.8 Flash 官方定價研究文件（`docs/research/gemini-3-8-flash-pricing.md`），記錄官方公布費率與思考層級費率推導說明。
+
+### 相容性
+
+- 本次僅補充模型價格規則、單元測試與研究文件，無資料庫結構、環境變數或安裝流程變更。
+
 ## [0.8.0] - 2026-09-02
 
 ### 新增與改善
@@ -449,7 +461,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.8.0...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.7.5...v0.8.0
 [0.6.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.5.0...v0.6.0
