@@ -514,6 +514,50 @@ mod tests {
     }
 
     #[test]
+    fn gemini_3_8_flash_thinking_levels_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in [
+            "Gemini 3.8 Flash",
+            "Gemini 3.8 Flash (Medium)",
+            "Gemini 3.8 Flash (High)",
+            "Gemini 3.8 Flash (Low)",
+            "gemini-3.8-flash",
+        ] {
+            let cost = calculate_usage_cost(
+                &rules,
+                Some(model_name),
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+            )
+            .unwrap();
+
+            assert!(
+                (cost - 9.15).abs() < 1e-9,
+                "unexpected Gemini 3.8 Flash cost for {model_name}: {cost}"
+            );
+        }
+
+        let turn_306_cost = calculate_usage_cost(
+            &rules,
+            Some("Gemini 3.8 Flash (High)"),
+            142_420,
+            76_059,
+            129_867,
+            0,
+            0,
+        )
+        .expect("Gemini 3.8 Flash (High) turn 306 cost should calculate successfully");
+        let expected = (142_420.0 / 1_000_000.0) * 1.50
+            + (129_867.0 / 1_000_000.0) * 0.15
+            + (76_059.0 / 1_000_000.0) * 7.50;
+        assert!((turn_306_cost - expected).abs() < 1e-9);
+    }
+
+    #[test]
     fn gemini_3_7_flash_thinking_levels_use_packaged_pricing() {
         let rules = load_pricing_rules();
 
