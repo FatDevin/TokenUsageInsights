@@ -447,9 +447,9 @@ function cardIconMarkup(name, extraClass = '') {
 function setTitleMarkup(iconName, textHtml) {
   const titleEl = document.getElementById('current-date-title');
   if (titleEl) {
-    // iconName 為 'sync' 表示資料仍在載入，標題加上旋轉圖示提示
+    // iconName 為 'sync' 表示資料仍在載入，旋轉圖示置於日期右側以避免文字位移晃動
     const spinner = iconName === 'sync' ? iconMarkup('sync', 'title-sync-icon') : '';
-    titleEl.innerHTML = `${spinner}<span class="title-text">${textHtml}</span>`;
+    titleEl.innerHTML = `<span class="title-text">${textHtml}</span>${spinner}`;
   }
 }
 

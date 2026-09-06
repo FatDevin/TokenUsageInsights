@@ -374,7 +374,8 @@ input {
 
 .title-sync-icon {
   display: inline-flex;
-  margin-right: 10px;
+  margin: 0;
+  flex-shrink: 0;
   color: var(--accent-cyan, #22d3ee);
   animation: reload-spin 0.9s linear infinite;
 }

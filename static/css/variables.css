@@ -290,6 +290,7 @@ body {
 .app-main {
   padding: 0 32px 32px 32px; /* Top padding is 0 to ensure sticky header lies strictly at the very top */
   overflow-y: auto;
+  scrollbar-gutter: stable;
   display: flex;
   flex-direction: column;
   gap: 28px;
