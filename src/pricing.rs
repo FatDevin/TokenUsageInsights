@@ -514,6 +514,105 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_astra_context_tiers_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        // 1. Short context (prompt tokens <= 272k): $10.00 / $1.00 / $50.00 per 1M tokens
+        for model_name in [
+            "GPT-6 Astra",
+            "GPT-6 Astra (<272k)",
+            "gpt-6-astra",
+            "GPT-6-Astra",
+        ] {
+            let cost =
+                calculate_usage_cost(&rules, Some(model_name), 100_000, 50_000, 100_000, 0, 0)
+                    .unwrap();
+
+            let expected = (100_000.0 / 1_000_000.0) * 10.00
+                + (100_000.0 / 1_000_000.0) * 1.00
+                + (50_000.0 / 1_000_000.0) * 50.00;
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "unexpected short-context cost for {model_name}: {cost}"
+            );
+        }
+
+        // 2. Long context (prompt tokens > 272k): $20.00 / $2.00 / $75.00 per 1M tokens
+        for model_name in [
+            "GPT-6 Astra",
+            "GPT-6 Astra (>272k)",
+            "gpt-6-astra",
+            "GPT-6-Astra",
+        ] {
+            let cost =
+                calculate_usage_cost(&rules, Some(model_name), 300_000, 50_000, 0, 0, 0).unwrap();
+
+            let expected = (300_000.0 / 1_000_000.0) * 20.00 + (50_000.0 / 1_000_000.0) * 75.00;
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "unexpected long-context cost for {model_name}: {cost}"
+            );
+        }
+
+        // 3. Regression test for session 01a074ab-f530-7cf1-b65f-d2e52a330258 turn 518
+        // input: 1,021, output: 1,388, cache_read: 197,760 -> prompt = 198,781 tokens (<= 272k)
+        let turn_518_cost =
+            calculate_usage_cost(&rules, Some("gpt-6-astra"), 1_021, 1_388, 197_760, 0, 0)
+                .expect("gpt-6-astra turn 518 cost should calculate successfully");
+        let expected_turn_518 = (1_021.0 / 1_000_000.0) * 10.00
+            + (197_760.0 / 1_000_000.0) * 1.00
+            + (1_388.0 / 1_000_000.0) * 50.00;
+        assert!((turn_518_cost - expected_turn_518).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gpt_daybreak_blue_uses_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        // Identical to gpt-5.6-sol: input 5.00, cache_read 0.50, output 30.00
+        for model_name in [
+            "gpt-daybreak-blue-latest",
+            "gpt-daybreak-blue",
+            "GPT-Daybreak-Blue-Latest",
+            "GPT-Daybreak-Blue",
+        ] {
+            let cost = calculate_usage_cost(
+                &rules,
+                Some(model_name),
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+            )
+            .unwrap();
+
+            // 5.00 + 0.50 + 30.00 = 35.50
+            assert!(
+                (cost - 35.5).abs() < 1e-9,
+                "unexpected cost for {model_name}: {cost}"
+            );
+        }
+
+        // Regression test for session 01a06d15-a222-7bc2-9c0b-19ec24de2c80 turn 6
+        // input: 227, output: 180, cache_read: 42,886
+        let turn_6_cost = calculate_usage_cost(
+            &rules,
+            Some("gpt-daybreak-blue-latest"),
+            227,
+            180,
+            42_886,
+            0,
+            0,
+        )
+        .expect("gpt-daybreak-blue-latest turn 6 cost should calculate successfully");
+        let expected_turn_6 = (227.0 / 1_000_000.0) * 5.00
+            + (42_886.0 / 1_000_000.0) * 0.50
+            + (180.0 / 1_000_000.0) * 30.00;
+        assert!((turn_6_cost - expected_turn_6).abs() < 1e-9);
+    }
+
+    #[test]
     fn gemini_3_8_flash_thinking_levels_use_packaged_pricing() {
         let rules = load_pricing_rules();
 

@@ -3,7 +3,8 @@ use crate::{
     pricing::PreparedPricingRules,
 };
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{LazyLock, Mutex};
 
 pub mod daily;
 pub mod misc;
@@ -99,6 +100,22 @@ fn entry_model(entry: &UsageEntry) -> Option<&str> {
         .filter(|model| !model.is_empty())
 }
 
+static WARNED_PRICING_MODELS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn log_pricing_failure(model: &str, session_id: &str, turn_no: u32, error: &str) {
+    let mut warned = match WARNED_PRICING_MODELS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if warned.insert(model.to_string()) {
+        eprintln!(
+            "計算成本失敗: session_id={} turn_no={} model={}: {}（此模型後續不再重複提示）",
+            session_id, turn_no, model, error
+        );
+    }
+}
+
 fn record_usage(
     result: &mut SessionUsageAggregation,
     pricing_rules: &PreparedPricingRules,
@@ -122,10 +139,7 @@ fn record_usage(
             ) {
                 Ok(cost) => cost,
                 Err(error) => {
-                    eprintln!(
-                        "計算成本失敗: session_id={} turn_no={} model={}: {}",
-                        entry.session_id, entry.turn_no, model_label, error
-                    );
+                    log_pricing_failure(model_label, &entry.session_id, entry.turn_no, &error);
                     0.0
                 }
             }
@@ -768,5 +782,27 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn missing_pricing_rule_logs_only_once_per_model() {
+        let rules = PreparedPricingRules::from_rules(vec![]);
+        let entries = vec![
+            usage_entry(1, "copilot/auto", token_stats(100, 50, 0), true),
+            usage_entry(2, "copilot/auto", token_stats(200, 80, 0), true),
+            usage_entry(3, "copilot/auto", token_stats(300, 90, 0), true),
+        ];
+
+        let result = summarize_session_usage(&rules, &entries);
+        assert_eq!(result.usage.cost_usd, 0.0);
+        assert_eq!(result.models.len(), 1);
+        assert_eq!(result.models[0].model, "copilot/auto");
+        assert_eq!(result.models[0].usage.cost_usd, 0.0);
+
+        // Verify the model was recorded in WARNED_PRICING_MODELS so subsequent logs are suppressed
+        assert!(WARNED_PRICING_MODELS
+            .lock()
+            .unwrap()
+            .contains("copilot/auto"));
     }
 }
