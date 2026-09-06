@@ -15,7 +15,13 @@ Follow standard Rust formatting with 4-space indentation and `snake_case` for fu
 The repository currently uses Rust unit/integration-style tests embedded under `#[cfg(test)]`, notably in `src/handlers.rs`. Add new backend tests close to the code they exercise unless a dedicated `tests/` directory becomes necessary. Prefer deterministic fixtures by pointing `INSIGHTS_DIR` to a temporary folder, matching the existing yearly handler test pattern. Run `cargo test` after any API, database, or parsing change.
 
 ## Commit & Pull Request Guidelines
-Recent history uses short conventional prefixes such as `feat:`, `fix:`, `style:`, and scoped forms like `feat(web):`. Keep commit subjects imperative and specific. PRs should describe the user-visible change, note any schema or env var impact, and include screenshots for `static/` UI changes. Link related issues when applicable and list the verification commands you ran.
+- **Automatic Detailed Commit on Completion**: Every time code editing and verification are done, create a git commit immediately. Do not leave uncommitted code changes after concluding a task unless explicitly instructed otherwise.
+- **Full Detailed Traditional Chinese (`zh-TW`) Commit Log**: Every commit message must be written in comprehensive, detailed Traditional Chinese (`zh-TW`) using Taiwan terminology. Follow Conventional Commits format (e.g. `feat(web):`, `fix(pricing):`, `fix(web):`). Structure the commit message with:
+  1. Imperative, specific subject line in Traditional Chinese.
+  2. Concise problem context and user impact overview.
+  3. Detailed file-by-file / module-by-module change breakdown (`變更細節`).
+  4. Explicit verification commands and test results (`驗證項目`), including compiler zero-warning checks, unit tests, clippy, and browser / manual verification.
+- **PRs**: PRs should describe the user-visible change, note any schema or env var impact, and include screenshots for `static/` UI changes. Link related issues when applicable and list the verification commands you ran.
 
 ## Release & Changelog Guidelines
 Every release must update `CHANGELOG.md` in the same release change before creating the version tag. Move the relevant items from the `Unreleased` / `未發行` section into a version heading with the release date, and derive the entries from both the Git log and the actual diff from the previous tag. Record user-visible additions, changes, fixes, removals, security changes, migrations, environment variable changes, and breaking changes when applicable; do not list a version bump by itself as a product change.
