@@ -453,6 +453,16 @@ function setTitleMarkup(iconName, textHtml) {
   }
 }
 
+function clearTitleSpinner() {
+  const titleEl = document.getElementById('current-date-title');
+  if (titleEl) {
+    const syncIcon = titleEl.querySelector('.title-sync-icon');
+    if (syncIcon) {
+      syncIcon.remove();
+    }
+  }
+}
+
 // =========================================================================
 // 視窗載入狀態：切換日期/月份/年份時立即給予回饋，資料抵達後再更新內容
 // =========================================================================
@@ -680,7 +690,18 @@ function updateLanguageUI() {
   // Update dynamic placeholders/empty state if they are currently displayed
   const emptyContainer = document.getElementById('empty-state-container');
   if (emptyContainer && !emptyContainer.classList.contains('hidden')) {
-    toggleEmptyState(true);
+    if (isEmptyState) {
+      toggleEmptyState(true);
+    } else if (activeTab === 'daily') {
+      const dateSelect = document.getElementById('date-select');
+      if (dateSelect && dateSelect.value) showNoDataForDate(dateSelect.value);
+    } else if (activeTab === 'monthly') {
+      const monthSelect = document.getElementById('month-select');
+      if (monthSelect && monthSelect.value) showNoDataForMonth(monthSelect.value);
+    } else if (activeTab === 'yearly') {
+      const yearSelect = document.getElementById('year-select');
+      if (yearSelect && yearSelect.value) showNoDataForYear(yearSelect.value);
+    }
   }
 
   ['monthly-stat-input-pct', 'monthly-stat-cache-input-pct', 'monthly-stat-output-pct',
@@ -842,6 +863,7 @@ function initApp() {
         }
 
         if (assistantChanged) {
+          isEmptyState = false;
           currentUsageData = null;
           currentMonthlyData = null;
           currentYearlyData = null;
@@ -849,10 +871,10 @@ function initApp() {
           showViewLoading(true);
         }
 
-        // 切換 agent 時保留目前日期，當日無資料則顯示提示
+        // 切換 agent 時保留目前日期與月份/年份，無資料則顯示提示，不任意倒退
         await fetchDates(null, true, currentAssistant);
-        await fetchMonths(null, currentAssistant);
-        await fetchYears(null, currentAssistant);
+        await fetchMonths(null, currentAssistant, true);
+        await fetchYears(null, currentAssistant, true);
       });
     });
   }
@@ -1806,7 +1828,10 @@ async function loadUsageData(date, assistant = currentAssistant) {
     console.error('載入使用量失敗:', err);
     if (mySeq === dailyRequestSeq) showNotification(t('load_failed'), 'error');
   } finally {
-    if (mySeq === dailyRequestSeq) hideViewLoading();
+    if (mySeq === dailyRequestSeq) {
+      hideViewLoading();
+      clearTitleSpinner();
+    }
   }
 }
 
@@ -2255,6 +2280,7 @@ function showNoDataForDate(date, assistant = currentAssistant) {
   const monthlyView = document.getElementById('monthly-view-container');
   const yearlyView = document.getElementById('yearly-view-container');
 
+  isEmptyState = false;
   currentUsageData = null;
   resetMiniStats();
 
@@ -2293,12 +2319,142 @@ function showNoDataForDate(date, assistant = currentAssistant) {
       });
     }
   }
+  clearTitleSpinner();
+  hideViewLoading();
   if (dailyView) dailyView.classList.add('hidden');
   if (monthlyView) monthlyView.classList.add('hidden');
   if (yearlyView) yearlyView.classList.add('hidden');
 
   // 更新標題
-  setTitleMarkup('empty', date);
+  setTitleMarkup('calendar', date);
+}
+
+// 顯示「此 Agent 於當月無資料」的提示畫面
+function showNoDataForMonth(month, assistant = currentAssistant) {
+  const resolvedAssistant = normalizeAssistant(assistant);
+  const meta = getAssistantMeta(resolvedAssistant);
+  const title = t('no_data_for_month', resolvedAssistant)
+    .replace('{agent}', meta.label)
+    .replace('{month}', month);
+  const desc = t('no_data_for_month_desc', resolvedAssistant);
+  const logoMarkup = `<div class="card-icon"><img src="${meta.logo}" alt="${meta.alt}" style="width: 56px; height: 56px; object-fit: contain;" /></div>`;
+
+  const emptyContainer = document.getElementById('empty-state-container');
+  const dailyView = document.getElementById('daily-view-container');
+  const monthlyView = document.getElementById('monthly-view-container');
+  const yearlyView = document.getElementById('yearly-view-container');
+
+  isEmptyState = false;
+  currentMonthlyData = null;
+  resetMiniStats();
+
+  if (emptyContainer) {
+    emptyContainer.classList.remove('hidden');
+    emptyContainer.innerHTML = `
+      <div class="welcome-setup-card no-agent-card" style="align-items: center; text-align: center;">
+        ${logoMarkup}
+        <h2>${title}</h2>
+        <p style="text-align: center; max-width: 100%;">${desc}</p>
+        <div class="action-buttons">
+          <button class="primary-btn" id="btn-no-data-setup-guide">${t('btn_empty_setup', resolvedAssistant)}</button>
+          <button class="secondary-btn" id="btn-no-data-refresh">${t('btn_empty_refresh', resolvedAssistant)}</button>
+        </div>
+      </div>
+    `;
+
+    const noDataGuideBtn = document.getElementById('btn-no-data-setup-guide');
+    if (noDataGuideBtn) {
+      noDataGuideBtn.addEventListener('click', () => openSetupModal(resolvedAssistant));
+    }
+
+    const noDataRefreshBtn = document.getElementById('btn-no-data-refresh');
+    if (noDataRefreshBtn) {
+      noDataRefreshBtn.addEventListener('click', async () => {
+        noDataRefreshBtn.classList.add('loading');
+        try {
+          const monthSelect = document.getElementById('month-select');
+          if (monthSelect) {
+            monthSelect.value = month;
+          }
+          await fetchMonths(month, resolvedAssistant, true);
+        } finally {
+          noDataRefreshBtn.classList.remove('loading');
+        }
+      });
+    }
+  }
+  clearTitleSpinner();
+  hideViewLoading();
+  if (dailyView) dailyView.classList.add('hidden');
+  if (monthlyView) monthlyView.classList.add('hidden');
+  if (yearlyView) yearlyView.classList.add('hidden');
+
+  // 更新標題
+  setTitleMarkup('calendar', month);
+}
+
+// 顯示「此 Agent 於當年無資料」的提示畫面
+function showNoDataForYear(year, assistant = currentAssistant) {
+  const resolvedAssistant = normalizeAssistant(assistant);
+  const meta = getAssistantMeta(resolvedAssistant);
+  const title = t('no_data_for_year', resolvedAssistant)
+    .replace('{agent}', meta.label)
+    .replace('{year}', year);
+  const desc = t('no_data_for_year_desc', resolvedAssistant);
+  const logoMarkup = `<div class="card-icon"><img src="${meta.logo}" alt="${meta.alt}" style="width: 56px; height: 56px; object-fit: contain;" /></div>`;
+
+  const emptyContainer = document.getElementById('empty-state-container');
+  const dailyView = document.getElementById('daily-view-container');
+  const monthlyView = document.getElementById('monthly-view-container');
+  const yearlyView = document.getElementById('yearly-view-container');
+
+  isEmptyState = false;
+  currentYearlyData = null;
+  resetMiniStats();
+
+  if (emptyContainer) {
+    emptyContainer.classList.remove('hidden');
+    emptyContainer.innerHTML = `
+      <div class="welcome-setup-card no-agent-card" style="align-items: center; text-align: center;">
+        ${logoMarkup}
+        <h2>${title}</h2>
+        <p style="text-align: center; max-width: 100%;">${desc}</p>
+        <div class="action-buttons">
+          <button class="primary-btn" id="btn-no-data-setup-guide">${t('btn_empty_setup', resolvedAssistant)}</button>
+          <button class="secondary-btn" id="btn-no-data-refresh">${t('btn_empty_refresh', resolvedAssistant)}</button>
+        </div>
+      </div>
+    `;
+
+    const noDataGuideBtn = document.getElementById('btn-no-data-setup-guide');
+    if (noDataGuideBtn) {
+      noDataGuideBtn.addEventListener('click', () => openSetupModal(resolvedAssistant));
+    }
+
+    const noDataRefreshBtn = document.getElementById('btn-no-data-refresh');
+    if (noDataRefreshBtn) {
+      noDataRefreshBtn.addEventListener('click', async () => {
+        noDataRefreshBtn.classList.add('loading');
+        try {
+          const yearSelect = document.getElementById('year-select');
+          if (yearSelect) {
+            yearSelect.value = year;
+          }
+          await fetchYears(year, resolvedAssistant, true);
+        } finally {
+          noDataRefreshBtn.classList.remove('loading');
+        }
+      });
+    }
+  }
+  clearTitleSpinner();
+  hideViewLoading();
+  if (dailyView) dailyView.classList.add('hidden');
+  if (monthlyView) monthlyView.classList.add('hidden');
+  if (yearlyView) yearlyView.classList.add('hidden');
+
+  // 更新標題
+  setTitleMarkup('calendar', year);
 }
 
 // Helpers to render metrics values (handling agent breakdown when multiple agents are active)
@@ -4794,7 +4950,7 @@ function escapeHtml(unsafe) {
 // =========================================================================
 // API 呼叫: 載入月份清單
 // =========================================================================
-async function fetchMonths(selectedMonth = null, assistant = currentAssistant) {
+async function fetchMonths(selectedMonth = null, assistant = currentAssistant, keepMonth = false) {
   try {
     const resolvedAssistant = normalizeAssistant(assistant);
     const res = await fetch(`/api/${resolvedAssistant}/months`);
@@ -4803,8 +4959,13 @@ async function fetchMonths(selectedMonth = null, assistant = currentAssistant) {
     if (currentAssistant !== resolvedAssistant) return;
     
     const monthSelect = document.getElementById('month-select');
+    if (!monthSelect) return;
+
+    const currentMonthVal = /^\d{4}-\d{2}$/.test(monthSelect.value) ? monthSelect.value : null;
     const urlMonth = getUrlDateForTab('monthly');
-    const targetMonth = selectedMonth || urlMonth || monthSelect.value;
+    const now = new Date();
+    const thisMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const targetMonth = selectedMonth || (keepMonth ? (currentMonthVal || urlMonth || thisMonthStr) : (urlMonth || currentMonthVal));
     
     monthSelect.innerHTML = '';
 
@@ -4817,10 +4978,16 @@ async function fetchMonths(selectedMonth = null, assistant = currentAssistant) {
       return;
     }
 
-    let monthToLoad = data.months[0];
+    const availableMonths = [...data.months];
+    if (targetMonth && /^\d{4}-\d{2}$/.test(targetMonth) && !availableMonths.includes(targetMonth)) {
+      availableMonths.push(targetMonth);
+      availableMonths.sort((a, b) => b.localeCompare(a));
+    }
+
+    let monthToLoad = targetMonth && /^\d{4}-\d{2}$/.test(targetMonth) ? targetMonth : availableMonths[0];
     let hasSelected = false;
 
-    data.months.forEach((month) => {
+    availableMonths.forEach((month) => {
       const opt = document.createElement('option');
       opt.value = month;
       opt.textContent = month;
@@ -4832,10 +4999,9 @@ async function fetchMonths(selectedMonth = null, assistant = currentAssistant) {
       monthSelect.appendChild(opt);
     });
 
-    if (!hasSelected) {
-      if (monthSelect.options.length > 0) {
-        monthSelect.options[0].selected = true;
-      }
+    if (!hasSelected && monthSelect.options.length > 0) {
+      monthSelect.options[0].selected = true;
+      monthToLoad = monthSelect.options[0].value;
     }
 
     if (activeTab === 'monthly') {
@@ -4857,7 +5023,7 @@ async function reloadMonthlyData() {
 // =========================================================================
 // API 呼叫: 載入年份清單
 // =========================================================================
-async function fetchYears(selectedYear = null, assistant = currentAssistant) {
+async function fetchYears(selectedYear = null, assistant = currentAssistant, keepYear = false) {
   try {
     const resolvedAssistant = normalizeAssistant(assistant);
     const res = await fetch(`/api/${resolvedAssistant}/years`);
@@ -4867,8 +5033,12 @@ async function fetchYears(selectedYear = null, assistant = currentAssistant) {
     
     const yearSelect = document.getElementById('year-select');
     if (!yearSelect) return;
+
+    const currentYearVal = /^\d{4}$/.test(yearSelect.value) ? yearSelect.value : null;
     const urlYear = getUrlDateForTab('yearly');
-    const targetYear = selectedYear || urlYear || yearSelect.value;
+    const now = new Date();
+    const thisYearStr = String(now.getFullYear());
+    const targetYear = selectedYear || (keepYear ? (currentYearVal || urlYear || thisYearStr) : (urlYear || currentYearVal));
     
     yearSelect.innerHTML = '';
 
@@ -4881,10 +5051,16 @@ async function fetchYears(selectedYear = null, assistant = currentAssistant) {
       return;
     }
 
-    let yearToLoad = data.years[0];
+    const availableYears = [...data.years];
+    if (targetYear && /^\d{4}$/.test(targetYear) && !availableYears.includes(targetYear)) {
+      availableYears.push(targetYear);
+      availableYears.sort((a, b) => b.localeCompare(a));
+    }
+
+    let yearToLoad = targetYear && /^\d{4}$/.test(targetYear) ? targetYear : availableYears[0];
     let hasSelected = false;
 
-    data.years.forEach((year) => {
+    availableYears.forEach((year) => {
       const opt = document.createElement('option');
       opt.value = year;
       opt.textContent = year;
@@ -4896,10 +5072,9 @@ async function fetchYears(selectedYear = null, assistant = currentAssistant) {
       yearSelect.appendChild(opt);
     });
 
-    if (!hasSelected) {
-      if (yearSelect.options.length > 0) {
-        yearSelect.options[0].selected = true;
-      }
+    if (!hasSelected && yearSelect.options.length > 0) {
+      yearSelect.options[0].selected = true;
+      yearToLoad = yearSelect.options[0].value;
     }
 
     if (activeTab === 'yearly') {
@@ -4940,7 +5115,7 @@ async function loadYearlyData(year, assistant = currentAssistant) {
     if (mySeq !== yearlyRequestSeq) return;
     if (currentAssistant !== resolvedAssistant) return;
     if (res.status === 404) {
-      showNotification(t('year_not_found'), 'error');
+      showNoDataForYear(year, resolvedAssistant);
       return;
     }
     
@@ -4958,6 +5133,7 @@ async function loadYearlyData(year, assistant = currentAssistant) {
     if (mySeq === yearlyRequestSeq) {
       yearlyInFlightTarget = null;
       hideViewLoading();
+      clearTitleSpinner();
     }
   }
 }
@@ -5720,7 +5896,7 @@ async function loadMonthlyData(month, assistant = currentAssistant) {
     if (mySeq !== monthlyRequestSeq) return;
     if (currentAssistant !== resolvedAssistant) return;
     if (res.status === 404) {
-      showNotification(t('month_not_found'), 'error');
+      showNoDataForMonth(month, resolvedAssistant);
       return;
     }
     
@@ -5738,6 +5914,7 @@ async function loadMonthlyData(month, assistant = currentAssistant) {
     if (mySeq === monthlyRequestSeq) {
       monthlyInFlightTarget = null;
       hideViewLoading();
+      clearTitleSpinner();
     }
   }
 }
@@ -6525,6 +6702,7 @@ function toggleEmptyState(showEmpty, assistant = currentAssistant) {
   if (showEmpty) {
     hideViewLoading();
     resetMiniStats();
+    clearTitleSpinner();
     if (emptyContainer) {
       emptyContainer.classList.remove('hidden');
       if (resolvedAssistant === 'none') {

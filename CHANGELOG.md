@@ -6,6 +6,13 @@
 
 ### 修正
 
+- 修復切換 Coding Agent 類型時任意切換與自動回退月份／年份的問題：
+  - 當使用者在特定月份（例如 2026-09）或年份下切換 Coding Agent（例如從 Antigravity 切換至 Pi coding agent），若目標 Agent 該月無數據，原本會自動降級回退至最新有紀錄的月份（如 2026-08），造成使用者操作體驗混亂與困惑。
+  - 在 `fetchMonths` 與 `fetchYears` 中引入期間保留機制（`keepMonth` / `keepYear`），當所選月份或年份未在目標 Agent 的紀錄清單中時，自動按降冪排列將該期間補入下拉選單並維持選取，不再任意跳轉其他月份。
+  - 當後端回應 404（該期間無紀錄）時，實作 `showNoDataForMonth` 與 `showNoDataForYear` 函式，顯示清晰友善的「此 Agent 於當月／當年無資料」提示卡片（如「Pi Coding Agent 在 2026-09 無資料」），並保留前置設定與重新整理按鈕，不再以錯誤彈窗（Toast）干擾或擅自回退歷史期間。
+  - 在 `static/i18n.js` 中補充 `no_data_for_month`、`no_data_for_month_desc`、`no_data_for_year`、`no_data_for_year_desc` 多語系翻譯支援（含正體中文、簡體中文、英文、日文、韓文）。
+  - 修復切換至無資料期間或後端回傳 404 時日期／月份標題左側載入旋轉指示器（Loading Indicator）未停止轉動之問題：新增 `clearTitleSpinner` 函式，於日報、月報、年報載入之 `finally` 區塊、無資料提示畫面及空狀態切換時確實移除 `.title-sync-icon`，並更新靜態資源快取版本號（`v=60`）。
+  - 修復切換語系時當前顯示之期間無資料卡片會被誤判為初始空狀態而重置為安裝設定教學卡片的問題，切換語系後立即以新語言正確刷新無資料提示。
 - 修復切換至無數據助理時右側看板殘留前一助理數據的問題：
   - 當切換至未安裝或無任何使用日誌之助理（如 Grok Build）時，原本因保留當前日期與月度／年度清單為空直接返回，導致右側視圖未被隱藏，誤顯示前一個助理（如 Pi coding agent）的統計數據與圖表。
   - 在 `fetchDates` 中，當可選日期清單為空時，一律清空快取數據、重設日期選取欄位並強制切換至空狀態。
