@@ -4,6 +4,8 @@
 
 ## [未發行]
 
+## [0.8.3] - 2026-09-06
+
 ### 修正
 
 - 修復切換 Coding Agent 類型時任意切換與自動回退月份／年份的問題：
@@ -497,7 +499,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.8.2...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.7.5...v0.8.0
