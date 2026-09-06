@@ -827,7 +827,9 @@ function initApp() {
         badgeButtons.forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
 
-        currentAssistant = normalizeAssistant(btn.getAttribute('data-value'));
+        const newAssistant = normalizeAssistant(btn.getAttribute('data-value'));
+        const assistantChanged = newAssistant !== currentAssistant;
+        currentAssistant = newAssistant;
         setCookie('selected_agent', currentAssistant);
         updateUrlParams();
         
@@ -839,10 +841,18 @@ function initApp() {
           colHeader.classList.add('hidden');
         }
 
+        if (assistantChanged) {
+          currentUsageData = null;
+          currentMonthlyData = null;
+          currentYearlyData = null;
+          resetMiniStats();
+          showViewLoading(true);
+        }
+
         // 切換 agent 時保留目前日期，當日無資料則顯示提示
         await fetchDates(null, true, currentAssistant);
-        await fetchMonths();
-        await fetchYears();
+        await fetchMonths(null, currentAssistant);
+        await fetchYears(null, currentAssistant);
       });
     });
   }
@@ -1445,8 +1455,14 @@ function switchTab(tab) {
     dailyView.classList.add('hidden');
     monthlyView.classList.add('hidden');
     yearlyView.classList.add('hidden');
-    if (!isEmptyState && activeView) {
-      activeView.classList.remove('hidden');
+    const emptyContainer = document.getElementById('empty-state-container');
+    if (isEmptyState) {
+      if (emptyContainer) emptyContainer.classList.remove('hidden');
+    } else {
+      if (emptyContainer) emptyContainer.classList.add('hidden');
+      if (activeView) {
+        activeView.classList.remove('hidden');
+      }
     }
   };
 
@@ -1463,8 +1479,10 @@ function switchTab(tab) {
 
     // 載入當前日期的數據
     const dateSelect = document.getElementById('date-select');
-    if (dateSelect.value) {
+    if (dateSelect.value && availableDates.length > 0) {
       loadUsageData(dateSelect.value);
+    } else if (availableDates.length === 0) {
+      toggleEmptyState(true, currentAssistant);
     }
   } else if (tab === 'monthly') {
     // 關閉即時自動刷新以節省資源
@@ -1654,7 +1672,15 @@ async function fetchDates(selectedDate = null, keepDate = false, assistant = cur
     const dateSelect = document.getElementById('date-select');
     availableDates = data.dates || [];
 
-    if (availableDates.length === 0 && !keepDate) {
+    if (availableDates.length === 0) {
+      currentUsageData = null;
+      currentMonthlyData = null;
+      currentYearlyData = null;
+      if (dateSelect) {
+        dateSelect.value = '';
+        dateSelect.min = '';
+        dateSelect.max = '';
+      }
       toggleEmptyState(true, resolvedAssistant);
       return;
     }
@@ -2199,6 +2225,21 @@ async function handleImportHistoryAction(event) {
   }
 }
 
+function resetMiniStats() {
+  const miniSessions = document.getElementById('mini-sessions');
+  if (miniSessions) miniSessions.textContent = '-';
+  const miniTokens = document.getElementById('mini-tokens');
+  if (miniTokens) miniTokens.textContent = '-';
+  const miniCache = document.getElementById('mini-cache');
+  if (miniCache) miniCache.textContent = `${t('cache_read_label')}: -`;
+  const miniCost = document.getElementById('mini-cost');
+  if (miniCost) miniCost.textContent = '-';
+  const miniDuration = document.getElementById('mini-duration');
+  if (miniDuration) miniDuration.textContent = '-';
+  const miniRequests = document.getElementById('mini-requests');
+  if (miniRequests) miniRequests.textContent = '-';
+}
+
 // 顯示「此 Agent 於當日無資料」的提示畫面
 function showNoDataForDate(date, assistant = currentAssistant) {
   const resolvedAssistant = normalizeAssistant(assistant);
@@ -2213,6 +2254,9 @@ function showNoDataForDate(date, assistant = currentAssistant) {
   const dailyView = document.getElementById('daily-view-container');
   const monthlyView = document.getElementById('monthly-view-container');
   const yearlyView = document.getElementById('yearly-view-container');
+
+  currentUsageData = null;
+  resetMiniStats();
 
   if (emptyContainer) {
     emptyContainer.classList.remove('hidden');
@@ -4750,10 +4794,13 @@ function escapeHtml(unsafe) {
 // =========================================================================
 // API 呼叫: 載入月份清單
 // =========================================================================
-async function fetchMonths(selectedMonth = null) {
+async function fetchMonths(selectedMonth = null, assistant = currentAssistant) {
   try {
-    const res = await fetch(`/api/${currentAssistant}/months`);
+    const resolvedAssistant = normalizeAssistant(assistant);
+    const res = await fetch(`/api/${resolvedAssistant}/months`);
     const data = await res.json();
+
+    if (currentAssistant !== resolvedAssistant) return;
     
     const monthSelect = document.getElementById('month-select');
     const urlMonth = getUrlDateForTab('monthly');
@@ -4763,6 +4810,10 @@ async function fetchMonths(selectedMonth = null) {
 
     if (!data.months || data.months.length === 0) {
       monthSelect.innerHTML = `<option value="" disabled selected>${t('no_month_logs')}</option>`;
+      if (activeTab === 'monthly') {
+        currentMonthlyData = null;
+        toggleEmptyState(true, resolvedAssistant);
+      }
       return;
     }
 
@@ -4788,7 +4839,7 @@ async function fetchMonths(selectedMonth = null) {
     }
 
     if (activeTab === 'monthly') {
-      await loadMonthlyData(monthToLoad);
+      await loadMonthlyData(monthToLoad, resolvedAssistant);
     }
 
   } catch (err) {
@@ -4806,10 +4857,13 @@ async function reloadMonthlyData() {
 // =========================================================================
 // API 呼叫: 載入年份清單
 // =========================================================================
-async function fetchYears(selectedYear = null) {
+async function fetchYears(selectedYear = null, assistant = currentAssistant) {
   try {
-    const res = await fetch(`/api/${currentAssistant}/years`);
+    const resolvedAssistant = normalizeAssistant(assistant);
+    const res = await fetch(`/api/${resolvedAssistant}/years`);
     const data = await res.json();
+
+    if (currentAssistant !== resolvedAssistant) return;
     
     const yearSelect = document.getElementById('year-select');
     if (!yearSelect) return;
@@ -4820,6 +4874,10 @@ async function fetchYears(selectedYear = null) {
 
     if (!data.years || data.years.length === 0) {
       yearSelect.innerHTML = `<option value="" disabled selected>${t('no_year_logs')}</option>`;
+      if (activeTab === 'yearly') {
+        currentYearlyData = null;
+        toggleEmptyState(true, resolvedAssistant);
+      }
       return;
     }
 
@@ -4845,7 +4903,7 @@ async function fetchYears(selectedYear = null) {
     }
 
     if (activeTab === 'yearly') {
-      await loadYearlyData(yearToLoad);
+      await loadYearlyData(yearToLoad, resolvedAssistant);
     }
 
   } catch (err) {
@@ -4865,10 +4923,11 @@ async function reloadYearlyData() {
 // =========================================================================
 // API 呼叫: 載入單年彙整數據
 // =========================================================================
-async function loadYearlyData(year) {
+async function loadYearlyData(year, assistant = currentAssistant) {
   if (!year || year === 'undefined' || year === 'null') {
     return;
   }
+  const resolvedAssistant = normalizeAssistant(assistant);
   updateUrlParams();
   const mySeq = ++yearlyRequestSeq;
   const dimView = !currentYearlyData || currentYearlyData.year !== year;
@@ -4877,8 +4936,9 @@ async function loadYearlyData(year) {
   try {
     setTitleMarkup('sync', year);
 
-    const res = await fetch(`/api/${currentAssistant}/yearly/${year}`);
+    const res = await fetch(`/api/${resolvedAssistant}/yearly/${year}`);
     if (mySeq !== yearlyRequestSeq) return;
+    if (currentAssistant !== resolvedAssistant) return;
     if (res.status === 404) {
       showNotification(t('year_not_found'), 'error');
       return;
@@ -4886,8 +4946,9 @@ async function loadYearlyData(year) {
     
     const data = await res.json();
     if (mySeq !== yearlyRequestSeq) return;
+    if (currentAssistant !== resolvedAssistant) return;
     modelSessionDetailsCache.clear();
-    toggleEmptyState(false);
+    toggleEmptyState(false, resolvedAssistant);
     renderYearlyDashboard(data);
 
   } catch (err) {
@@ -5642,10 +5703,11 @@ function updateYearlySortHeadersUI() {
 // =========================================================================
 // API 呼叫: 載入單月彙整數據
 // =========================================================================
-async function loadMonthlyData(month) {
+async function loadMonthlyData(month, assistant = currentAssistant) {
   if (!month || month === 'undefined' || month === 'null') {
     return;
   }
+  const resolvedAssistant = normalizeAssistant(assistant);
   updateUrlParams();
   const mySeq = ++monthlyRequestSeq;
   const dimView = !currentMonthlyData || currentMonthlyData.year_month !== month;
@@ -5654,8 +5716,9 @@ async function loadMonthlyData(month) {
   try {
     setTitleMarkup('sync', month);
 
-    const res = await fetch(`/api/${currentAssistant}/monthly/${month}`);
+    const res = await fetch(`/api/${resolvedAssistant}/monthly/${month}`);
     if (mySeq !== monthlyRequestSeq) return;
+    if (currentAssistant !== resolvedAssistant) return;
     if (res.status === 404) {
       showNotification(t('month_not_found'), 'error');
       return;
@@ -5663,8 +5726,9 @@ async function loadMonthlyData(month) {
     
     const data = await res.json();
     if (mySeq !== monthlyRequestSeq) return;
+    if (currentAssistant !== resolvedAssistant) return;
     modelSessionDetailsCache.clear();
-    toggleEmptyState(false);
+    toggleEmptyState(false, resolvedAssistant);
     renderMonthlyDashboard(data);
 
   } catch (err) {
@@ -6459,6 +6523,8 @@ function toggleEmptyState(showEmpty, assistant = currentAssistant) {
   const yearlyView = document.getElementById('yearly-view-container');
   
   if (showEmpty) {
+    hideViewLoading();
+    resetMiniStats();
     if (emptyContainer) {
       emptyContainer.classList.remove('hidden');
       if (resolvedAssistant === 'none') {
