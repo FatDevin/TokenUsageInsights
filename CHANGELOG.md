@@ -2,6 +2,20 @@
 
 本文件記錄 TokenUsageInsights 各正式版本的實際變更。內容依 Git 標籤間的提交記錄與檔案差異整理，格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)，版本編號遵循 [Semantic Versioning](https://semver.org/lang/zh-TW/)。
 
+## [0.8.2] - 2026-09-06
+
+### 新增與改善
+
+- 補充 OpenAI 於 2026-09-03 正式發布的 **GPT-6 Astra** 模型標準費率規則（含短上下文 `GPT-6 Astra (<272k)`、長上下文 `GPT-6 Astra (>272k)` 與預設規則條目），修復 Codex 使用量記錄出現 `gpt-6-astra` 時因缺少價格條目導致的「找不到可用的模型價格規則」錯誤。費率採 OpenAI 官方非邊際階梯牌價（Prompt ≤ 272K：輸入 10.00、快取 1.00、輸出 50.00 美元／每百萬 tokens；Prompt > 272K：輸入 20.00、快取 2.00、輸出 75.00 美元；批次 API 50% 牌價）。
+- 補充 `gpt-daybreak-blue-latest` 與 `gpt-daybreak-blue` 模型費率規則，費率完全等同於 `gpt-5.6-sol`（輸入 5.00、快取 0.50、輸出 30.00 美元／每百萬 tokens），修復對應 session 成本計算失敗的問題。
+- 新增未定價模型日誌去重抑制機制：在 `src/handlers/mod.rs` 引入執行緒安全之全域紀錄 `WARNED_PRICING_MODELS`，對同一未定價模型（如 `copilot/auto` 或各類地端模型）在執行期間僅於首次發生時輸出警告日誌，徹底解決相同模型在連續 Turn 與每次聚合請求中連續重複輸出「計算成本失敗」刷屏的問題。
+- 新增單元測試驗證 `GPT-6 Astra` 長短上下文階梯切換、`gpt-daybreak-blue` 費率對照，以及未定價模型單次日誌抑制機制，並加入實際 turn 用量的回歸斷言。
+- 新增 GPT-6 Astra（`docs/research/gpt-6-astra-pricing.md`）與 GPT-Daybreak-Blue（`docs/research/gpt-daybreak-blue-pricing.md`）定價研究文件。
+
+### 相容性
+
+- 本次僅補充模型價格規則、日誌輸出抑制、單元測試與研究文件，無資料庫結構、環境變數或安裝流程變更。
+
 ## [0.8.1] - 2026-09-06
 
 ### 新增與改善
@@ -461,7 +475,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.8.1...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.7.5...v0.8.0
 [0.6.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.6.0...v0.6.1
