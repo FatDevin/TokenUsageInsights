@@ -4,6 +4,8 @@
 
 ## [未發行]
 
+## [1.1.0] - 2026-09-28
+
 ### 新增與改善
 
 - 新增「全部 Agent」合併檢視：側欄 Agent 選擇器最上方的「全部 Agent」按鈕（或網址參數 `agent=all`）會合併本機所有 Coding Agent 的資料，每日、月度、年度視圖的指標卡片、趨勢圖、Session 清單、專案與模型排行都改以整台電腦的合計呈現，合併後的 Token 與估算費用等於各 Agent 分別統計的加總。
@@ -791,7 +793,9 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.5...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.6...v1.1.0
+[1.0.6]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.1...v1.0.3
