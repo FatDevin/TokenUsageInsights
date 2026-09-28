@@ -1,12 +1,12 @@
 use crate::{
     db::UsageEntry,
     reporting::{
-        summarize_session_usage, AgentBreakdown, DaySummary, MonthlyModelSummary,
+        summarize_session_usage, AgentBreakdown, AgentPeriodUsage, DaySummary, MonthlyModelSummary,
         MonthlyProjectSummary,
     },
 };
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub mod daily;
 pub mod misc;
@@ -33,6 +33,15 @@ pub fn normalize_assistant_name(assistant: &str) -> String {
         | "mini_max_code" => "mcode".to_string(),
         _ => normalized,
     }
+}
+
+/// 合併本機所有 Agent 的彙總範圍；只供唯讀的報表 API 使用。
+pub const ALL_ASSISTANTS_SCOPE: &str = "all";
+
+/// 唯讀報表 API 可接受單一 Agent 或 [`ALL_ASSISTANTS_SCOPE`]；匯入、匯出、
+/// 撤銷與 Session 詳情等需要明確來源的 API 仍必須使用 [`is_supported_assistant`]。
+pub fn is_supported_assistant_scope(assistant: &str) -> bool {
+    normalize_assistant_name(assistant) == ALL_ASSISTANTS_SCOPE || is_supported_assistant(assistant)
 }
 
 pub fn is_supported_assistant(assistant: &str) -> bool {
@@ -141,6 +150,7 @@ pub struct MonthlyDailyBreakdown {
     pub total_reasoning_tokens: u64,
     pub sessions_count: usize,
     pub cost_usd: f64,
+    pub agents: BTreeMap<String, AgentPeriodUsage>,
 }
 
 #[derive(Serialize, Clone)]
@@ -206,6 +216,7 @@ pub struct YearlyMonthlyBreakdown {
     pub total_reasoning_tokens: u64,
     pub sessions_count: usize,
     pub cost_usd: f64,
+    pub agents: BTreeMap<String, AgentPeriodUsage>,
 }
 
 #[derive(Serialize)]
@@ -302,6 +313,199 @@ mod tests {
         assert_eq!(years, vec!["2026", "2025"]);
 
         // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn assistant_scope_accepts_all_only_for_aggregate_reports() {
+        assert!(super::is_supported_assistant_scope("all"));
+        assert!(super::is_supported_assistant_scope(" ALL "));
+        assert!(super::is_supported_assistant_scope("claude-code"));
+        assert!(!super::is_supported_assistant_scope("all,codex"));
+        assert!(!super::is_supported_assistant_scope("unknown"));
+        // 匯入、匯出與 Session 詳情等需要明確來源的 API 不可接受合併範圍。
+        assert!(!super::is_supported_assistant("all"));
+    }
+
+    async fn response_json(response: axum::response::Response) -> (u16, serde_json::Value) {
+        let status = response.status().as_u16();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn all_agents_reports_merge_every_assistant() {
+        use axum::{
+            extract::{Path, Query},
+            response::IntoResponse,
+        };
+
+        let _guard = lock_test_env().await;
+        let temp_dir = env::temp_dir().join(format!(
+            "tui-all-agents-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let previous_insights_dir = env::var_os("INSIGHTS_DIR");
+        env::set_var("INSIGHTS_DIR", &temp_dir);
+
+        // 先建立資料庫檔案，避免 get_db_conn 將舊位置的資料庫搬進測試目錄。
+        let conn = rusqlite::Connection::open(temp_dir.join("token_usage_insights.db")).unwrap();
+        db::init_db(&conn).unwrap();
+        for (assistant, timestamp, date, session_id, turn_no, input, output) in [
+            (
+                "codex",
+                "2026-07-01 09:00:00",
+                "2026-07-01",
+                "shared",
+                1,
+                1_000,
+                100,
+            ),
+            (
+                "codex",
+                "2026-08-02 09:00:00",
+                "2026-08-02",
+                "codex-2",
+                1,
+                3_000,
+                300,
+            ),
+            (
+                "claude",
+                "2026-07-01 10:00:00",
+                "2026-07-01",
+                "shared",
+                1,
+                2_000,
+                200,
+            ),
+            (
+                "claude",
+                "2026-07-01 10:05:00",
+                "2026-07-01",
+                "shared",
+                2,
+                500,
+                50,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, timestamp, date, session_id, session_name, cwd, turn_no, model,
+                    tokens_input, tokens_output, tokens_cache_read, tokens_total,
+                    delta_input, delta_output, delta_cache_read, delta_total
+                ) VALUES (?1, ?2, ?3, ?4, ?4, '/cwd/all', ?5, 'gpt-5.5', ?6, ?7, 0, ?6 + ?7, ?6, ?7, 0, ?6 + ?7)",
+                rusqlite::params![assistant, timestamp, date, session_id, turn_no, input, output],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let yearly = |assistant: &str| {
+            super::get_yearly_details(Path((assistant.to_string(), "2026".to_string())))
+        };
+        let (status, all) = response_json(yearly("ALL").await.into_response()).await;
+        assert_eq!(status, 200);
+        let (_, codex) = response_json(yearly("codex").await.into_response()).await;
+        let (_, claude) = response_json(yearly("claude").await.into_response()).await;
+
+        let summary_u64 =
+            |report: &serde_json::Value, key: &str| report["summary"][key].as_u64().unwrap();
+        assert_eq!(summary_u64(&all, "total_sessions"), 3);
+        for key in ["total_tokens", "total_input_tokens", "total_output_tokens"] {
+            assert_eq!(
+                summary_u64(&all, key),
+                summary_u64(&codex, key) + summary_u64(&claude, key),
+                "{key}"
+            );
+        }
+        let all_cost = all["summary"]["total_cost_usd"].as_f64().unwrap();
+        let separate_cost = codex["summary"]["total_cost_usd"].as_f64().unwrap()
+            + claude["summary"]["total_cost_usd"].as_f64().unwrap();
+        assert!((all_cost - separate_cost).abs() < 1e-9);
+
+        let agents = all["agent_breakdown"].as_object().unwrap();
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents["claude"]["total_tokens"].as_u64(), Some(2_750));
+        assert_eq!(agents["codex"]["total_sessions"].as_u64(), Some(2));
+
+        let months = all["monthly_breakdown"].as_array().unwrap();
+        assert_eq!(months.len(), 2);
+        assert_eq!(months[0]["month"], "2026-07");
+        assert_eq!(
+            months[0]["agents"]["codex"]["total_tokens"].as_u64(),
+            Some(1_100)
+        );
+        assert_eq!(
+            months[0]["agents"]["claude"]["total_tokens"].as_u64(),
+            Some(2_750)
+        );
+        assert_eq!(months[1]["agents"].as_object().unwrap().len(), 1);
+
+        let (status, monthly) = response_json(
+            super::get_monthly_details(Path(("all".to_string(), "2026-07".to_string())))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            monthly["daily_breakdown"][0]["agents"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let (status, dates) = response_json(
+            super::get_available_dates(Path("all".to_string()))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            dates["dates"],
+            serde_json::json!(["2026-08-02", "2026-07-01"])
+        );
+
+        let (status, daily) = response_json(
+            super::get_usage_details(Path(("all".to_string(), "2026-07-01".to_string())))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let mut daily_agents = daily["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["assistant_type"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        daily_agents.sort();
+        assert_eq!(daily_agents, vec!["claude", "codex"]);
+
+        // 需要明確單一來源的 API 仍拒絕合併範圍。
+        let export = super::export_usage_day(Path(("all".to_string(), "2026-07-01".to_string())))
+            .await
+            .into_response();
+        assert_eq!(export.status().as_u16(), 400);
+        let details = super::get_session_details(
+            Path(("all".to_string(), "shared".to_string())),
+            Query(Default::default()),
+        )
+        .await
+        .into_response();
+        assert_eq!(details.status().as_u16(), 400);
+
+        match previous_insights_dir {
+            Some(value) => env::set_var("INSIGHTS_DIR", value),
+            None => env::remove_var("INSIGHTS_DIR"),
+        }
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }

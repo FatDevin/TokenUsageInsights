@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=36';
+import i18n from './i18n.js?v=37';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -21,6 +21,8 @@ let tokenChartInstance = null;
 let monthlyChartInstance = null;
 let pendingUsageImport = null;
 let importHistoryAssistant = null;
+let setupModalAssistant = null;
+let latestAllAgentSetupInfo = null;
 
 const chartPalette = {
   tokenFill: 'rgba(47, 184, 197, 0.24)',
@@ -208,6 +210,10 @@ const assistantMeta = {
   },
 };
 
+// 合併本機所有 Agent 的彙總範圍：只用於唯讀報表，不是實際的 Agent 類型，
+// 因此不放進 assistantMeta，避免匯入目標或 Session 來源誤把它當成 Agent。
+const ALL_ASSISTANTS = 'all';
+
 function normalizeAssistant(rawValue) {
   const normalized = String(rawValue || '').trim().toLowerCase();
   return assistantAliasMap[normalized] || normalized;
@@ -218,8 +224,28 @@ function isSupportedAssistant(rawValue) {
   return Object.prototype.hasOwnProperty.call(assistantMeta, normalized);
 }
 
+function isAllAssistantsScope(rawValue = currentAssistant) {
+  return normalizeAssistant(rawValue) === ALL_ASSISTANTS;
+}
+
+// 側欄可選取的範圍：單一 Agent 或合併全部 Agent
+function isSelectableAssistant(rawValue) {
+  return normalizeAssistant(rawValue) === ALL_ASSISTANTS || isSupportedAssistant(rawValue);
+}
+
 function getAssistantMeta(rawValue) {
   const normalized = normalizeAssistant(rawValue);
+  if (normalized === ALL_ASSISTANTS) {
+    const label = t('all_agents_label', ALL_ASSISTANTS);
+    return {
+      logo: '/static/favicon-v2.png',
+      label,
+      shortLabel: label,
+      alt: label,
+      badgeStyle: 'display: inline-flex; align-items: center;',
+      senderName: 'AGENT',
+    };
+  }
   return assistantMeta[normalized] || {
     logo: '/static/favicon-v2.png',
     label: normalized || 'Agent',
@@ -294,8 +320,8 @@ function updateUrlParams() {
 
 const urlParams = new URLSearchParams(window.location.search);
 const urlAgent = urlParams.get('agent');
-const savedAgent = isSupportedAssistant(urlAgent) ? urlAgent : getCookie('selected_agent');
-let currentAssistant = isSupportedAssistant(savedAgent) ? normalizeAssistant(savedAgent) : 'antigravity';
+const savedAgent = isSelectableAssistant(urlAgent) ? urlAgent : getCookie('selected_agent');
+let currentAssistant = isSelectableAssistant(savedAgent) ? normalizeAssistant(savedAgent) : 'antigravity';
 
 const urlTab = urlParams.get('tab');
 const savedTab = ['daily', 'monthly', 'yearly'].includes(urlTab) ? urlTab : getCookie('active_tab');
@@ -425,7 +451,7 @@ function t(key, assistant = currentAssistant) {
   const resolvedAssistant = normalizeAssistant(assistant);
   const currentTranslations = i18n[currentLang] || {};
   const fallbackTranslations = i18n['zh-TW'] || {};
-  const assistantPrefix = isSupportedAssistant(resolvedAssistant) && !key.startsWith(`${resolvedAssistant}_`)
+  const assistantPrefix = isSelectableAssistant(resolvedAssistant) && !key.startsWith(`${resolvedAssistant}_`)
     ? `${resolvedAssistant}_`
     : '';
   const candidateKeys = assistantPrefix ? [`${assistantPrefix}${key}`, key] : [key];
@@ -606,6 +632,7 @@ function toggleSidebar() {
 }
 
 const setupModalTitleKeys = {
+  all: 'all_agents_setup_title',
   antigravity: 'setup_modal_title',
   copilot: 'copilot_setup_modal_title',
   codex: 'codex_setup_modal_title',
@@ -632,6 +659,7 @@ function setSetupModalTitle(assistant) {
 
 function setSetupModalBody(assistant) {
   const bodyIds = {
+    all: 'setup-body-all',
     antigravity: 'setup-body-statusline',
     copilot: 'setup-body-statusline',
     codex: 'setup-body-codex',
@@ -880,13 +908,15 @@ function initApp() {
         btn.classList.remove('active');
       }
     });
-    // 若沒有任何 active（例如 currentAssistant === 'all' 或 'none'），預設第一個
+    // 若沒有任何 active（例如 currentAssistant === 'none'），預設第一個實際 Agent（略過「全部 Agent」）
     if (!document.querySelector('.assistant-badge-btn.active')) {
-      badgeButtons[0].classList.add('active');
-      currentAssistant = badgeButtons[0].getAttribute('data-value');
-      currentAssistant = normalizeAssistant(currentAssistant);
+      const fallbackButton = [...badgeButtons].find(button => !isAllAssistantsScope(button.getAttribute('data-value')))
+        || badgeButtons[0];
+      fallbackButton.classList.add('active');
+      currentAssistant = normalizeAssistant(fallbackButton.getAttribute('data-value'));
       setCookie('selected_agent', currentAssistant);
     }
+    updateAssistantScopeUI();
 
     badgeButtons.forEach(btn => {
       btn.addEventListener('click', async () => {
@@ -899,6 +929,7 @@ function initApp() {
         currentAssistant = newAssistant;
         setCookie('selected_agent', currentAssistant);
         updateUrlParams();
+        updateAssistantScopeUI();
         
         updateLanguageUI();
         fetchPricingRules();
@@ -935,6 +966,10 @@ function initApp() {
       localStorage.setItem('lang', languagePreference);
       updateLanguageUI();
       
+      if (latestAllAgentSetupInfo && isSetupModalOpen() && isAllAssistantsScope(setupModalAssistant)) {
+        renderAllAgentSourceList(latestAllAgentSetupInfo);
+      }
+
       // Re-render currently active view
       if (activeTab === 'daily' && currentUsageData) {
         renderDashboard(currentUsageData);
@@ -1463,6 +1498,9 @@ function initApp() {
   // 初始化單日圖表類型與 K 線時間刻度
   initDailyChartControls();
 
+  // 初始化合併全部 Agent 的分佈表與堆疊圖控制
+  initAgentShareControls();
+
   // 初始化前置設定教學 Modal 與事件
   initSetupGuide();
 
@@ -1905,6 +1943,7 @@ function getUsageExportFilename(payload) {
 }
 
 async function exportCurrentUsageDay() {
+  if (isAllAssistantsScope()) return;
   const period = getCurrentUsagePeriod();
   const btnExport = document.getElementById('btn-export-usage-day');
   if (btnExport) btnExport.classList.add('loading');
@@ -1955,6 +1994,7 @@ async function exportCurrentUsageDay() {
 }
 
 async function importUsageDayFromFile(file) {
+  if (isAllAssistantsScope()) return;
   if (!file) {
     showNotification(t('import_no_file'), 'info');
     return;
@@ -2172,6 +2212,7 @@ function closeUsageImportHistory() {
 }
 
 async function openUsageImportHistory() {
+  if (isAllAssistantsScope()) return;
   importHistoryAssistant = currentAssistant;
   const modal = document.getElementById('usage-import-history-modal');
   const description = document.getElementById('usage-import-history-description');
@@ -2577,6 +2618,391 @@ function renderMonthlyMetricValue(elementId, getValFn, formatFn, agentBreakdown,
 }
 
 // =========================================================================
+// 合併全部 Agent：用量分佈表、佔比條與依 Agent 堆疊的趨勢圖
+// =========================================================================
+const AGENT_TREND_METRIC_STORAGE_KEY = 'agent_trend_metric';
+const AGENT_TREND_METRICS = ['cost', 'tokens'];
+const AGENT_SHARE_VIEWS = ['daily', 'monthly', 'yearly'];
+const AGENT_FALLBACK_COLOR = '#94a3b8';
+const agentTrendCharts = new Map();
+const agentTrendBreakdowns = new Map();
+const savedAgentTrendMetric = localStorage.getItem(AGENT_TREND_METRIC_STORAGE_KEY);
+let agentTrendMetric = AGENT_TREND_METRICS.includes(savedAgentTrendMetric) ? savedAgentTrendMetric : 'cost';
+
+function updateAssistantScopeUI() {
+  const isAll = isAllAssistantsScope();
+  document.body.classList.toggle('all-agents-scope', isAll);
+  // 匯入、匯出與匯入紀錄都必須指定單一 Agent，合併模式下不提供
+  ['btn-export-usage-day', 'btn-import-usage-day', 'btn-import-history'].forEach(id => {
+    document.getElementById(id)?.classList.toggle('hidden', isAll);
+  });
+  AGENT_SHARE_VIEWS.forEach(view => {
+    document.getElementById(`${view}-agent-share-section`)?.classList.toggle('hidden', !isAll);
+  });
+  if (!isAll) {
+    agentTrendCharts.forEach(chart => chart.destroy());
+    agentTrendCharts.clear();
+    agentTrendBreakdowns.clear();
+  }
+}
+
+function colorWithAlpha(hexColor, alpha) {
+  const match = /^#([0-9a-f]{6})$/i.exec(String(hexColor || ''));
+  if (!match) return `rgba(148, 163, 184, ${alpha})`;
+  const value = parseInt(match[1], 16);
+  return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, ${alpha})`;
+}
+
+function getAgentColor(assistant) {
+  return getAssistantMeta(assistant).highlightColor || AGENT_FALLBACK_COLOR;
+}
+
+function createAgentShareRow(assistant) {
+  return { assistant, sessions: 0, input: 0, output: 0, cache: 0, tokens: 0, cost: 0 };
+}
+
+function sortAgentShareRows(rows) {
+  return rows.sort((left, right) => (
+    right.cost - left.cost
+    || right.tokens - left.tokens
+    || left.assistant.localeCompare(right.assistant)
+  ));
+}
+
+// 每日：由（套用 CWD 篩選後的）Session 在前端彙總，確保與指標卡片數字一致
+function buildAgentShareRowsFromSessions(sessions) {
+  const rows = new Map();
+  (Array.isArray(sessions) ? sessions : []).forEach(session => {
+    const assistant = normalizeAssistant(session.assistant_type);
+    if (!rows.has(assistant)) rows.set(assistant, createAgentShareRow(assistant));
+    const row = rows.get(assistant);
+    row.sessions += 1;
+    row.input += Number(session.total_input_tokens) || 0;
+    row.output += Number(session.total_output_tokens) || 0;
+    row.cache += Number(session.total_cache_read_tokens) || 0;
+    row.tokens += Number(session.total_tokens) || 0;
+    row.cost += Number(session.cost_usd) || 0;
+  });
+  return sortAgentShareRows([...rows.values()]);
+}
+
+// 月度／年度：使用後端 agent_breakdown（以完整 Session 計價，合計等於期間總覽）
+function buildAgentShareRowsFromBreakdown(agentBreakdown) {
+  if (!agentBreakdown || typeof agentBreakdown !== 'object') return [];
+  return sortAgentShareRows(Object.entries(agentBreakdown).map(([assistant, usage]) => ({
+    assistant: normalizeAssistant(assistant),
+    sessions: Number(usage?.total_sessions) || 0,
+    input: Number(usage?.total_input_tokens) || 0,
+    output: Number(usage?.total_output_tokens) || 0,
+    cache: Number(usage?.total_cache_read_tokens) || 0,
+    tokens: Number(usage?.total_tokens) || 0,
+    cost: Number(usage?.total_cost_usd) || 0,
+  })));
+}
+
+// 非零但極小的佔比顯示為 <0.01%，避免與完全沒有用量的 0.00% 混淆
+function formatSharePercent(part, total) {
+  const value = Number(part) || 0;
+  const denominator = Number(total) || 0;
+  if (value > 0 && denominator > 0 && (value / denominator) * 100 < 0.01) return '<0.01%';
+  return calculatePercentage(value, denominator);
+}
+
+// 圖表座標軸使用精簡金額（$8k），詳細金額仍由 tooltip 以 formatCost 呈現
+function formatCompactCost(value) {
+  const amount = Number(value) || 0;
+  if (Math.abs(amount) >= 1000) {
+    const thousands = amount / 1000;
+    return `$${Number.isInteger(thousands) ? thousands.toFixed(0) : thousands.toFixed(1)}k`;
+  }
+  return `$${Number.isInteger(amount) ? amount.toFixed(0) : amount.toFixed(2)}`;
+}
+
+function renderAgentShareMeter(value, total, color) {
+  const width = total > 0 ? Math.min(100, Math.max(0, (value / total) * 100)) : 0;
+  return `
+    <div class="agent-share-meter">
+      <span class="agent-share-meter-track" aria-hidden="true"><span class="agent-share-meter-fill" style="width: ${width.toFixed(2)}%; background: ${color};"></span></span>
+      <span class="agent-share-meter-value">${formatSharePercent(value, total)}</span>
+    </div>`;
+}
+
+function renderAgentShareStrip(strip, rows, totals) {
+  if (!strip) return;
+  // 佔比條以費用為主；全部費用為 0（例如模型尚未定價）時改用 Token 佔比
+  const metricKey = totals.cost > 0 ? 'cost' : 'tokens';
+  const metricTotal = totals[metricKey];
+  const parts = rows
+    .filter(row => row[metricKey] > 0)
+    .map(row => ({
+      row,
+      meta: getAssistantMeta(row.assistant),
+      color: getAgentColor(row.assistant),
+      share: metricTotal > 0 ? (row[metricKey] / metricTotal) * 100 : 0,
+      label: formatSharePercent(row[metricKey], metricTotal),
+    }));
+  if (!parts.length) {
+    strip.classList.add('hidden');
+    strip.innerHTML = '';
+    strip.removeAttribute('aria-label');
+    return;
+  }
+
+  const title = t(metricKey === 'cost' ? 'agent_share_cost_col' : 'agent_share_token_col');
+  strip.classList.remove('hidden');
+  strip.setAttribute('aria-label', `${title}: ${parts.map(part => `${part.meta.label} ${part.label}`).join(', ')}`);
+  strip.innerHTML = `
+    <div class="agent-share-strip-track" aria-hidden="true">
+      ${parts.map(part => `<span class="agent-share-segment" style="flex-grow: ${part.share.toFixed(4)}; background: ${colorWithAlpha(part.color, 0.82)};" title="${escapeHtml(`${part.meta.label} ${part.label}`)}"></span>`).join('')}
+    </div>
+    <ul class="agent-share-legend" aria-hidden="true">
+      <li class="agent-share-legend-title">${escapeHtml(title)}</li>
+      ${parts.map(part => `
+        <li class="agent-share-legend-item">
+          <span class="agent-share-legend-dot" style="background: ${part.color};"></span>
+          <span class="agent-share-legend-name">${escapeHtml(part.meta.shortLabel)}</span>
+          <span class="agent-share-legend-value">${escapeHtml(part.label)}</span>
+        </li>`).join('')}
+    </ul>`;
+}
+
+function renderAgentShareSection(viewKey, rows) {
+  const section = document.getElementById(`${viewKey}-agent-share-section`);
+  if (!section) return;
+  if (!isAllAssistantsScope()) {
+    section.classList.add('hidden');
+    return;
+  }
+  section.classList.remove('hidden');
+
+  const tbody = document.getElementById(`${viewKey}-agent-share-body`);
+  const tfoot = document.getElementById(`${viewKey}-agent-share-foot`);
+  const countEl = document.getElementById(`${viewKey}-agent-share-count`);
+  const totals = rows.reduce((sum, row) => {
+    ['sessions', 'input', 'output', 'cache', 'tokens', 'cost'].forEach(key => {
+      sum[key] += row[key];
+    });
+    return sum;
+  }, createAgentShareRow(ALL_ASSISTANTS));
+
+  if (countEl) countEl.textContent = t('agent_share_count').replace('{count}', String(rows.length));
+  renderAgentShareStrip(document.getElementById(`${viewKey}-agent-share-strip`), rows, totals);
+  if (!tbody || !tfoot) return;
+
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="9" class="placeholder-text">${escapeHtml(t('agent_share_empty'))}</td></tr>`;
+    tfoot.innerHTML = '';
+    return;
+  }
+
+  tbody.innerHTML = rows.map(row => {
+    const meta = getAssistantMeta(row.assistant);
+    const color = getAgentColor(row.assistant);
+    const canOpen = isSupportedAssistant(row.assistant);
+    const nameContent = `<img class="badge-logo" src="${escapeHtml(meta.logo)}" alt="" /><span class="agent-share-name-text">${escapeHtml(meta.label)}</span>`;
+    const openLabel = t('agent_share_open').replace('{agent}', meta.label);
+    const nameCell = canOpen
+      ? `<button type="button" class="agent-share-link" title="${escapeHtml(openLabel)}" aria-label="${escapeHtml(openLabel)}">${nameContent}</button>`
+      : `<span class="agent-share-link is-static">${nameContent}</span>`;
+    return `
+      <tr class="agent-share-row${canOpen ? ' is-openable' : ''}" data-assistant="${escapeHtml(row.assistant)}">
+        <td>${nameCell}</td>
+        <td class="numeric">${formatNumber(row.sessions)}</td>
+        <td class="numeric">${formatToken(row.input)}</td>
+        <td class="numeric">${formatToken(row.output)}</td>
+        <td class="numeric">${formatToken(row.cache)}</td>
+        <td class="numeric agent-share-strong">${formatToken(row.tokens)}</td>
+        <td>${renderAgentShareMeter(row.tokens, totals.tokens, color)}</td>
+        <td class="numeric agent-share-cost">${formatCost(row.cost)}</td>
+        <td>${renderAgentShareMeter(row.cost, totals.cost, color)}</td>
+      </tr>`;
+  }).join('');
+
+  tfoot.innerHTML = `
+    <tr class="agent-share-total">
+      <th scope="row">${escapeHtml(t('agent_share_total_row'))}</th>
+      <td class="numeric">${formatNumber(totals.sessions)}</td>
+      <td class="numeric">${formatToken(totals.input)}</td>
+      <td class="numeric">${formatToken(totals.output)}</td>
+      <td class="numeric">${formatToken(totals.cache)}</td>
+      <td class="numeric agent-share-strong">${formatToken(totals.tokens)}</td>
+      <td></td>
+      <td class="numeric agent-share-cost">${formatCost(totals.cost)}</td>
+      <td></td>
+    </tr>`;
+}
+
+// 由合併模式的分佈表跳到單一 Agent，沿用目前的每日／月度／年度與期間
+function openAssistantFromAllScope(assistant) {
+  const normalized = normalizeAssistant(assistant);
+  if (!isSupportedAssistant(normalized)) return;
+  const badge = [...document.querySelectorAll('.assistant-badge-btn')]
+    .find(button => normalizeAssistant(button.getAttribute('data-value')) === normalized);
+  badge?.click();
+}
+
+function formatAgentTrendValue(value) {
+  return agentTrendMetric === 'cost' ? formatCost(value) : formatToken(value);
+}
+
+function updateAgentTrendMetricButtons() {
+  document.querySelectorAll('[data-agent-metric]').forEach(button => {
+    const isActive = button.dataset.agentMetric === agentTrendMetric;
+    button.classList.toggle('is-active', isActive);
+    button.setAttribute('aria-pressed', String(isActive));
+  });
+}
+
+function setAgentTrendMetric(metric) {
+  if (!AGENT_TREND_METRICS.includes(metric) || metric === agentTrendMetric) return;
+  agentTrendMetric = metric;
+  localStorage.setItem(AGENT_TREND_METRIC_STORAGE_KEY, metric);
+  updateAgentTrendMetricButtons();
+  agentTrendBreakdowns.forEach((breakdown, viewKey) => renderAgentTrendChart(viewKey, breakdown));
+}
+
+function initAgentShareControls() {
+  AGENT_SHARE_VIEWS.forEach(view => {
+    const tbody = document.getElementById(`${view}-agent-share-body`);
+    if (!tbody) return;
+    tbody.addEventListener('click', event => {
+      const row = event.target.closest('tr.agent-share-row.is-openable');
+      if (row && tbody.contains(row)) openAssistantFromAllScope(row.dataset.assistant);
+    });
+  });
+  document.querySelectorAll('[data-agent-metric]').forEach(button => {
+    button.addEventListener('click', () => setAgentTrendMetric(button.dataset.agentMetric));
+  });
+  updateAgentTrendMetricButtons();
+}
+
+function renderAgentTrendChart(viewKey, breakdown) {
+  const isMonthly = viewKey === 'monthly';
+  const labelKey = isMonthly ? 'date' : 'month';
+  // 同一份 breakdown 陣列會被月／年彙總表原地排序，因此保存副本並自行依時間升冪排列
+  const buckets = (Array.isArray(breakdown) ? [...breakdown] : [])
+    .sort((left, right) => String(left[labelKey] || '').localeCompare(String(right[labelKey] || '')));
+  agentTrendBreakdowns.set(viewKey, buckets);
+  const canvas = document.getElementById(`${viewKey}AgentTrendChart`);
+  if (!canvas || typeof Chart === 'undefined' || !isAllAssistantsScope()) return;
+
+  const valueKey = agentTrendMetric === 'cost' ? 'cost_usd' : 'total_tokens';
+  // Agent 名稱來自本機日誌，一律以 Map 查詢，避免與物件原型屬性碰撞
+  const bucketAgents = buckets.map(bucket => new Map(
+    Object.entries(bucket.agents || {}).map(([assistant, usage]) => [
+      normalizeAssistant(assistant),
+      Number(usage?.[valueKey]) || 0,
+    ])
+  ));
+  const periodTotals = new Map();
+  bucketAgents.forEach(agents => {
+    agents.forEach((value, assistant) => {
+      periodTotals.set(assistant, (periodTotals.get(assistant) || 0) + value);
+    });
+  });
+  // 期間用量最大的 Agent 放在最底層，較容易比較堆疊高度
+  const assistants = [...periodTotals.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .map(([assistant]) => assistant);
+  const datasets = assistants.map(assistant => {
+    const color = getAgentColor(assistant);
+    return {
+      label: getAssistantMeta(assistant).label,
+      data: bucketAgents.map(agents => agents.get(assistant) || 0),
+      backgroundColor: colorWithAlpha(color, 0.72),
+      borderColor: color,
+      borderWidth: 1,
+      borderRadius: 3,
+      stack: 'agents',
+      barPercentage: 0.82,
+      categoryPercentage: 0.9,
+    };
+  });
+  const labels = buckets.map(bucket => (
+    isMonthly ? String(bucket.date || '').substring(5) : String(bucket.month || '')
+  ));
+
+  agentTrendCharts.get(viewKey)?.destroy();
+  const chart = new Chart(canvas, {
+    type: 'bar',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? false : undefined,
+      interaction: { mode: 'index', intersect: false },
+      onClick: (event, elements) => {
+        const index = elements?.[0]?.index;
+        const bucket = Number.isInteger(index) ? agentTrendBreakdowns.get(viewKey)?.[index] : null;
+        if (!bucket) return;
+        if (isMonthly) {
+          switchToDailyDate(bucket.date);
+        } else if (bucket.month) {
+          switchToMonthlyMonth(bucket.month);
+        }
+      },
+      onHover: (event, activeElements) => {
+        canvas.style.cursor = activeElements.length ? 'pointer' : 'default';
+      },
+      plugins: {
+        legend: {
+          position: 'top',
+          labels: {
+            color: '#94a3b8',
+            boxWidth: 12,
+            font: { family: chartFontFamily, size: 12 },
+          },
+        },
+        tooltip: {
+          backgroundColor: 'rgba(15, 23, 42, 0.92)',
+          borderColor: 'rgba(255, 255, 255, 0.08)',
+          borderWidth: 1,
+          titleColor: chartPalette.tokenStroke,
+          titleFont: { size: 14, weight: 'bold' },
+          bodyFont: { size: 13 },
+          footerFont: { size: 13 },
+          padding: 12,
+          cornerRadius: 8,
+          filter: item => item.parsed.y > 0,
+          itemSort: (left, right) => right.parsed.y - left.parsed.y,
+          callbacks: {
+            label: context => `${context.dataset.label}: ${formatAgentTrendValue(context.parsed.y)}`,
+            footer: items => `${t('agent_share_total_row')}: ${formatAgentTrendValue(
+              items.reduce((sum, item) => sum + item.parsed.y, 0)
+            )}`,
+          },
+        },
+      },
+      scales: {
+        x: {
+          stacked: true,
+          grid: { display: false },
+          ticks: { color: '#94a3b8', font: { size: 11 } },
+        },
+        y: {
+          stacked: true,
+          beginAtZero: true,
+          grid: { color: 'rgba(255, 255, 255, 0.04)' },
+          ticks: {
+            color: '#94a3b8',
+            font: { size: 11 },
+            callback: value => (agentTrendMetric === 'cost' ? formatCompactCost(value) : formatToken(value)),
+          },
+          title: {
+            display: true,
+            text: t(agentTrendMetric === 'cost' ? 'col_cost' : 'col_total'),
+            color: '#94a3b8',
+            font: { size: 11 },
+          },
+        },
+      },
+    },
+  });
+  agentTrendCharts.set(viewKey, chart);
+  updateChartsTheme(document.documentElement.getAttribute('data-theme') || 'dark');
+}
+
+// =========================================================================
 // 渲染主看板數據
 // =========================================================================
 function renderDashboard(data) {
@@ -2719,10 +3145,13 @@ function renderDashboard(data) {
     }
   }
 
-  // 4. 繪製 Token 圖表
+  // 4. 合併全部 Agent 時的用量分佈
+  renderAgentShareSection('daily', buildAgentShareRowsFromSessions(sessions));
+
+  // 5. 繪製 Token 圖表
   renderChart(dailyViewData);
 
-  // 5. 渲染 Session 列表
+  // 6. 渲染 Session 列表
   if (shouldRefreshSearch) {
     scheduleSessionPromptSearch(currentSessionSearchQuery, { immediate: true });
   } else {
@@ -2909,7 +3338,7 @@ function initDailyChartControls() {
     });
   }
 
-  document.querySelectorAll('.chart-interval-button').forEach(button => {
+  document.querySelectorAll('#daily-chart-intervals .chart-interval-button').forEach(button => {
     button.addEventListener('click', () => {
       const interval = Number(button.dataset.minutes);
       if (!DAILY_CHART_INTERVALS.includes(interval) || interval === dailyChartIntervalMinutes) {
@@ -2995,7 +3424,7 @@ function updateDailyChartControls() {
     canvas.classList.remove('is-pannable', 'is-dragging');
   }
 
-  document.querySelectorAll('.chart-interval-button').forEach(button => {
+  document.querySelectorAll('#daily-chart-intervals .chart-interval-button').forEach(button => {
     const isActive = Number(button.dataset.minutes) === dailyChartIntervalMinutes;
     button.classList.toggle('is-active', isActive);
     button.setAttribute('aria-pressed', String(isActive));
@@ -4246,7 +4675,7 @@ function renderSessionTable(sessions) {
     const nameSourceBadge = s.assistant_type === 'cursor' ? '' : sourceBadge;
     const modelSourceBadge = s.assistant_type === 'cursor' ? sourceBadge : '';
 
-    const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td>${assistantBadge}</td>` : '';
+    const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td class="session-agent-column">${assistantBadge}</td>` : '';
 
     // 依據 depth 縮排會話名稱，並呈現└─ 符號與 subagent tag
     let nameCellContent = '';
@@ -5276,6 +5705,10 @@ function renderYearlyDashboard(data) {
   // 3. 繪製單年每月趨勢圖
   renderYearlyChart(monthly_breakdown);
 
+  // 3-1. 合併全部 Agent 時的用量分佈與依 Agent 堆疊的每月趨勢
+  renderAgentShareSection('yearly', buildAgentShareRowsFromBreakdown(agent_breakdown));
+  renderAgentTrendChart('yearly', monthly_breakdown);
+
   // 4. 渲染最常活動專案列表
   renderYearlyProjectsTable(projects);
 
@@ -5567,6 +6000,13 @@ function groupModelSessionsByDate(sessions) {
     });
 }
 
+// 合併模式下，同一模型可能來自多個 Agent，需標示每個 Session 的來源 Agent
+function getAllScopeAgentBadge(assistantType) {
+  if (!isAllAssistantsScope() || !isSupportedAssistant(assistantType)) return '';
+  const meta = getAssistantMeta(assistantType);
+  return `<span class="badge" style="${meta.badgeStyle}">${getAssistantLogoHtml(assistantType)} ${escapeHtml(meta.shortLabel)}</span>`;
+}
+
 function renderModelSessionDrilldown(sessions) {
   if (sessions.length === 0) {
     return `<div class="model-session-state">${escapeHtml(t('model_sessions_unavailable'))}</div>`;
@@ -5612,6 +6052,7 @@ function renderModelSessionDrilldown(sessions) {
                       <span class="model-session-primary">
                         <span class="model-session-name-row">
                           <span class="model-session-name">${escapeHtml(name)}</span>
+                          ${getAllScopeAgentBadge(session.assistant_type)}
                           ${getSessionSourceBadge(session)}
                         </span>
                         <span class="model-session-cwd" title="${escapeHtml(cwd)}">${escapeHtml(cwd)}</span>
@@ -6032,6 +6473,10 @@ function renderMonthlyDashboard(data) {
 
   // 3. 繪製單月每日趨勢圖
   renderMonthlyChart(daily_breakdown);
+
+  // 3-1. 合併全部 Agent 時的用量分佈與依 Agent 堆疊的每日趨勢
+  renderAgentShareSection('monthly', buildAgentShareRowsFromBreakdown(agent_breakdown));
+  renderAgentTrendChart('monthly', daily_breakdown);
 
   // 4. 渲染最常活動專案列表
   renderMonthlyProjectsTable(projects);
@@ -6475,7 +6920,7 @@ function updateChartsTheme(theme) {
   const tooltipBg = isLight ? 'rgba(255, 255, 255, 0.95)' : 'rgba(15, 18, 29, 0.95)';
   const tooltipBorder = isLight ? 'rgba(15, 23, 42, 0.1)' : 'rgba(255, 255, 255, 0.1)';
 
-  [tokenChartInstance, monthlyChartInstance, yearlyChartInstance].forEach(chart => {
+  [tokenChartInstance, monthlyChartInstance, yearlyChartInstance, ...agentTrendCharts.values()].forEach(chart => {
     if (chart) {
       // 更新標籤文字顏色
       if (chart.options.plugins.legend && chart.options.plugins.legend.labels) {
@@ -6520,6 +6965,21 @@ function initSetupGuide() {
     setupBtn.addEventListener('click', () => openSetupModal(currentAssistant));
   }
 
+  // 合併模式的資料來源清單：可進入個別 Agent 的教學，再返回清單
+  const sourceList = document.getElementById('all-agent-source-list');
+  if (sourceList) {
+    sourceList.addEventListener('click', event => {
+      const guideButton = event.target.closest('.agent-source-guide');
+      if (guideButton && sourceList.contains(guideButton)) {
+        openSetupModal(guideButton.dataset.assistant);
+      }
+    });
+  }
+  const backBtn = document.getElementById('setup-modal-back-btn');
+  if (backBtn) {
+    backBtn.addEventListener('click', () => openSetupModal(ALL_ASSISTANTS));
+  }
+
   if (closeBtn && modalOverlay) {
     closeBtn.addEventListener('click', closeSetupModal);
     modalOverlay.addEventListener('click', (e) => {
@@ -6548,12 +7008,48 @@ function openSetupModal(assistant = currentAssistant) {
   if (!modal) return;
 
   const resolvedAssistant = normalizeAssistant(assistant);
-  if (!isSupportedAssistant(resolvedAssistant)) return;
+  if (!isSelectableAssistant(resolvedAssistant)) return;
 
+  setupModalAssistant = resolvedAssistant;
   setSetupModalTitle(resolvedAssistant);
   setSetupModalBody(resolvedAssistant);
+  // 從合併模式的資料來源清單進入個別 Agent 教學時，提供返回清單的按鈕
+  const backBtn = document.getElementById('setup-modal-back-btn');
+  if (backBtn) {
+    backBtn.classList.toggle('hidden', !isAllAssistantsScope() || isAllAssistantsScope(resolvedAssistant));
+  }
   modal.classList.add('active');
   loadSetupInfo(resolvedAssistant);
+}
+
+function isSetupModalOpen() {
+  return Boolean(document.getElementById('setup-guide-modal')?.classList.contains('active'));
+}
+
+function renderAllAgentSourceList(data) {
+  const list = document.getElementById('all-agent-source-list');
+  if (!list) return;
+
+  list.innerHTML = Object.keys(assistantMeta).map(assistant => {
+    const meta = getAssistantMeta(assistant);
+    const sources = (assistant === 'copilot' ? [data?.copilot, data?.copilot_app] : [data?.[assistant]])
+      .filter(source => source && typeof source === 'object');
+    const detected = sources.some(source => source.exists === true);
+    const paths = sources
+      .map(source => abbreviateHomePath(typeof source.data_path === 'string' ? source.data_path : ''))
+      .filter(Boolean);
+    const statusLabel = t(detected ? 'agent_source_detected' : 'agent_source_missing');
+    const guideButton = setupModalTitleKeys[assistant]
+      ? `<button type="button" class="agent-source-guide" data-assistant="${assistant}">${escapeHtml(t('agent_source_guide'))}</button>`
+      : '';
+    return `
+      <li class="agent-source-item${detected ? ' is-detected' : ''}">
+        <span class="agent-source-name">${getAssistantLogoHtml(assistant)}<span>${escapeHtml(meta.label)}</span></span>
+        <span class="agent-source-paths">${paths.map(path => `<code title="${escapeHtml(path)}">${escapeHtml(path)}</code>`).join('') || '—'}</span>
+        <span class="agent-source-status"><span class="agent-source-dot" aria-hidden="true"></span>${escapeHtml(statusLabel)}</span>
+        ${guideButton}
+      </li>`;
+  }).join('');
 }
 
 function closeSetupModal() {
@@ -6566,11 +7062,13 @@ function closeSetupModal() {
 async function loadSetupInfo(assistant = currentAssistant) {
   try {
     const resolvedAssistant = normalizeAssistant(assistant);
-    if (!isSupportedAssistant(resolvedAssistant)) return;
+    if (!isSelectableAssistant(resolvedAssistant)) return;
 
     const res = await fetch(`/api/${resolvedAssistant}/setup-info`);
     const data = await res.json();
-    if (currentAssistant !== resolvedAssistant) return;
+    // Modal 開啟時以其顯示的 Agent 為準，否則以目前 Agent 為準；不符即為過期回應
+    const expectedAssistant = isSetupModalOpen() ? setupModalAssistant : currentAssistant;
+    if (expectedAssistant !== resolvedAssistant) return;
     currentSessionHomeDir = typeof data.home_dir === 'string' ? data.home_dir : currentSessionHomeDir;
     
     const isWindows = data.platform === 'windows';
@@ -6579,7 +7077,10 @@ async function loadSetupInfo(assistant = currentAssistant) {
 
     setSetupModalTitle(resolvedAssistant);
     
-    if (resolvedAssistant === 'antigravity' || resolvedAssistant === 'copilot') {
+    if (resolvedAssistant === ALL_ASSISTANTS) {
+      latestAllAgentSetupInfo = data;
+      renderAllAgentSourceList(data);
+    } else if (resolvedAssistant === 'antigravity' || resolvedAssistant === 'copilot') {
       const assistantSetup = data[resolvedAssistant] || {};
       const targetScriptPath = assistantSetup.script_path || '';
       const sourceScriptPath = assistantSetup.source_script_path || '';

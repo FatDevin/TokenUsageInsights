@@ -92,6 +92,7 @@ Windows는 기본적으로 다음 네이티브 경로를 사용합니다.
 ### 데이터 분석
 
 - 일별·월별·연별 Token 통계
+- “모든 Agent” 통합 보기: 컴퓨터의 모든 Coding Agent Token 사용량과 예상 비용을 합산하고, Agent별 비중과 Agent별로 누적한 일별·월별 추이를 표시
 - 입력, 출력, 캐시 읽기, 캐시 쓰기, 추론 Token 분류
 - `pricing.csv`에 따른 로컬 비용 추정
 - Session 수, 요청 수 및 API 소요 시간 통계
@@ -128,7 +129,7 @@ Windows는 기본적으로 다음 네이티브 경로를 사용합니다.
 
 | 매개변수 | 적용 보기 | 사용 가능한 값 | 설명 |
 | --- | --- | --- | --- |
-| `agent` | 전체 | `antigravity`, `copilot`, `codex`, `claude`, `cursor`, `grok`, `pi`, `omp`, `muse` | 표시할 Coding Agent를 지정합니다. `claude-code`, `grok-build`, `pi-coding-agent`, `oh-my-pi`, `muse-code` 같은 별칭도 지원합니다 |
+| `agent` | 전체 | `all`, `antigravity`, `copilot`, `codex`, `claude`, `cursor`, `grok`, `pi`, `omp`, `muse` | 표시할 Coding Agent를 지정합니다. `all`은 로컬의 모든 Agent를 합산합니다(가져오기/내보내기는 제공하지 않음). `claude-code`, `grok-build`, `pi-coding-agent`, `oh-my-pi`, `muse-code` 같은 별칭도 지원합니다 |
 | `tab` | 전체 | `daily`, `monthly`, `yearly` | 일별(daily), 월별(monthly), 연별(yearly) 보기를 지정합니다 |
 | `date` | 전체 | `daily`: `YYYY-MM-DD`, `monthly`: `YYYY-MM`, `yearly`: `YYYY` | 표시할 날짜·월·연도를 지정하며, 형식은 `tab`에 따라 자동으로 매핑됩니다 |
 | `dir` | `daily` | 전체 경로, `~`로 시작하는 홈 디렉터리 경로, 또는 고유한 경로 접미사(예: `TokenUsageInsights`) | 일별 보기의 작업 디렉터리 필터를 지정합니다. Windows 경로는 대소문자를 구분하지 않으며, 일치하는 디렉터리가 없으면 전체를 표시합니다 |
@@ -139,6 +140,7 @@ Windows는 기본적으로 다음 네이티브 경로를 사용합니다.
 ```text
 http://localhost:3003/?agent=copilot&tab=monthly&date=2026-08
 http://localhost:3003/?agent=codex&tab=yearly&date=2026
+http://localhost:3003/?agent=all&tab=monthly&date=2026-09
 http://localhost:3003/?agent=claude&tab=daily&date=2026-08-09&chart=trend
 http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/TokenUsageInsights
 ```

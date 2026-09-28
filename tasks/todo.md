@@ -1,3 +1,37 @@
+# 2026-09-28 新增「全部 Agent」合併檢視
+
+## Goal and acceptance criteria
+
+- [x] 側欄新增「全部 Agent」入口（`agent=all`），每日／月度／年度視圖合併本機所有 Coding Agent 的 Token 與估算費用。
+- [x] 合併後的 Token、Session 與費用等於各 Agent 分別統計的加總；匯入、匯出、撤銷與 Session 詳情仍只接受單一 Agent。
+- [x] 新增 Agent 用量分佈（佔比條＋表格＋合計）與依 Agent 堆疊的每日／每月趨勢圖，可切換費用／Token 並可下鑽。
+- [x] 合併模式的設定說明改為本機 Agent 資料來源清單；五種語系文案完整。
+- [x] `cargo fmt -- --check`、`cargo test --locked`、`cargo build --release --locked --all-targets`（零警告）、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`npm test`、`git diff --check` 通過。
+
+## Plan
+
+- [x] Checkpoint A：確認 DB 層已支援 `all` 查詢、報表層已有 `agent_breakdown`，前端僅殘留未完成的 `all` 程式碼。
+- [x] Checkpoint B：後端以 `is_supported_assistant_scope` 只放行唯讀報表 API，並為期間 breakdown 加上 `agents`。
+- [x] Checkpoint C：前端新增合併入口、分佈區塊、堆疊圖、資料來源清單與 i18n。
+- [x] Checkpoint D：以真實資料副本在獨立 port 啟動服務並用瀏覽器驗證深淺色、五語系與 400px 寬度。
+
+## Risk and rollback
+
+- Risk：低至中；新增 API 範圍值與回應欄位，單一 Agent 的既有回應欄位不變，不涉及資料庫結構。
+- Rollback：回復本次提交即可；`agent=all` 的 cookie 在舊版前端會自動退回預設 Agent。
+
+## Working notes
+
+- i18n 的 `${assistant}_${key}` 前綴機制會讓 `all_*` 鍵覆蓋同名基底鍵；Antigravity 教學沿用無前綴的 `setup_modal_title`／`setup_modal_intro`，因此合併模式的鍵改名為 `all_agents_setup_*`。
+- 月／年彙總表會原地排序共用的 breakdown 陣列，堆疊圖需保存副本並自行依時間排序。
+- 每日 K 線控制以全域 `.chart-interval-button` 選取器重設 active 狀態，已限定在 `#daily-chart-intervals` 內。
+
+## Results
+
+- 真實資料（2026 年）：合併年度 38.4b Token／$22,311，與九個 Agent 分別查詢的加總一致；Claude 的差異經前後夾擊查詢確認來自即時同步中的本 Session 資料。
+- `cargo test --locked` 通過 379 個主 binary 測試（新增 3 個）及 2 個 CLI 測試；Release 全目標建置零警告；Clippy `-D warnings` 通過；`npm test` 18 項通過。
+- 另修正既有問題：月度趨勢圖的「每日會話數」曲線讀取不存在的 `total_sessions` 欄位，改為 API 實際提供的 `sessions_count`（獨立提交）。
+
 # 2026-09-23 新增 GPT-6 Sol 與 Luna 定價
 
 ## Goal and acceptance criteria

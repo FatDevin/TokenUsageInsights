@@ -91,6 +91,7 @@ Windows 預設使用下列原生路徑：
 ### 資料分析
 
 - 每日、月度、年度 Token 統計
+- 「全部 Agent」合併檢視：彙總整台電腦所有 Coding Agent 的 Token 用量與估算費用，並列出各 Agent 佔比與依 Agent 堆疊的每日／每月趨勢
 - 輸入、輸出、快取讀取、快取寫入、推理 Token 分拆
 - 依 `pricing.csv` 進行本地估算費用
 - Session 數、請求次數與 API 耗時統計
@@ -127,7 +128,7 @@ Windows 預設使用下列原生路徑：
 
 | 參數 | 適用視圖 | 可用值 | 說明 |
 | --- | --- | --- | --- |
-| `agent` | 全部 | `antigravity`、`copilot`、`codex`、`claude`、`cursor`、`grok`、`pi`、`omp`、`muse` | 指定要顯示的 Coding Agent。另支援 `claude-code`、`grok-build`、`pi-coding-agent`、`oh-my-pi`、`muse-code` 等別名寫法 |
+| `agent` | 全部 | `all`、`antigravity`、`copilot`、`codex`、`claude`、`cursor`、`grok`、`pi`、`omp`、`muse` | 指定要顯示的 Coding Agent；`all` 會合併本機所有 Agent 的資料（不提供匯入／匯出）。另支援 `claude-code`、`grok-build`、`pi-coding-agent`、`oh-my-pi`、`muse-code` 等別名寫法 |
 | `tab` | 全部 | `daily`、`monthly`、`yearly` | 指定以日（每日）、月（月度）或年（年度）視圖顯示 |
 | `date` | 全部 | `daily`：`YYYY-MM-DD`；`monthly`：`YYYY-MM`；`yearly`：`YYYY` | 指定要顯示的日期、月份或年份，格式會依 `tab` 自動對應 |
 | `dir` | `daily` | 完整路徑、`~` 開頭的家目錄路徑，或唯一的路徑尾碼（如 `TokenUsageInsights`） | 指定每日視圖的工作目錄篩選。Windows 路徑不分大小寫；找不到符合目錄時會顯示全部 |
@@ -138,6 +139,7 @@ Windows 預設使用下列原生路徑：
 ```text
 http://localhost:3003/?agent=copilot&tab=monthly&date=2026-08
 http://localhost:3003/?agent=codex&tab=yearly&date=2026
+http://localhost:3003/?agent=all&tab=monthly&date=2026-09
 http://localhost:3003/?agent=claude&tab=daily&date=2026-08-09&chart=trend
 http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/TokenUsageInsights
 ```
