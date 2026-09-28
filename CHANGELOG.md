@@ -11,6 +11,10 @@
 - 月度與年度的合併檢視新增依 Agent 堆疊的每日／每月長條圖，可在「費用」與「Token」指標間切換（選擇會記住），點選長條可下鑽到該日或該月。
 - 合併檢視的「前置作業啟用教學」改為「本機 Agent 資料來源」清單，顯示每個 Agent 的偵測路徑與狀態，並可進入個別 Agent 的設定教學後返回清單；模型 Session 明細會標示每個 Session 的來源 Agent。
 
+### 修正
+
+- 修正月度「單月每日 Token 消耗與會話數趨勢」圖的「每日會話數」曲線永遠空白的問題：前端讀取不存在的 `total_sessions` 欄位，現改為 API 實際提供的 `sessions_count`，與年度趨勢圖一致。
+
 ### 相容性
 
 - 報表 API 的 `:assistant` 路徑參數新增接受 `all`（每日、月度、年度、可用日期／月份／年份、模型 Session、Session 提示詞搜尋、費用標準、手動同步與 setup-info）；匯出、匯入、匯入紀錄與撤銷、Session 詳情與 Codex rate limit 仍只接受單一 Agent，傳入 `all` 會回傳 400。

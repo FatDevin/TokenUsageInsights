@@ -6502,7 +6502,7 @@ function renderMonthlyChart(dailyBreakdown) {
   const labels = dailyBreakdown.map(entry => entry.date.substring(5)); // 只顯示 MM-DD
   const tokenData = dailyBreakdown.map(entry => entry.total_tokens);
   const cacheData = dailyBreakdown.map(entry => entry.total_cache_read_tokens || 0);
-  const sessionData = dailyBreakdown.map(entry => entry.total_sessions);
+  const sessionData = dailyBreakdown.map(entry => entry.sessions_count);
 
   // 若圖表已存在，則動態更新數據以達到平滑變動效果
   if (monthlyChartInstance) {
