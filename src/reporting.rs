@@ -190,6 +190,11 @@ static WARNED_PRICING_MODELS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
 fn log_pricing_failure(model: &str, session_id: &str, turn_no: u32, error: &str) {
+    // 此模型缺少價格規則時保留用量統計，僅略過錯誤提示。
+    if model.eq_ignore_ascii_case("copilot-search-b") {
+        return;
+    }
+
     let mut warned = match WARNED_PRICING_MODELS.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -1004,22 +1009,78 @@ mod tests {
     }
 
     #[test]
+    fn missing_copilot_search_b_pricing_is_silent_and_preserves_tokens() {
+        let rules = PreparedPricingRules::from_rules(vec![]);
+
+        for model in ["copilot-search-b", "COPILOT-SEARCH-B", " copilot-search-b "] {
+            for has_delta in [true, false] {
+                let entries = [summary_entry(1, model, token_stats(100, 50, 25), has_delta)];
+
+                let result = summarize_session_usage(&rules, &entries);
+
+                assert_eq!(result.usage.total_tokens, 175);
+                assert_eq!(result.usage.input_tokens, 100);
+                assert_eq!(result.usage.output_tokens, 50);
+                assert_eq!(result.usage.cache_read_tokens, 25);
+                assert_eq!(result.usage.cost_usd, 0.0);
+                assert_eq!(result.models.len(), 1);
+                assert_eq!(result.models[0].model, model.trim());
+                assert_eq!(result.models[0].usage.total_tokens, 175);
+                assert_eq!(result.models[0].usage.cost_usd, 0.0);
+                let was_warned = WARNED_PRICING_MODELS.lock().unwrap().contains(model.trim());
+                assert!(!was_warned, "{model} 缺少價格規則時應忽略錯誤提示");
+            }
+        }
+    }
+
+    #[test]
+    fn copilot_search_b_uses_available_pricing_and_reported_costs() {
+        let rules = PreparedPricingRules::from_rules(vec![PricingRule {
+            model_name: "copilot-search-b".to_string(),
+            input_price: 2.0,
+            cache_input_price: 0.5,
+            output_price: 6.0,
+        }]);
+        let mut entry = summary_entry(
+            1,
+            "copilot-search-b",
+            token_stats(1_000_000, 1_000_000, 1_000_000),
+            true,
+        );
+
+        let priced = summarize_session_usage(&rules, std::slice::from_ref(&entry));
+        assert_eq!(priced.usage.cost_usd, 8.5);
+        assert_eq!(priced.models[0].usage.cost_usd, 8.5);
+
+        entry.cost = Some(CostStats {
+            total_api_duration_ms: None,
+            total_duration_ms: None,
+            total_premium_requests: None,
+            reported_cost_usd: Some(0.25),
+        });
+        let reported = summarize_session_usage(&PreparedPricingRules::from_rules(vec![]), &[entry]);
+        assert_eq!(reported.usage.cost_usd, 0.25);
+        assert_eq!(reported.models[0].usage.cost_usd, 0.25);
+    }
+
+    #[test]
     fn missing_pricing_rule_logs_only_once_per_model() {
         let rules = PreparedPricingRules::from_rules(vec![]);
-        let entries = vec![
-            summary_entry(1, "copilot/auto", token_stats(100, 50, 0), true),
-            summary_entry(2, "copilot/auto", token_stats(200, 80, 0), true),
-            summary_entry(3, "copilot/auto", token_stats(300, 90, 0), true),
-        ];
 
-        let result = summarize_session_usage(&rules, &entries);
-        assert_eq!(result.usage.cost_usd, 0.0);
-        assert_eq!(result.models.len(), 1);
-        assert_eq!(result.models[0].model, "copilot/auto");
-        assert_eq!(result.models[0].usage.cost_usd, 0.0);
-        assert!(WARNED_PRICING_MODELS
-            .lock()
-            .unwrap()
-            .contains("copilot/auto"));
+        for model in ["copilot/auto", "copilot-search-b-preview"] {
+            let entries = vec![
+                summary_entry(1, model, token_stats(100, 50, 0), true),
+                summary_entry(2, model, token_stats(200, 80, 0), true),
+                summary_entry(3, model, token_stats(300, 90, 0), true),
+            ];
+
+            let result = summarize_session_usage(&rules, &entries);
+            assert_eq!(result.usage.cost_usd, 0.0);
+            assert_eq!(result.models.len(), 1);
+            assert_eq!(result.models[0].model, model);
+            assert_eq!(result.models[0].usage.cost_usd, 0.0);
+            let was_warned = WARNED_PRICING_MODELS.lock().unwrap().contains(model);
+            assert!(was_warned, "其他缺少價格規則的模型仍應提示錯誤");
+        }
     }
 }
