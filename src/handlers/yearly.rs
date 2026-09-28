@@ -7,7 +7,7 @@ use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
 /// API 12: 獲取可用的有使用記錄年份
 pub async fn get_available_years(Path(assistant): Path<String>) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
-    if !is_supported_assistant(&assistant) {
+    if !is_supported_assistant_scope(&assistant) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "不支援的助理類型" })),
@@ -37,7 +37,7 @@ pub async fn get_yearly_details(
     Path((assistant, year)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
-    if !is_supported_assistant(&assistant) {
+    if !is_supported_assistant_scope(&assistant) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "不支援的助理類型" })),
@@ -78,6 +78,7 @@ pub async fn get_yearly_details(
                     total_reasoning_tokens: item.usage.reasoning_tokens,
                     sessions_count: item.sessions_count,
                     cost_usd: item.usage.cost_usd,
+                    agents: item.agents,
                 })
                 .collect(),
             projects: report.projects,

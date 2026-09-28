@@ -92,6 +92,7 @@ Windows ではデフォルトで次のネイティブパスを使用します：
 ### データ分析
 
 - 日別・月別・年別の Token 統計
+- 「すべての Agent」合算ビュー：マシン上のすべての Coding Agent の Token 使用量と推定費用を集計し、Agent 別の比率と Agent 別に積み上げた日別・月別の推移を表示
 - 入力、出力、キャッシュ読み取り、キャッシュ書き込み、推論 Token の内訳
 - `pricing.csv` に基づくローカルコスト推定
 - Session 数、リクエスト数、API 所要時間の統計
@@ -128,7 +129,7 @@ Windows ではデフォルトで次のネイティブパスを使用します：
 
 | パラメータ | 対象ビュー | 指定できる値 | 説明 |
 | --- | --- | --- | --- |
-| `agent` | すべて | `antigravity`、`copilot`、`codex`、`claude`、`cursor`、`grok`、`pi`、`omp`、`muse` | 表示する Coding Agent を指定します。`claude-code`、`grok-build`、`pi-coding-agent`、`oh-my-pi`、`muse-code` などのエイリアスも利用可能です |
+| `agent` | すべて | `all`、`antigravity`、`copilot`、`codex`、`claude`、`cursor`、`grok`、`pi`、`omp`、`muse` | 表示する Coding Agent を指定します。`all` はローカルのすべての Agent を合算します（インポート／エクスポートは利用不可）。`claude-code`、`grok-build`、`pi-coding-agent`、`oh-my-pi`、`muse-code` などのエイリアスも利用可能です |
 | `tab` | すべて | `daily`、`monthly`、`yearly` | 日別（daily）、月別（monthly）、年別（yearly）ビューを指定します |
 | `date` | すべて | `daily`: `YYYY-MM-DD`、`monthly`: `YYYY-MM`、`yearly`: `YYYY` | 表示する日付・月・年を指定します。形式は `tab` に応じて自動的に対応します |
 | `dir` | `daily` | フルパス、`~` で始まるホームディレクトリのパス、または一意のパス末尾（例：`TokenUsageInsights`） | 日別ビューの作業ディレクトリフィルターを指定します。Windows パスは大文字小文字を区別しません。一致するディレクトリがない場合はすべて表示されます |
@@ -139,6 +140,7 @@ Windows ではデフォルトで次のネイティブパスを使用します：
 ```text
 http://localhost:3003/?agent=copilot&tab=monthly&date=2026-08
 http://localhost:3003/?agent=codex&tab=yearly&date=2026
+http://localhost:3003/?agent=all&tab=monthly&date=2026-09
 http://localhost:3003/?agent=claude&tab=daily&date=2026-08-09&chart=trend
 http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/TokenUsageInsights
 ```

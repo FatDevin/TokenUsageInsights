@@ -92,6 +92,7 @@ Drive letters, paths containing spaces or non-ASCII characters, and UNC paths ar
 ### Data analysis
 
 - Daily, monthly, and yearly token statistics
+- “All Agents” combined view: aggregates token usage and estimated cost from every coding agent on the machine, with per-agent shares and daily/monthly trends stacked by agent
 - Breakdown of input, output, cache read, cache write, and reasoning tokens
 - Local cost estimates based on `pricing.csv`
 - Session count, request count, and API duration statistics
@@ -128,7 +129,7 @@ The dashboard supports URL query parameters for opening a specific state directl
 
 | Parameter | Applies to | Values | Description |
 | --- | --- | --- | --- |
-| `agent` | All views | `antigravity`, `copilot`, `codex`, `claude`, `cursor`, `grok`, `pi`, `omp`, `muse` | Selects the coding agent to display. Aliases such as `claude-code`, `grok-build`, `pi-coding-agent`, `oh-my-pi`, and `muse-code` are also supported |
+| `agent` | All views | `all`, `antigravity`, `copilot`, `codex`, `claude`, `cursor`, `grok`, `pi`, `omp`, `muse` | Selects the coding agent to display; `all` combines every local agent (import/export is not available). Aliases such as `claude-code`, `grok-build`, `pi-coding-agent`, `oh-my-pi`, and `muse-code` are also supported |
 | `tab` | All views | `daily`, `monthly`, `yearly` | Selects the daily, monthly, or yearly view |
 | `date` | All views | `daily`: `YYYY-MM-DD`; `monthly`: `YYYY-MM`; `yearly`: `YYYY` | Selects the date, month, or year to display; the format follows `tab` automatically |
 | `dir` | `daily` | Full path, `~`-prefixed home path, or a unique path suffix (e.g. `TokenUsageInsights`) | Filters the daily view by working directory. Windows paths are case-insensitive; if no directory matches, all directories are shown |
@@ -139,6 +140,7 @@ Examples (`http://localhost:3003` is the default URL; adjust to your actual `HOS
 ```text
 http://localhost:3003/?agent=copilot&tab=monthly&date=2026-08
 http://localhost:3003/?agent=codex&tab=yearly&date=2026
+http://localhost:3003/?agent=all&tab=monthly&date=2026-09
 http://localhost:3003/?agent=claude&tab=daily&date=2026-08-09&chart=trend
 http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/TokenUsageInsights
 ```

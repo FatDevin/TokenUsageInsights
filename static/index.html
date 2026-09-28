@@ -20,7 +20,7 @@
     document.documentElement.setAttribute('data-theme', savedTheme);
   </script>
   <!-- CSS Stylesheet -->
-  <link rel="stylesheet" href="/static/styles.css?v=32">
+  <link rel="stylesheet" href="/static/styles.css?v=33">
   <!-- Chart.js for beautiful charts -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <!-- Marked.js for rendering markdown response -->
@@ -49,6 +49,16 @@
       <div class="sidebar-section agent-selector-section">
         <h3 data-i18n="select_assistant_label">Agent 類型</h3>
         <div class="assistant-badges-container" id="assistant-badges-container">
+          <button class="assistant-badge-btn assistant-all-btn" data-value="all" data-i18n-title="all_agents_badge_title" title="合併本機所有 Agent 的用量與費用" aria-label="合併本機所有 Agent 的用量與費用">
+            <span class="control-svg-icon assistant-all-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3 3 7.5l9 4.5 9-4.5L12 3Z" />
+                <path d="m3 12 9 4.5 9-4.5" />
+                <path d="m3 16.5 9 4.5 9-4.5" />
+              </svg>
+            </span>
+            <span class="assistant-all-label" data-i18n="all_agents_label">全部 Agent</span>
+          </button>
           <button class="assistant-badge-btn active" data-value="antigravity" title="Antigravity CLI" aria-label="Antigravity CLI">
             <img class="assistant-logo" src="/static/antigravity.webp" alt="Antigravity" />
             <span class="agent-name-tooltip">Antigravity CLI</span>
@@ -460,6 +470,43 @@
           </div>
         </section>
 
+        <!-- 合併全部 Agent 時的用量分佈（僅於 agent=all 顯示） -->
+        <section class="agent-share-section hidden" id="daily-agent-share-section" aria-labelledby="daily-agent-share-title">
+          <div class="glass-card agent-share-card">
+            <div class="agent-share-header">
+              <div class="agent-share-heading">
+                <h3 id="daily-agent-share-title" data-i18n="agent_share_title">Agent 用量分佈</h3>
+                <p class="agent-share-caption" data-i18n="agent_share_caption">合併本機所有 Agent 的 Token 與估算費用；點選任一 Agent 可切換到該 Agent 的同期報表。</p>
+              </div>
+              <span class="agent-share-count" id="daily-agent-share-count" aria-live="polite"></span>
+            </div>
+            <div class="agent-share-strip" id="daily-agent-share-strip" role="img"></div>
+            <div class="table-wrapper agent-share-table-wrapper">
+              <table class="premium-table agent-share-table">
+                <thead>
+                  <tr>
+                    <th data-i18n="col_assistant">Agent</th>
+                    <th class="numeric" data-i18n="col_sessions_count">會話數</th>
+                    <th class="numeric" data-i18n="col_input">輸入</th>
+                    <th class="numeric" data-i18n="col_output">輸出</th>
+                    <th class="numeric" data-i18n="col_cache">快取</th>
+                    <th class="numeric" data-i18n="col_total">總計</th>
+                    <th data-i18n="agent_share_token_col">Token 佔比</th>
+                    <th class="numeric" data-i18n="col_cost">估算費用 (美金)</th>
+                    <th data-i18n="agent_share_cost_col">費用佔比</th>
+                  </tr>
+                </thead>
+                <tbody id="daily-agent-share-body">
+                  <tr>
+                    <td colspan="9" class="placeholder-text" data-i18n="agent_share_empty">此期間沒有任何 Agent 的使用紀錄</td>
+                  </tr>
+                </tbody>
+                <tfoot id="daily-agent-share-foot"></tfoot>
+              </table>
+            </div>
+          </div>
+        </section>
+
         <!-- Charts Section -->
         <section class="charts-section">
           <div class="chart-container daily-chart-container glass-card">
@@ -610,6 +657,55 @@
           </div>
         </section>
 
+        <!-- 合併全部 Agent 時的用量分佈（僅於 agent=all 顯示） -->
+        <section class="agent-share-section hidden" id="monthly-agent-share-section" aria-labelledby="monthly-agent-share-title">
+          <div class="glass-card agent-share-card">
+            <div class="agent-share-header">
+              <div class="agent-share-heading">
+                <h3 id="monthly-agent-share-title" data-i18n="agent_share_title">Agent 用量分佈</h3>
+                <p class="agent-share-caption" data-i18n="agent_share_caption">合併本機所有 Agent 的 Token 與估算費用；點選任一 Agent 可切換到該 Agent 的同期報表。</p>
+              </div>
+              <span class="agent-share-count" id="monthly-agent-share-count" aria-live="polite"></span>
+            </div>
+            <div class="agent-share-strip" id="monthly-agent-share-strip" role="img"></div>
+            <div class="table-wrapper agent-share-table-wrapper">
+              <table class="premium-table agent-share-table">
+                <thead>
+                  <tr>
+                    <th data-i18n="col_assistant">Agent</th>
+                    <th class="numeric" data-i18n="col_sessions_count">會話數</th>
+                    <th class="numeric" data-i18n="col_input">輸入</th>
+                    <th class="numeric" data-i18n="col_output">輸出</th>
+                    <th class="numeric" data-i18n="col_cache">快取</th>
+                    <th class="numeric" data-i18n="col_total">總計</th>
+                    <th data-i18n="agent_share_token_col">Token 佔比</th>
+                    <th class="numeric" data-i18n="col_cost">估算費用 (美金)</th>
+                    <th data-i18n="agent_share_cost_col">費用佔比</th>
+                  </tr>
+                </thead>
+                <tbody id="monthly-agent-share-body">
+                  <tr>
+                    <td colspan="9" class="placeholder-text" data-i18n="agent_share_empty">此期間沒有任何 Agent 的使用紀錄</td>
+                  </tr>
+                </tbody>
+                <tfoot id="monthly-agent-share-foot"></tfoot>
+              </table>
+            </div>
+          </div>
+          <div class="glass-card agent-trend-card">
+            <div class="chart-title-row agent-trend-header">
+              <h3 data-i18n="agent_trend_title_monthly">每日各 Agent 用量堆疊</h3>
+              <div class="agent-metric-toggle" role="group" data-i18n-aria-label="agent_trend_metric_label" aria-label="堆疊指標">
+                <button type="button" class="chart-interval-button is-active" data-agent-metric="cost" aria-pressed="true" data-i18n="agent_trend_metric_cost">費用</button>
+                <button type="button" class="chart-interval-button" data-agent-metric="tokens" aria-pressed="false" data-i18n="agent_trend_metric_tokens">Token</button>
+              </div>
+            </div>
+            <div class="canvas-wrapper agent-trend-canvas">
+              <canvas id="monthlyAgentTrendChart" role="img" data-i18n-aria-label="agent_trend_chart_aria" aria-label="各 Agent 用量堆疊長條圖"></canvas>
+            </div>
+          </div>
+        </section>
+
         <!-- Monthly Charts Section -->
         <section class="charts-section">
           <div class="chart-container glass-card">
@@ -753,6 +849,55 @@
             <div class="stat-info">
               <span class="label" data-i18n="estimated_cost_label">估算費用 (美金)</span>
               <span class="value" id="yearly-stat-total-cost">$0.00</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- 合併全部 Agent 時的用量分佈（僅於 agent=all 顯示） -->
+        <section class="agent-share-section hidden" id="yearly-agent-share-section" aria-labelledby="yearly-agent-share-title">
+          <div class="glass-card agent-share-card">
+            <div class="agent-share-header">
+              <div class="agent-share-heading">
+                <h3 id="yearly-agent-share-title" data-i18n="agent_share_title">Agent 用量分佈</h3>
+                <p class="agent-share-caption" data-i18n="agent_share_caption">合併本機所有 Agent 的 Token 與估算費用；點選任一 Agent 可切換到該 Agent 的同期報表。</p>
+              </div>
+              <span class="agent-share-count" id="yearly-agent-share-count" aria-live="polite"></span>
+            </div>
+            <div class="agent-share-strip" id="yearly-agent-share-strip" role="img"></div>
+            <div class="table-wrapper agent-share-table-wrapper">
+              <table class="premium-table agent-share-table">
+                <thead>
+                  <tr>
+                    <th data-i18n="col_assistant">Agent</th>
+                    <th class="numeric" data-i18n="col_sessions_count">會話數</th>
+                    <th class="numeric" data-i18n="col_input">輸入</th>
+                    <th class="numeric" data-i18n="col_output">輸出</th>
+                    <th class="numeric" data-i18n="col_cache">快取</th>
+                    <th class="numeric" data-i18n="col_total">總計</th>
+                    <th data-i18n="agent_share_token_col">Token 佔比</th>
+                    <th class="numeric" data-i18n="col_cost">估算費用 (美金)</th>
+                    <th data-i18n="agent_share_cost_col">費用佔比</th>
+                  </tr>
+                </thead>
+                <tbody id="yearly-agent-share-body">
+                  <tr>
+                    <td colspan="9" class="placeholder-text" data-i18n="agent_share_empty">此期間沒有任何 Agent 的使用紀錄</td>
+                  </tr>
+                </tbody>
+                <tfoot id="yearly-agent-share-foot"></tfoot>
+              </table>
+            </div>
+          </div>
+          <div class="glass-card agent-trend-card">
+            <div class="chart-title-row agent-trend-header">
+              <h3 data-i18n="agent_trend_title_yearly">每月各 Agent 用量堆疊</h3>
+              <div class="agent-metric-toggle" role="group" data-i18n-aria-label="agent_trend_metric_label" aria-label="堆疊指標">
+                <button type="button" class="chart-interval-button is-active" data-agent-metric="cost" aria-pressed="true" data-i18n="agent_trend_metric_cost">費用</button>
+                <button type="button" class="chart-interval-button" data-agent-metric="tokens" aria-pressed="false" data-i18n="agent_trend_metric_tokens">Token</button>
+              </div>
+            </div>
+            <div class="canvas-wrapper agent-trend-canvas">
+              <canvas id="yearlyAgentTrendChart" role="img" data-i18n-aria-label="agent_trend_chart_aria" aria-label="各 Agent 用量堆疊長條圖"></canvas>
             </div>
           </div>
         </section>
@@ -940,11 +1085,20 @@
     <div class="modal-content">
       <div class="modal-header">
         <div class="modal-title-group">
+          <button type="button" class="setup-back-btn hidden" id="setup-modal-back-btn">
+            <span class="icon-glyph icon-chevron-left" aria-hidden="true"></span>
+            <span data-i18n="setup_back_to_sources">返回資料來源</span>
+          </button>
           <h2 id="setup-modal-title" data-i18n="setup_modal_title">Google Antigravity CLI 前置設定與啟用教學</h2>
         </div>
         <button class="close-btn" id="close-setup-modal-btn" data-i18n-aria-label="close" aria-label="關閉"><span class="icon-glyph icon-close" aria-hidden="true"></span></button>
       </div>
       <!-- Status Line Setup Content (Antigravity & Copilot) -->
+      <div class="modal-body" id="setup-body-all" style="display: none;">
+        <p class="modal-text" data-i18n="all_agents_setup_intro">合併模式會彙總下列本機資料來源；未偵測到的 Agent 不影響其他 Agent 的統計。點選「設定教學」可查看個別 Agent 的啟用方式。</p>
+        <ul class="agent-source-list" id="all-agent-source-list" aria-live="polite"></ul>
+      </div>
+
       <div class="modal-body" id="setup-body-statusline">
         <div class="modal-text">
           <p id="setup-modal-intro" data-i18n="setup_modal_intro">本看板主要解析並呈現 Google Antigravity CLI 的 <strong>Status Line (狀態列)</strong> 所收集的 Token 數據。我們將使用 <code>~/.gemini/antigravity-cli/statusline-token.sh</code> 進行每日數據統計與會話紀錄。</p>
@@ -1307,6 +1461,6 @@ cd TokenUsageInsights</code></pre>
   <div class="sidebar-overlay" id="sidebar-overlay"></div>
 
   <!-- Frontend Javascript logic -->
-  <script type="module" src="/static/app.js?v=63"></script>
+  <script type="module" src="/static/app.js?v=64"></script>
 </body>
 </html>

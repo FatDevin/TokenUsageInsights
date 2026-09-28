@@ -43,7 +43,7 @@ pub struct UsageDayImportRequest {
 /// API 7: 獲取模型價格清單 ( pricing.csv 資訊)
 pub async fn get_pricing(Path(assistant): Path<String>) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
-    if !is_supported_assistant(&assistant) {
+    if !is_supported_assistant_scope(&assistant) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "不支援的助理類型" })),
@@ -64,7 +64,7 @@ pub async fn get_pricing(Path(assistant): Path<String>) -> impl IntoResponse {
 /// API 8: 手動觸發日誌增量同步
 pub async fn trigger_manual_sync(Path(assistant): Path<String>) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
-    if !is_supported_assistant(&assistant) {
+    if !is_supported_assistant_scope(&assistant) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "不支援的助理類型" })),

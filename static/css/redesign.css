@@ -2727,3 +2727,468 @@ body {
     padding-bottom: 2px;
   }
 }
+
+/* =========================================================================
+   合併全部 Agent：側欄入口、用量分佈表、佔比條與堆疊趨勢圖
+   ========================================================================= */
+
+.agent-selector-section .assistant-all-btn {
+  grid-column: 1 / -1;
+  justify-content: flex-start;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--glass-border);
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.agent-selector-section .assistant-all-btn:hover,
+.agent-selector-section .assistant-all-btn.active {
+  border-color: color-mix(in srgb, var(--accent-cyan) 42%, transparent);
+  color: var(--text-primary);
+}
+
+.agent-selector-section .assistant-all-btn:focus-visible {
+  outline: 2px solid var(--accent-cyan);
+  outline-offset: 2px;
+}
+
+.assistant-all-icon {
+  display: inline-flex;
+  width: 20px;
+  height: 20px;
+  color: var(--accent-cyan);
+}
+
+.assistant-all-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
+.assistant-all-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-share-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.agent-share-card,
+.agent-trend-card {
+  min-width: 0;
+}
+
+.agent-share-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+.agent-share-heading {
+  min-width: 0;
+}
+
+.agent-share-heading h3 {
+  margin-bottom: var(--space-1);
+}
+
+.agent-share-caption {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  text-wrap: pretty;
+}
+
+.agent-share-count:empty {
+  display: none;
+}
+
+.agent-share-count {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.agent-share-strip {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+}
+
+.agent-share-strip-track {
+  display: flex;
+  gap: 2px;
+  height: 12px;
+  overflow: hidden;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.agent-share-segment {
+  flex-basis: 0;
+  min-width: 3px;
+}
+
+.agent-share-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 0.75rem;
+}
+
+.agent-share-legend-title {
+  color: var(--text-muted);
+  font-weight: 700;
+}
+
+.agent-share-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+}
+
+.agent-share-legend-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.agent-share-legend-value {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-share-table {
+  min-width: 760px;
+}
+
+.agent-share-table th,
+.agent-share-table td {
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+/* 表頭允許換行（例如「估算費用 (美金)」），讓九個欄位在一般桌面寬度內不需水平捲動 */
+.agent-share-table thead th {
+  vertical-align: bottom;
+  white-space: normal;
+  word-break: keep-all;
+}
+
+.agent-share-table th.numeric,
+.agent-share-table td.numeric {
+  text-align: right;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-share-table td.numeric {
+  white-space: nowrap;
+}
+
+.agent-share-table .agent-share-strong {
+  font-weight: 700;
+}
+
+.agent-share-table .agent-share-cost {
+  color: var(--neon-gold);
+  font-weight: 700;
+}
+
+.agent-share-row.is-openable {
+  cursor: pointer;
+}
+
+.agent-share-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 180px;
+  padding: 4px 6px;
+  margin: -4px -6px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-share-link.is-static {
+  cursor: default;
+}
+
+.agent-share-link .badge-logo {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  object-fit: contain;
+}
+
+.agent-share-name-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-share-row.is-openable:hover .agent-share-name-text {
+  color: var(--accent-cyan);
+}
+
+.agent-share-link:focus-visible {
+  outline: 2px solid var(--accent-cyan);
+  outline-offset: 2px;
+}
+
+.agent-share-meter {
+  display: grid;
+  grid-template-columns: minmax(40px, 1fr) 50px;
+  align-items: center;
+  gap: 6px;
+  width: 104px;
+}
+
+.agent-share-meter-track {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-3);
+}
+
+.agent-share-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+}
+
+.agent-share-meter-value {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.agent-share-total th,
+.agent-share-total td {
+  padding-top: 12px;
+  padding-bottom: 12px;
+  border-top: 1px solid var(--glass-border-strong);
+  background: var(--surface-2);
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+.agent-share-total th {
+  text-align: left;
+  font-size: 0.78rem;
+}
+
+.agent-trend-header {
+  flex-wrap: wrap;
+}
+
+.agent-metric-toggle {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-2);
+}
+
+.agent-metric-toggle .chart-interval-button {
+  min-height: 28px;
+  font-family: var(--font-body);
+}
+
+.agent-trend-canvas {
+  height: 320px;
+  min-height: 320px;
+}
+
+.setup-back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: var(--space-2);
+  padding: 4px 8px 4px 4px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.setup-back-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--glass-border-strong);
+}
+
+.setup-back-btn:focus-visible {
+  outline: 2px solid var(--accent-cyan);
+  outline-offset: 2px;
+}
+
+.agent-source-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-4) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-source-item {
+  display: grid;
+  /* 每列各自為 grid，尾端欄位固定寬度才能讓路徑欄在所有列對齊 */
+  grid-template-columns: minmax(150px, 1fr) minmax(0, 2fr) 112px 96px;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 10px 12px;
+  border: 1px solid var(--border-meta-item);
+  border-radius: var(--radius-lg);
+  background: var(--bg-meta-item);
+}
+
+.agent-source-name {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.agent-source-name .badge-logo {
+  width: 18px;
+  height: 18px;
+  object-fit: contain;
+}
+
+.agent-source-paths {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  color: var(--text-muted);
+}
+
+.agent-source-paths code {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-source-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.agent-source-dot {
+  width: 8px;
+  height: 8px;
+  border: 1px solid var(--text-muted);
+  border-radius: 50%;
+}
+
+.agent-source-item.is-detected .agent-source-status {
+  color: var(--neon-green);
+}
+
+.agent-source-item.is-detected .agent-source-dot {
+  border-color: var(--neon-green);
+  background: var(--neon-green);
+}
+
+.agent-source-guide {
+  justify-self: end;
+  padding: 5px 10px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.agent-source-guide:hover {
+  border-color: color-mix(in srgb, var(--accent-cyan) 42%, transparent);
+  color: var(--accent-cyan);
+}
+
+.agent-source-guide:focus-visible {
+  outline: 2px solid var(--accent-cyan);
+  outline-offset: 2px;
+}
+
+@media (max-width: 640px) {
+  .agent-share-header {
+    flex-direction: column;
+  }
+
+  .agent-trend-canvas {
+    height: 280px;
+    min-height: 280px;
+  }
+
+  .agent-source-item {
+    grid-template-columns: minmax(0, 1fr) auto auto;
+  }
+
+  .agent-source-paths {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+}
+
+/* 合併模式的 Session 表格 Agent 欄：badge 不可被窄欄位擠成直排 */
+.premium-table td.session-agent-column {
+  min-width: 128px;
+}
+
+.premium-table td.session-agent-column .badge {
+  white-space: nowrap;
+  word-break: keep-all;
+}

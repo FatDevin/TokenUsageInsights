@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{LazyLock, Mutex},
 };
 
@@ -130,6 +130,14 @@ pub struct AgentBreakdown {
     pub total_reasoning_tokens: u64,
     pub total_cost_usd: f64,
     pub total_sessions: usize,
+}
+
+/// 單一時間區段（日或月）內某個 Agent 的用量，供合併全部 Agent 的堆疊趨勢圖使用。
+#[derive(Serialize, Debug, Default, Clone, PartialEq)]
+pub struct AgentPeriodUsage {
+    pub total_tokens: u64,
+    pub cost_usd: f64,
+    pub sessions_count: usize,
 }
 
 fn has_usage(tokens: &TokenStats) -> bool {
@@ -395,6 +403,8 @@ pub(crate) struct PeriodBreakdown {
     pub label: String,
     pub usage: UsageAggregation,
     pub sessions_count: usize,
+    /// 依 Agent 拆分的區段用量；以 BTreeMap 保持序列化順序穩定。
+    pub agents: BTreeMap<String, AgentPeriodUsage>,
 }
 
 pub(crate) struct PeriodReport {
@@ -409,6 +419,7 @@ pub(crate) struct PeriodReport {
 struct PeriodBucketAggregation {
     usage: UsageAggregation,
     sessions_count: usize,
+    agents: BTreeMap<String, AgentPeriodUsage>,
 }
 
 #[derive(Default)]
@@ -447,7 +458,7 @@ fn build_period_breakdown(
     }
 
     let mut bucket_totals: HashMap<String, PeriodBucketAggregation> = HashMap::new();
-    for records in dated_sessions.values() {
+    for (identity, records) in &dated_sessions {
         // Delta-based collectors can be summed inside each bucket. Legacy
         // cumulative collectors must instead contribute the increase from the
         // preceding bucket; otherwise a session spanning two buckets would
@@ -483,6 +494,13 @@ fn build_period_breakdown(
             let bucket = bucket_totals.entry(label).or_default();
             bucket.usage.add(&bucket_usage);
             bucket.sessions_count += 1;
+            let agent = bucket
+                .agents
+                .entry(identity.assistant_type.clone())
+                .or_default();
+            agent.total_tokens += bucket_usage.total_tokens;
+            agent.cost_usd += bucket_usage.cost_usd;
+            agent.sessions_count += 1;
         }
     }
 
@@ -492,6 +510,7 @@ fn build_period_breakdown(
             label,
             usage: bucket.usage,
             sessions_count: bucket.sessions_count,
+            agents: bucket.agents,
         })
         .collect::<Vec<_>>();
     breakdown.sort_by(|left, right| left.label.cmp(&right.label));
@@ -693,6 +712,81 @@ mod tests {
             .unwrap();
         assert_eq!(gpt_summary.sessions_count, 2);
         assert_eq!(gpt_summary.total_tokens, 400);
+    }
+
+    #[test]
+    fn period_report_splits_buckets_by_agent_for_all_agents_scope() {
+        let dated = |assistant: &str, date: &str, tokens: u64| {
+            let mut entry = usage_entry("aa", "gpt-5", tokens);
+            entry.timestamp = format!("{date}T10:00:00Z");
+            DatedUsageEntry {
+                entry,
+                assistant_type: assistant.to_string(),
+                date: date.to_string(),
+            }
+        };
+        // 兩個 Agent 使用相同 session_id，合併模式仍必須視為不同 Session。
+        let mut later_claude = dated("claude", "2026-07-11", 2_000_000);
+        later_claude.entry.session_id = "claude-second".to_string();
+        let entries = vec![
+            dated("codex", "2026-07-10", 3_000_000),
+            dated("claude", "2026-07-10", 1_000_000),
+            later_claude,
+        ];
+
+        let report = build_period_report(
+            &entries,
+            str::to_string,
+            &PreparedPricingRules::from_rules(vec![PricingRule {
+                model_name: "gpt-5".to_string(),
+                input_price: 1.0,
+                cache_input_price: 0.0,
+                output_price: 0.0,
+            }]),
+        );
+
+        assert_eq!(report.summary.total_sessions, 3);
+        assert_eq!(report.summary.total_tokens, 6_000_000);
+        assert_eq!(report.breakdown.len(), 2);
+
+        let first_day = &report.breakdown[0];
+        assert_eq!(first_day.label, "2026-07-10");
+        assert_eq!(
+            first_day.agents.keys().collect::<Vec<_>>(),
+            vec!["claude", "codex"]
+        );
+        assert_eq!(
+            first_day.agents["codex"],
+            AgentPeriodUsage {
+                total_tokens: 3_000_000,
+                cost_usd: 3.0,
+                sessions_count: 1,
+            }
+        );
+        assert_eq!(first_day.agents["claude"].total_tokens, 1_000_000);
+        assert_eq!(
+            first_day
+                .agents
+                .values()
+                .map(|agent| agent.total_tokens)
+                .sum::<u64>(),
+            first_day.usage.total_tokens
+        );
+
+        let second_day = &report.breakdown[1];
+        assert_eq!(second_day.agents.len(), 1);
+        assert_eq!(second_day.agents["claude"].sessions_count, 1);
+
+        assert_eq!(report.agent_breakdown["codex"].total_tokens, 3_000_000);
+        assert_eq!(report.agent_breakdown["claude"].total_tokens, 3_000_000);
+        assert_eq!(report.agent_breakdown["claude"].total_sessions, 2);
+        let agent_cost_sum = report
+            .agent_breakdown
+            .values()
+            .map(|agent| agent.total_cost_usd)
+            .sum::<f64>();
+        assert!((agent_cost_sum - report.summary.total_cost_usd).abs() < 1e-9);
+        assert!((report.summary.total_cost_usd - 6.0).abs() < 1e-9);
     }
 
     #[test]
