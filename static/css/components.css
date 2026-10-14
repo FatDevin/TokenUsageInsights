@@ -462,7 +462,7 @@ input:checked + .slider-round:before {
 }
 
 #theme-toggle-btn:hover {
-  transform: scale(1.05) rotate(15deg);
+  transform: translateY(-1px);
 }
 
 .icon-btn.loading {

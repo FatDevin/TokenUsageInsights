@@ -6955,10 +6955,13 @@ function initThemeToggle() {
 function updateThemeButton(theme) {
   const themeBtn = document.getElementById('theme-toggle-btn');
   if (themeBtn) {
-    const title = theme === 'dark' ? t('theme_toggle_title_dark') : t('theme_toggle_title_light');
-    themeBtn.innerHTML = iconMarkup('theme');
+    const isDark = theme === 'dark';
+    const title = isDark ? t('theme_toggle_title_dark') : t('theme_toggle_title_light');
+    const modeClass = isDark ? 'icon-theme-sun' : 'icon-theme-moon';
+    themeBtn.innerHTML = iconMarkup('theme', modeClass);
     themeBtn.title = title;
     themeBtn.setAttribute('aria-label', title);
+    themeBtn.setAttribute('aria-pressed', String(!isDark));
   }
 }
 

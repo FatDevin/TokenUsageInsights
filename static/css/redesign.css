@@ -1802,8 +1802,14 @@ body {
   --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M9.5 9a2.7 2.7 0 0 1 5.1 1.3c0 1.8-2.6 2.2-2.6 4'/%3E%3Cpath d='M12 18h.01'/%3E%3C/svg%3E");
 }
 
-.icon-theme {
-  --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='black'%3E%3Cpath d='M12 2a10 10 0 1 0 0 20V2Zm2 3.3a7 7 0 0 1 0 13.4V5.3Z'/%3E%3C/svg%3E");
+.icon-theme,
+.icon-theme-sun {
+  --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='4'/%3E%3Cpath d='M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41'/%3E%3C/svg%3E");
+}
+
+[data-theme="light"] .icon-theme,
+.icon-theme-moon {
+  --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z'/%3E%3C/svg%3E");
 }
 
 .icon-github {
@@ -2024,6 +2030,22 @@ body {
 
 #theme-toggle-btn:hover {
   transform: translateY(-1px);
+}
+
+#theme-toggle-btn .icon-glyph {
+  transition: transform 220ms var(--ease-out-quart);
+}
+
+#theme-toggle-btn:hover .icon-glyph {
+  transform: rotate(15deg) scale(1.06);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #theme-toggle-btn .icon-glyph,
+  #theme-toggle-btn:hover .icon-glyph {
+    transition: none;
+    transform: none;
+  }
 }
 
 .live-label {
