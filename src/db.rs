@@ -1490,8 +1490,8 @@ fn sync_antigravity_usage_logs_with_cancel(
     root: &Path,
     should_cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
-    sync_hook_usage_logs_with_cancel(conn, "antigravity", root, should_cancel)?;
     let root = crate::config::absolute_root(root);
+    sync_hook_usage_logs_with_cancel(conn, "antigravity", &root, should_cancel)?;
     let source_key = encode_hex(root.as_os_str().as_encoded_bytes());
     let source_kind = crate::antigravity::SOURCE_KIND;
     let sync_states = load_sync_state_for_prefix(conn, "antigravity");
@@ -7989,7 +7989,8 @@ mod tests {
         );
         fs::write(root.join("usage/usage-2026-10-10.jsonl"), &hook).unwrap();
         fs::write(&path, "{\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-10-10T01:00:00Z\",\"input_tokens\":12,\"output_tokens\":3}\n").unwrap();
-        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        let non_canonical_root = root.join("usage").join("..");
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &non_canonical_root, &|| false).unwrap();
         // Newly arriving hook snapshots must not resurrect duplicate costs.
         native_hook.turn_no += 1;
         fs::write(
@@ -7998,7 +7999,7 @@ mod tests {
         )
         .unwrap();
         fs::write(&path, "{\"type\":").unwrap();
-        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &non_canonical_root, &|| false).unwrap();
         native_hook.turn_no += 1;
         fs::write(
             root.join("usage/usage-2026-10-11.jsonl"),
@@ -8006,7 +8007,7 @@ mod tests {
         )
         .unwrap();
         fs::write(&path, "invalid\n").unwrap();
-        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &non_canonical_root, &|| false).unwrap();
         let rows: (i64, i64, i64) = conn.query_row(
             "SELECT COUNT(*), SUM(source_kind = 'legacy'), SUM(source_kind = 'antigravity-session') FROM usage_entries", [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
