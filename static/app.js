@@ -267,17 +267,17 @@ function getUrlDateForTab(tab) {
   if (!urlDate) return null;
   
   if (tab === 'daily') {
-    return urlDate;
+    return /^\d{4}-\d{2}-\d{2}$/.test(urlDate) ? urlDate : null;
   } else if (tab === 'monthly') {
     if (/^\d{4}-\d{2}-\d{2}$/.test(urlDate)) {
       return urlDate.substring(0, 7);
     }
-    return urlDate;
+    return /^\d{4}-\d{2}$/.test(urlDate) ? urlDate : null;
   } else if (tab === 'yearly') {
-    if (/^\d{4}-\d{2}(-\d{2})?$/.test(urlDate)) {
+    if (/^\d{4}(-\d{2}(-\d{2})?)?$/.test(urlDate)) {
       return urlDate.substring(0, 4);
     }
-    return urlDate;
+    return null;
   }
   return urlDate;
 }
@@ -780,6 +780,7 @@ async function refreshDashboardAfterSyncAdvance() {
   try {
     const dateSelect = document.getElementById('date-select');
     const wasFollowingLatestDate =
+      activeTab === 'daily' &&
       !initialUrlParams.get('date') &&
       (!dateSelect?.value ||
         availableDates.length === 0 ||
@@ -1564,10 +1565,17 @@ function initApp() {
 // =========================================================================
 // Tab 切換邏輯
 // =========================================================================
-function switchTab(tab) {
+function switchTab(tab, options = {}) {
   if (activeTab === tab) return;
   activeTab = tab;
   setCookie('active_tab', tab);
+
+  if (tab === 'daily') {
+    const dateSelect = document.getElementById('date-select');
+    if (dateSelect && (!dateSelect.value || !options.preserveDate)) {
+      dateSelect.value = getUtcDateString();
+    }
+  }
   updateUrlParams();
 
   // Update custom hover dropdown UI
@@ -1630,7 +1638,10 @@ function switchTab(tab) {
 
     // 載入當前日期的數據
     const dateSelect = document.getElementById('date-select');
-    if (dateSelect.value && availableDates.length > 0) {
+    if (dateSelect && !dateSelect.value) {
+      dateSelect.value = getUtcDateString();
+    }
+    if (dateSelect && dateSelect.value && availableDates.length > 0) {
       loadUsageData(dateSelect.value);
     } else if (availableDates.length === 0) {
       toggleEmptyState(true, currentAssistant);
@@ -1821,6 +1832,7 @@ async function fetchDates(selectedDate = null, keepDate = false, assistant = cur
     if (currentAssistant !== resolvedAssistant) return;
     
     const dateSelect = document.getElementById('date-select');
+    const todayStr = getUtcDateString();
     availableDates = data.dates || [];
 
     if (availableDates.length === 0) {
@@ -1828,9 +1840,9 @@ async function fetchDates(selectedDate = null, keepDate = false, assistant = cur
       currentMonthlyData = null;
       currentYearlyData = null;
       if (dateSelect) {
-        dateSelect.value = '';
+        dateSelect.value = todayStr;
         dateSelect.min = '';
-        dateSelect.max = '';
+        dateSelect.max = todayStr;
       }
       toggleEmptyState(true, resolvedAssistant);
       return;
@@ -1839,7 +1851,6 @@ async function fetchDates(selectedDate = null, keepDate = false, assistant = cur
     // 設定日曆最小與最大值
     const oldestDate = availableDates.length > 0 ? availableDates[availableDates.length - 1] : null;
     const newestDate = availableDates.length > 0 ? availableDates[0] : null;
-    const todayStr = getUtcDateString();
     
     if (oldestDate) dateSelect.min = oldestDate;
     dateSelect.max = todayStr;
@@ -1848,13 +1859,14 @@ async function fetchDates(selectedDate = null, keepDate = false, assistant = cur
     if (keepDate) {
       // 切換 agent：保留目前日期，不自動跳轉
       dateToLoad = dateSelect.value || todayStr;
+      dateSelect.value = dateToLoad;
     } else {
       const urlDate = getUrlDateForTab('daily');
       dateToLoad = selectedDate || urlDate || dateSelect.value;
       if (!dateToLoad || (!selectedDate && !urlDate && !availableDates.includes(dateToLoad))) {
-        // 若有啟用即時刷新，預設為今日；否則預設為最新有日誌的日期
+        // 若有啟用即時刷新或目前不在每日分頁，預設為 UTC 今日；否則預設為最新有日誌的日期
         const liveToggle = document.getElementById('live-toggle');
-        if (liveToggle && liveToggle.checked) {
+        if ((liveToggle && liveToggle.checked) || activeTab !== 'daily') {
           dateToLoad = todayStr;
         } else {
           dateToLoad = newestDate || todayStr;
@@ -7402,7 +7414,7 @@ function switchToDailyDate(date) {
     loadUsageData(date);
   } else {
     // switchTab('daily') 內部會自動載入 dateSelect.value
-    switchTab('daily');
+    switchTab('daily', { preserveDate: true });
   }
 }
 
