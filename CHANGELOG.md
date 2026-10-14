@@ -4,6 +4,23 @@
 
 ## [未發行]
 
+## [1.2.2] - 2026-10-14
+
+### 新增與改善
+
+- 大幅加速背景日誌同步並支援協作式停機中斷（Cooperative Cancellation）：收到 `Ctrl+C` 或 `SIGTERM` 時於完成目前單檔交易後立即安全結束背景同步，解決背景尚有日誌同步時關閉程式需長時間等待的問題。
+- 各 Agent 日誌掃描改採「最新檔案優先（Newest-first）」順序，搭配預載入 `sync_state` 記憶體快取、SQLite `WAL` 模式、複合索引（`idx_assistant_date`、`idx_assistant_session`、`idx_codex_local_transcript_path`）與 Codex / Claude 串流輕量解析，讓近期最新資料在啟動後數秒內優先入庫，並消除歷史檔案重複掃描與逐筆 `fs::metadata` 造成的大量 I/O。
+- 前端啟動期間透過 `/api/version` 追蹤背景同步的 `data_revision`，當最新日誌同步完成時自動漸進刷新目前檢視畫面與日期清單，無須等待歷史舊檔全部掃描完成或手動重新整理。
+- 重新設計頂部工具列深淺色主題切換按鈕（`#theme-toggle-btn`）圖示，改用直覺的標準太陽（深色模式）與新月（淺色模式）動態切換線條圖示，並支援平滑旋轉過渡與 `prefers-reduced-motion` 無障礙設定。
+
+### 修正
+
+- 修正從「月度」檢視切換至「每日」檢視時，因網址月份參數（`YYYY-MM`）被套用至 `<input type="date">` 導致日期欄位留白的問題，並確保從月度或年度分頁切換至每日分頁時預設顯示 UTC 今天日期。
+
+### 相容性
+
+- SQLite 連線自動啟用 `WAL` 模式與 `synchronous = NORMAL` 並自動建立複合索引；`/api/version` 回應新增 `syncing`、`initial_sync_completed`、`data_revision` 欄位（向下相容）；未變更環境變數或安裝流程。
+
 ## [1.2.1] - 2026-10-10
 
 ### 新增與改善
