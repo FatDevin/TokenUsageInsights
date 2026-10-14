@@ -935,18 +935,36 @@ pub(super) fn parse_cursor_session_file(
     Ok(results)
 }
 
+#[cfg(test)]
 pub(super) fn sync_cursor_usage_logs(
     conn: &mut Connection,
     cursor_dir: &Path,
 ) -> Result<(), String> {
-    sync_cursor_usage_logs_with_ledger(conn, cursor_dir, &get_cursor_state_db_path())
+    sync_cursor_usage_logs_with_cancel(conn, cursor_dir, &|| false)
 }
 
-pub(super) fn sync_cursor_usage_logs_with_ledger(
+pub(super) fn sync_cursor_usage_logs_with_cancel(
+    conn: &mut Connection,
+    cursor_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    sync_cursor_usage_logs_with_ledger_and_cancel(
+        conn,
+        cursor_dir,
+        &get_cursor_state_db_path(),
+        should_cancel,
+    )
+}
+
+pub(super) fn sync_cursor_usage_logs_with_ledger_and_cancel(
     conn: &mut Connection,
     cursor_dir: &Path,
     state_db_path: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
+    if should_cancel() {
+        return Ok(());
+    }
     run_cursor_model_attribution_migration(conn)?;
     run_cursor_cache_tokens_unknown_migration(conn)?;
 
@@ -983,9 +1001,22 @@ pub(super) fn sync_cursor_usage_logs_with_ledger(
         return Ok(());
     }
 
-    let files = find_jsonl_files(&projects_dir);
+    let sync_states = super::load_sync_state_for_prefix(conn, "cursor");
+    let mut files_with_meta: Vec<(PathBuf, u64, SystemTime)> = find_jsonl_files(&projects_dir)
+        .into_iter()
+        .filter_map(|filepath| {
+            let metadata = fs::metadata(&filepath).ok()?;
+            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            Some((filepath, metadata.len(), mtime))
+        })
+        .collect();
+    files_with_meta.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| right.0.cmp(&left.0)));
 
-    for filepath in files {
+    for (filepath, current_size, _) in files_with_meta {
+        if should_cancel() {
+            return Ok(());
+        }
+
         let state_path = filepath
             .strip_prefix(cursor_dir)
             .unwrap_or(&filepath)
@@ -993,19 +1024,10 @@ pub(super) fn sync_cursor_usage_logs_with_ledger(
             .into_owned();
         let state_key = source_sync_key("cursor", cursor_dir, &state_path);
 
-        let last_synced_size: u64 = conn
-            .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
-                params![state_key],
-                |row| row.get(0),
-            )
+        let last_synced_size: u64 = sync_states
+            .get(&state_key)
+            .map(|(size, _)| *size)
             .unwrap_or(0u64);
-
-        let metadata = match fs::metadata(&filepath) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let current_size = metadata.len();
 
         if current_size != last_synced_size {
             let parsed_entries = match parse_cursor_session_file(
@@ -1126,6 +1148,8 @@ pub(super) fn sync_cursor_usage_logs_with_ledger(
                 if update_state_res.is_ok() {
                     if let Err(e) = tx.commit() {
                         eprintln!("Transaction COMMIT 失敗: {}", e);
+                    } else {
+                        super::bump_sync_data_revision();
                     }
                 }
             }

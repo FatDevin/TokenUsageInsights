@@ -168,20 +168,29 @@ fn spawn_usage_sync_task() -> UsageSyncTask {
             }
 
             let should_migrate = migrate_legacy_databases;
+            let cancel_rx = shutdown_rx.clone();
+            db::set_sync_in_progress(true);
             let sync_res = tokio::task::spawn_blocking(move || {
                 let mut conn = db::get_db_conn()?;
                 if should_migrate {
                     db::migrate_old_databases(&mut conn)?;
                 }
-                db::sync_usage_logs(&mut conn)
+                db::sync_usage_logs_with_cancel(&mut conn, &|| *cancel_rx.borrow())
             })
             .await;
+            db::set_sync_in_progress(false);
 
             match sync_res {
+                Ok(Ok(())) if *shutdown_rx.borrow() => {
+                    break;
+                }
                 Ok(Ok(())) if should_migrate => {
+                    db::mark_initial_sync_completed();
                     println!("✅ SQLite 資料庫已成功載入並完成增量同步！");
                 }
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    db::mark_initial_sync_completed();
+                }
                 Ok(Err(error)) => eprintln!("⚠️ 背景日誌同步失敗: {error}"),
                 Err(error) => eprintln!("⚠️ 背景日誌同步任務異常: {error:?}"),
             }

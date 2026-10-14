@@ -185,26 +185,6 @@ pub(super) fn parse_codex_session_file_with_diagnostics(
         .trim_start_matches("rollout-")
         .to_string();
 
-    let mut events = Vec::new();
-    let mut malformed_lines = 0usize;
-    for line_res in reader.lines() {
-        let line = match line_res {
-            Ok(line) => line,
-            Err(_) => {
-                malformed_lines += 1;
-                continue;
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
-            events.push(event);
-        } else {
-            malformed_lines += 1;
-        }
-    }
-
     let mut session_id = fallback_session_id.clone();
     let mut session_name_selector = InitialUserPromptSelector::default();
     let mut subagent_path: Option<String> = None;
@@ -218,8 +198,44 @@ pub(super) fn parse_codex_session_file_with_diagnostics(
     let mut reasoning_effort: Option<String> = None;
     let mut source_kind = CODEX_OTHER_SOURCE_KIND.to_string();
     let mut session_identity_locked = false;
+    let mut completed_task_duration_ms: Option<u64> = None;
+    let mut turn_and_token_events = Vec::new();
+    let mut malformed_lines = 0usize;
 
-    for event in &events {
+    for line_res in reader.lines() {
+        let line = match line_res {
+            Ok(line) => line,
+            Err(_) => {
+                malformed_lines += 1;
+                continue;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let name_selection_done = session_name_selector.is_complete()
+            && (subagent_path.is_none() || subagent_task_name.is_some());
+        if name_selection_done
+            && !line.contains("token_count")
+            && !line.contains("turn_context")
+            && !line.contains("session_meta")
+            && !line.contains("task_complete")
+        {
+            if serde_json::from_str::<serde::de::IgnoredAny>(&line).is_err() {
+                malformed_lines += 1;
+            }
+            continue;
+        }
+
+        let event = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(event) => event,
+            Err(_) => {
+                malformed_lines += 1;
+                continue;
+            }
+        };
+
         let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let payload = match event.get("payload") {
             Some(payload) => payload,
@@ -327,26 +343,26 @@ pub(super) fn parse_codex_session_file_with_diagnostics(
             {
                 session_name_selector.observe_non_user_message();
             }
+            ("event_msg", "task_complete") => {
+                if let Some(duration_ms) = payload.get("duration_ms").and_then(|v| v.as_u64()) {
+                    completed_task_duration_ms = Some(
+                        completed_task_duration_ms
+                            .unwrap_or_default()
+                            .saturating_add(duration_ms),
+                    );
+                }
+            }
             _ => {}
+        }
+
+        if event_type == "turn_context"
+            || (event_type == "event_msg" && payload_type == "token_count")
+        {
+            turn_and_token_events.push(event);
         }
     }
 
     let session_name = subagent_task_name.or_else(|| session_name_selector.into_name());
-    let completed_task_duration_ms = events
-        .iter()
-        .filter_map(|event| {
-            if event.get("type").and_then(|value| value.as_str()) != Some("event_msg") {
-                return None;
-            }
-            let payload = event.get("payload")?;
-            if payload.get("type").and_then(|value| value.as_str()) != Some("task_complete") {
-                return None;
-            }
-            payload.get("duration_ms").and_then(|value| value.as_u64())
-        })
-        .fold(None::<u64>, |total, duration_ms| {
-            Some(total.unwrap_or_default().saturating_add(duration_ms))
-        });
 
     if parent_session_id.as_deref() == Some(session_id.as_str()) {
         parent_session_id = None;
@@ -357,7 +373,7 @@ pub(super) fn parse_codex_session_file_with_diagnostics(
     let mut effort_for_turn = reasoning_effort.clone();
     let mut previous_total_usage: Option<CodexTokenUsage> = None;
 
-    for event in events {
+    for event in turn_and_token_events {
         let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let timestamp = event
             .get("timestamp")

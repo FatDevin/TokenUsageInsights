@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 mod claude;
@@ -14,7 +14,65 @@ mod cursor;
 use claude::{find_claude_session_files, parse_claude_session_file};
 use codex::{find_codex_session_files, parse_codex_session_file_with_diagnostics};
 pub(crate) use cursor::parse_cursor_timestamp;
+#[cfg(test)]
 use cursor::sync_cursor_usage_logs;
+
+static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static INITIAL_SYNC_COMPLETED: AtomicBool = AtomicBool::new(false);
+static SYNC_DATA_REVISION: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SyncRuntimeStatus {
+    pub syncing: bool,
+    pub initial_sync_completed: bool,
+    pub data_revision: u64,
+}
+
+pub fn set_sync_in_progress(in_progress: bool) {
+    SYNC_IN_PROGRESS.store(in_progress, Ordering::Relaxed);
+}
+
+pub fn mark_initial_sync_completed() {
+    INITIAL_SYNC_COMPLETED.store(true, Ordering::Relaxed);
+}
+
+pub fn bump_sync_data_revision() {
+    SYNC_DATA_REVISION.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn get_sync_runtime_status() -> SyncRuntimeStatus {
+    SyncRuntimeStatus {
+        syncing: SYNC_IN_PROGRESS.load(Ordering::Relaxed),
+        initial_sync_completed: INITIAL_SYNC_COMPLETED.load(Ordering::Relaxed),
+        data_revision: SYNC_DATA_REVISION.load(Ordering::Relaxed),
+    }
+}
+
+pub(crate) fn load_sync_state_for_prefix(
+    conn: &Connection,
+    prefix: &str,
+) -> HashMap<String, (u64, i64)> {
+    let mut map = HashMap::new();
+    let pattern = format!("{prefix}:%");
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT filename, last_synced_size, last_synced_time FROM sync_state WHERE filename LIKE ?1",
+    ) else {
+        return map;
+    };
+    let Ok(rows) = stmt.query_map(params![pattern], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, u64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    }) else {
+        return map;
+    };
+    for (filename, size, time) in rows.flatten() {
+        map.insert(filename, (size, time));
+    }
+    map
+}
 
 fn find_jsonl_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -699,6 +757,11 @@ pub fn get_db_conn() -> Result<Connection, String> {
 
     let conn = Connection::open(&db_path).map_err(|e| format!("無法開啟資料庫: {}", e))?;
     let _ = conn.busy_timeout(std::time::Duration::from_millis(15000));
+    let _ = conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA temp_store = MEMORY;",
+    );
     Ok(conn)
 }
 
@@ -930,6 +993,18 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     .map_err(|e| format!("建立助理類型索引 idx_assistant_type 失敗: {}", e))?;
 
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_assistant_date ON usage_entries(assistant_type, date)",
+        [],
+    )
+    .map_err(|e| format!("建立助理與日期複合索引 idx_assistant_date 失敗: {}", e))?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_assistant_session ON usage_entries(assistant_type, session_id)",
+        [],
+    )
+    .map_err(|e| format!("建立助理與會話複合索引 idx_assistant_session 失敗: {}", e))?;
+
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_assistant_transcript_path
          ON usage_entries(assistant_type, transcript_path)",
         [],
@@ -937,6 +1012,22 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     .map_err(|e| {
         format!(
             "建立 transcript 路徑索引 idx_assistant_transcript_path 失敗: {}",
+            e
+        )
+    })?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_codex_local_transcript_path
+         ON usage_entries(transcript_path)
+         WHERE assistant_type = 'codex'
+           AND transcript_path IS NOT NULL
+           AND import_source_id IS NULL
+           AND import_batch_id IS NULL",
+        [],
+    )
+    .map_err(|e| {
+        format!(
+            "建立 Codex 本機 transcript 索引 idx_codex_local_transcript_path 失敗: {}",
             e
         )
     })?;
@@ -1476,11 +1567,24 @@ pub(crate) fn hook_transcript_path(
 }
 
 /// Sync usage logs for hooks-based assistant (Antigravity or Copilot)
+#[cfg(test)]
 fn sync_hook_usage_logs(
     conn: &mut Connection,
     assistant_type: &str,
     base_dir: &Path,
 ) -> Result<(), String> {
+    sync_hook_usage_logs_with_cancel(conn, assistant_type, base_dir, &|| false)
+}
+
+fn sync_hook_usage_logs_with_cancel(
+    conn: &mut Connection,
+    assistant_type: &str,
+    base_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    if should_cancel() {
+        return Ok(());
+    }
     if assistant_type == "antigravity" {
         // Perform migration if we haven't tracked it yet to update antigravity session names
         let migration_done: bool = conn
@@ -1519,19 +1623,28 @@ fn sync_hook_usage_logs(
         "legacy"
     };
 
-    for entry in entries.flatten() {
-        let file_type = match entry.file_type() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+    let sync_states = load_sync_state_for_prefix(conn, assistant_type);
+    let mut usage_files: Vec<(String, PathBuf, u64)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_file() {
+                return None;
+            }
+            let filename = entry.file_name().to_string_lossy().into_owned();
+            if !filename.starts_with("usage-") || !filename.ends_with(".jsonl") {
+                return None;
+            }
+            let current_size = entry.metadata().ok()?.len();
+            Some((filename, entry.path(), current_size))
+        })
+        .collect();
+    // Sort newest-first so today's / recent usage logs are synced before older days
+    usage_files.sort_by(|left, right| right.0.cmp(&left.0));
 
-        if !file_type.is_file() {
-            continue;
-        }
-
-        let filename = entry.file_name().to_string_lossy().into_owned();
-        if !filename.starts_with("usage-") || !filename.ends_with(".jsonl") {
-            continue;
+    for (filename, filepath, current_size) in usage_files {
+        if should_cancel() {
+            return Ok(());
         }
 
         let date_str = filename
@@ -1539,25 +1652,13 @@ fn sync_hook_usage_logs(
             .trim_end_matches(".jsonl")
             .to_string();
 
-        let filepath = entry.path();
-
         // Scope the sync_state key with the assistant prefix to prevent key collision
         let state_key = source_sync_key(assistant_type, base_dir, &filename);
 
-        let last_synced_size: u64 = conn
-            .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
-                params![state_key],
-                |row| row.get(0),
-            )
+        let last_synced_size: u64 = sync_states
+            .get(&state_key)
+            .map(|(size, _)| *size)
             .unwrap_or(0u64);
-
-        let mut file =
-            File::open(&filepath).map_err(|e| format!("無法開啟日誌檔 {}: {}", filename, e))?;
-        let metadata = file
-            .metadata()
-            .map_err(|e| format!("無法取得檔案資訊 {}: {}", filename, e))?;
-        let current_size = metadata.len();
 
         let start_pos = if current_size < last_synced_size {
             0
@@ -1566,6 +1667,8 @@ fn sync_hook_usage_logs(
         };
 
         if current_size > start_pos {
+            let mut file =
+                File::open(&filepath).map_err(|e| format!("無法開啟日誌檔 {}: {}", filename, e))?;
             file.seek(SeekFrom::Start(start_pos))
                 .map_err(|e| format!("Seek 失敗 {}: {}", filename, e))?;
             let mut buffer = Vec::new();
@@ -1605,6 +1708,7 @@ fn sync_hook_usage_logs(
 
                 let mut success = true;
                 let mut resolved_names = HashMap::<String, Option<String>>::new();
+                let mut session_names_to_update = HashMap::<String, String>::new();
                 for entry in &parsed_entries {
                     let tokens = entry.tokens.as_ref();
                     let delta = entry.delta_tokens.as_ref();
@@ -1621,6 +1725,10 @@ fn sync_hook_usage_logs(
                         })
                         .clone()
                         .or_else(|| entry.session_name.clone());
+
+                    if let Some(name) = &resolved_name {
+                        session_names_to_update.insert(entry.session_id.clone(), name.clone());
+                    }
 
                     let insert_res = tx.execute(
                         "INSERT OR IGNORE INTO usage_entries (
@@ -1668,15 +1776,17 @@ fn sync_hook_usage_logs(
                         success = false;
                         break;
                     }
+                }
 
-                    if let Some(name) = resolved_name.as_deref() {
+                if success {
+                    for (session_id, name) in &session_names_to_update {
                         if let Err(error) = tx.execute(
                             "UPDATE usage_entries
                              SET session_name = ?
                              WHERE assistant_type = ?
                                AND source_kind = ?
                                AND session_id = ?",
-                            params![name, assistant_type, source_kind, entry.session_id],
+                            params![name, assistant_type, source_kind, session_id],
                         ) {
                             eprintln!("[{}] 更新會話名稱失敗: {}", assistant_type, error);
                             success = false;
@@ -1699,6 +1809,8 @@ fn sync_hook_usage_logs(
                     if update_state_res.is_ok() {
                         if let Err(e) = tx.commit() {
                             eprintln!("Transaction COMMIT 失敗: {}", e);
+                        } else {
+                            bump_sync_data_revision();
                         }
                     }
                 }
@@ -1797,23 +1909,33 @@ fn vscode_sync_signature(filepath: &Path, metadata: &fs::Metadata) -> (u64, i64)
     (size, modified)
 }
 
-fn sync_vscode_chat_sessions_from(conn: &mut Connection, roots: &[PathBuf]) -> Result<(), String> {
+fn sync_vscode_chat_sessions_from_with_cancel(
+    conn: &mut Connection,
+    roots: &[PathBuf],
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    if should_cancel() {
+        return Ok(());
+    }
     let mut seen_sessions = HashSet::new();
+    let sync_states = load_sync_state_for_prefix(conn, "vscode");
 
-    for filepath in crate::vscode::session_files_in(roots) {
-        let metadata = match fs::metadata(&filepath) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        let (current_size, modified_time) = vscode_sync_signature(&filepath, &metadata);
+    let mut session_files: Vec<(PathBuf, u64, i64)> = crate::vscode::session_files_in(roots)
+        .into_iter()
+        .filter_map(|filepath| {
+            let metadata = fs::metadata(&filepath).ok()?;
+            let (current_size, modified_time) = vscode_sync_signature(&filepath, &metadata);
+            Some((filepath, current_size, modified_time))
+        })
+        .collect();
+    session_files.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| right.0.cmp(&left.0)));
+
+    for (filepath, current_size, modified_time) in session_files {
+        if should_cancel() {
+            return Ok(());
+        }
         let state_key = format!("vscode:{}", filepath.to_string_lossy());
-        let previous_state: Option<(u64, i64)> = conn
-            .query_row(
-                "SELECT last_synced_size, last_synced_time FROM sync_state WHERE filename = ?",
-                params![state_key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .ok();
+        let previous_state: Option<(u64, i64)> = sync_states.get(&state_key).copied();
 
         if previous_state == Some((current_size, modified_time)) {
             continue;
@@ -1870,6 +1992,7 @@ fn sync_vscode_chat_sessions_from(conn: &mut Connection, roots: &[PathBuf]) -> R
         .map_err(|error| format!("更新 VS Code 同步狀態失敗: {error}"))?;
         tx.commit()
             .map_err(|error| format!("提交 VS Code 同步交易失敗: {error}"))?;
+        bump_sync_data_revision();
     }
 
     Ok(())
@@ -4130,7 +4253,19 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
     sync_codex_usage_logs_from(conn, &[get_codex_dir()])
 }
 
+#[cfg(test)]
 fn sync_codex_usage_logs_from(conn: &mut Connection, roots: &[PathBuf]) -> Result<(), String> {
+    sync_codex_usage_logs_from_with_cancel(conn, roots, &|| false)
+}
+
+fn sync_codex_usage_logs_from_with_cancel(
+    conn: &mut Connection,
+    roots: &[PathBuf],
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    if should_cancel() {
+        return Ok(());
+    }
     let Some(codex_dir) = roots.first() else {
         return Ok(());
     };
@@ -4141,6 +4276,9 @@ fn sync_codex_usage_logs_from(conn: &mut Connection, roots: &[PathBuf]) -> Resul
 
     let mut transcripts = Vec::new();
     for root in roots {
+        if should_cancel() {
+            return Ok(());
+        }
         transcripts.extend(collect_codex_transcripts(&root.join("sessions")));
         transcripts.extend(collect_codex_transcripts(&root.join("archived_sessions")));
     }
@@ -4166,8 +4304,14 @@ fn sync_codex_usage_logs_from(conn: &mut Connection, roots: &[PathBuf]) -> Resul
     }
 
     let transcript_paths = load_codex_transcript_paths(conn)?;
+    let mut sync_states = load_sync_state_for_prefix(conn, "codex");
 
-    for (identity, group) in transcripts_by_identity {
+    // Process newest rollouts first (`rollout-YYYY-MM-DD...` keys sort chronologically)
+    // so today's and recent sessions appear on the dashboard immediately.
+    for (identity, group) in transcripts_by_identity.into_iter().rev() {
+        if should_cancel() {
+            return Ok(());
+        }
         let Some(canonical) = group
             .iter()
             .max_by_key(|transcript| codex_transcript_canonical_rank(transcript))
@@ -4191,6 +4335,7 @@ fn sync_codex_usage_logs_from(conn: &mut Connection, roots: &[PathBuf]) -> Resul
             &identity,
             &canonical,
             &transcript_paths,
+            &mut sync_states,
             &duplicates,
             true,
         )?;
@@ -4200,27 +4345,22 @@ fn sync_codex_usage_logs_from(conn: &mut Connection, roots: &[PathBuf]) -> Resul
 }
 
 /// Sync one Codex rollout transcript, replacing every row of that rollout.
+// Internal helper passing preloaded transcript_paths and sync_states caches to avoid per-file queries.
+#[allow(clippy::too_many_arguments)]
 fn sync_codex_transcript(
     conn: &mut Connection,
     codex_dir: &Path,
     identity: &str,
     transcript: &CodexTranscript,
     transcript_paths: &HashMap<String, Vec<String>>,
+    sync_states: &mut HashMap<String, (u64, i64)>,
     duplicates: &[CodexTranscript],
     allow_fallback: bool,
 ) -> Result<(), String> {
     let state_path = portable_relative_path(codex_dir, &transcript.path);
     let state_key = format!("codex:{}", state_path);
 
-    let last_synced_state: Option<(u64, i64)> = conn
-        .query_row(
-            "SELECT last_synced_size, last_synced_time
-             FROM sync_state
-             WHERE filename = ?",
-            params![state_key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .ok();
+    let last_synced_state: Option<(u64, i64)> = sync_states.get(&state_key).copied();
 
     let current_size = transcript.size;
     let transcript_path = transcript.path.to_string_lossy().into_owned();
@@ -4246,6 +4386,7 @@ fn sync_codex_transcript(
             remove_stale_codex_copy_rows(&tx, &stale_copy_paths)?;
             tx.commit()
                 .map_err(|error| format!("Transaction COMMIT 失敗: {error}"))?;
+            bump_sync_data_revision();
         }
         return Ok(());
     }
@@ -4281,6 +4422,7 @@ fn sync_codex_transcript(
                 identity,
                 fallback,
                 transcript_paths,
+                sync_states,
                 &remaining,
                 false,
             );
@@ -4306,6 +4448,7 @@ fn sync_codex_transcript(
             ],
         )
         .map_err(|error| format!("記錄空白 Codex transcript 同步狀態失敗: {error}"))?;
+        sync_states.insert(state_key, (current_size, CODEX_EMPTY_TRANSCRIPT_SYNC_TIME));
         return Ok(());
     }
 
@@ -4451,6 +4594,11 @@ fn sync_codex_transcript(
         if update_state_res.is_ok() {
             if let Err(e) = tx.commit() {
                 eprintln!("Transaction COMMIT 失敗: {}", e);
+            } else {
+                sync_states.insert(state_key, (current_size, last_synced_time));
+                if wrote_local_rows || parsed_completely {
+                    bump_sync_data_revision();
+                }
             }
         }
     }
@@ -4480,7 +4628,19 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
     sync_claude_usage_logs_from(conn, &get_claude_dir())
 }
 
+#[cfg(test)]
 fn sync_claude_usage_logs_from(conn: &mut Connection, claude_dir: &Path) -> Result<(), String> {
+    sync_claude_usage_logs_from_with_cancel(conn, claude_dir, &|| false)
+}
+
+fn sync_claude_usage_logs_from_with_cancel(
+    conn: &mut Connection,
+    claude_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    if should_cancel() {
+        return Ok(());
+    }
     // Move Claude Code data that was previously written into the Codex slot.
     let migration_done: bool = conn
         .query_row(
@@ -4549,9 +4709,24 @@ fn sync_claude_usage_logs_from(conn: &mut Connection, claude_dir: &Path) -> Resu
         return Ok(());
     }
 
-    let files = find_claude_session_files(&projects_dir);
+    let sync_states = load_sync_state_for_prefix(conn, "claude");
+    let mut files_with_meta: Vec<(PathBuf, u64, SystemTime)> =
+        find_claude_session_files(&projects_dir)
+            .into_iter()
+            .filter_map(|filepath| {
+                let metadata = fs::metadata(&filepath).ok()?;
+                let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                Some((filepath, metadata.len(), mtime))
+            })
+            .collect();
+    // Sort newest-first so recent Claude Code sessions sync first
+    files_with_meta.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| right.0.cmp(&left.0)));
 
-    for filepath in files {
+    for (filepath, current_size, _) in files_with_meta {
+        if should_cancel() {
+            return Ok(());
+        }
+
         let state_path = filepath
             .strip_prefix(claude_dir)
             .unwrap_or(&filepath)
@@ -4559,19 +4734,10 @@ fn sync_claude_usage_logs_from(conn: &mut Connection, claude_dir: &Path) -> Resu
             .into_owned();
         let state_key = source_sync_key("claude", claude_dir, &state_path);
 
-        let last_synced_size: u64 = conn
-            .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
-                params![state_key],
-                |row| row.get(0),
-            )
+        let last_synced_size: u64 = sync_states
+            .get(&state_key)
+            .map(|(size, _)| *size)
             .unwrap_or(0u64);
-
-        let metadata = match fs::metadata(&filepath) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let current_size = metadata.len();
 
         if current_size != last_synced_size {
             let parsed_entries = match parse_claude_session_file(&filepath) {
@@ -4686,6 +4852,8 @@ fn sync_claude_usage_logs_from(conn: &mut Connection, claude_dir: &Path) -> Resu
                 if update_state_res.is_ok() {
                     if let Err(e) = tx.commit() {
                         eprintln!("Transaction COMMIT 失敗: {}", e);
+                    } else {
+                        bump_sync_data_revision();
                     }
                 }
             }
@@ -4695,27 +4863,49 @@ fn sync_claude_usage_logs_from(conn: &mut Connection, claude_dir: &Path) -> Resu
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn sync_grok_usage_logs(conn: &mut Connection, grok_dir: &Path) -> Result<(), String> {
-    for filepath in crate::grok::find_session_update_files(grok_dir) {
-        let metadata = match fs::metadata(&filepath) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                eprintln!(
-                    "讀取 Grok Build session 檔案 {:?} 失敗: {}",
-                    filepath, error
-                );
-                continue;
-            }
-        };
-        let current_size = metadata.len();
+    sync_grok_usage_logs_with_cancel(conn, grok_dir, &|| false)
+}
+
+pub(crate) fn sync_grok_usage_logs_with_cancel(
+    conn: &mut Connection,
+    grok_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    if should_cancel() {
+        return Ok(());
+    }
+    let sync_states = load_sync_state_for_prefix(conn, "grok");
+    let mut files_with_meta: Vec<(PathBuf, u64, SystemTime)> =
+        crate::grok::find_session_update_files(grok_dir)
+            .into_iter()
+            .filter_map(|filepath| {
+                let metadata = match fs::metadata(&filepath) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        eprintln!(
+                            "讀取 Grok Build session 檔案 {:?} 失敗: {}",
+                            filepath, error
+                        );
+                        return None;
+                    }
+                };
+                let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                Some((filepath, metadata.len(), mtime))
+            })
+            .collect();
+    files_with_meta.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| right.0.cmp(&left.0)));
+
+    for (filepath, current_size, _) in files_with_meta {
+        if should_cancel() {
+            return Ok(());
+        }
         let state_name = portable_relative_path(grok_dir, &filepath);
         let state_key = source_sync_key("grok", grok_dir, &state_name);
-        let last_synced_size: u64 = conn
-            .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
-                params![state_key],
-                |row| row.get(0),
-            )
+        let last_synced_size: u64 = sync_states
+            .get(&state_key)
+            .map(|(size, _)| *size)
             .unwrap_or(0);
 
         if current_size == last_synced_size {
@@ -4840,6 +5030,7 @@ pub(crate) fn sync_grok_usage_logs(conn: &mut Connection, grok_dir: &Path) -> Re
         .map_err(|error| format!("更新 Grok Build sync state 失敗: {error}"))?;
         tx.commit()
             .map_err(|error| format!("提交 Grok Build transaction 失敗: {error}"))?;
+        bump_sync_data_revision();
     }
 
     Ok(())
@@ -4858,27 +5049,40 @@ fn sync_pi_family_usage_logs(
     session_files: Vec<PathBuf>,
     dir: &Path,
     parse_file: impl Fn(&Path) -> Result<Vec<UsageEntry>, String>,
+    should_cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
-    for filepath in session_files {
-        let metadata = match fs::metadata(&filepath) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                eprintln!(
-                    "讀取 {assistant_label} session 檔案 {:?} 失敗: {}",
-                    filepath, error
-                );
-                continue;
-            }
-        };
-        let current_size = metadata.len();
+    if should_cancel() {
+        return Ok(());
+    }
+    let sync_states = load_sync_state_for_prefix(conn, assistant_type);
+    let mut files_with_meta: Vec<(PathBuf, u64, SystemTime)> = session_files
+        .into_iter()
+        .filter_map(|filepath| {
+            let metadata = match fs::metadata(&filepath) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    eprintln!(
+                        "讀取 {assistant_label} session 檔案 {:?} 失敗: {}",
+                        filepath, error
+                    );
+                    return None;
+                }
+            };
+            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            Some((filepath, metadata.len(), mtime))
+        })
+        .collect();
+    files_with_meta.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| right.0.cmp(&left.0)));
+
+    for (filepath, current_size, _) in files_with_meta {
+        if should_cancel() {
+            return Ok(());
+        }
         let state_name = portable_relative_path(dir, &filepath);
         let state_key = source_sync_key(assistant_type, dir, &state_name);
-        let last_synced_size: u64 = conn
-            .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
-                params![state_key],
-                |row| row.get(0),
-            )
+        let last_synced_size: u64 = sync_states
+            .get(&state_key)
+            .map(|(size, _)| *size)
             .unwrap_or(0);
 
         if current_size == last_synced_size {
@@ -4943,6 +5147,7 @@ fn sync_pi_family_usage_logs(
         .map_err(|error| format!("更新 {assistant_label} sync state 失敗: {error}"))?;
         tx.commit()
             .map_err(|error| format!("提交 {assistant_label} transaction 失敗: {error}"))?;
+        bump_sync_data_revision();
     }
 
     Ok(())
@@ -5034,7 +5239,16 @@ fn insert_usage_entries(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn sync_pi_usage_logs(conn: &mut Connection, pi_dir: &Path) -> Result<(), String> {
+    sync_pi_usage_logs_with_cancel(conn, pi_dir, &|| false)
+}
+
+pub(crate) fn sync_pi_usage_logs_with_cancel(
+    conn: &mut Connection,
+    pi_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
     let session_files = crate::pi::find_session_files(pi_dir);
     sync_pi_family_usage_logs(
         conn,
@@ -5043,10 +5257,20 @@ pub(crate) fn sync_pi_usage_logs(conn: &mut Connection, pi_dir: &Path) -> Result
         session_files,
         pi_dir,
         |path| crate::pi::parse_session_usage_file(path, crate::pi::SOURCE_KIND),
+        should_cancel,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn sync_omp_usage_logs(conn: &mut Connection, omp_dir: &Path) -> Result<(), String> {
+    sync_omp_usage_logs_with_cancel(conn, omp_dir, &|| false)
+}
+
+pub(crate) fn sync_omp_usage_logs_with_cancel(
+    conn: &mut Connection,
+    omp_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
     let session_files = crate::omp::find_session_files(omp_dir);
     sync_pi_family_usage_logs(
         conn,
@@ -5055,10 +5279,15 @@ pub(crate) fn sync_omp_usage_logs(conn: &mut Connection, omp_dir: &Path) -> Resu
         session_files,
         omp_dir,
         crate::omp::parse_session_usage_file,
+        should_cancel,
     )
 }
 
-pub(crate) fn sync_muse_usage_logs(conn: &mut Connection, muse_dir: &Path) -> Result<(), String> {
+pub(crate) fn sync_muse_usage_logs_with_cancel(
+    conn: &mut Connection,
+    muse_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
     let session_files = crate::muse::find_session_files(muse_dir);
     sync_pi_family_usage_logs(
         conn,
@@ -5067,6 +5296,7 @@ pub(crate) fn sync_muse_usage_logs(conn: &mut Connection, muse_dir: &Path) -> Re
         session_files,
         muse_dir,
         crate::muse::parse_session_usage_file,
+        should_cancel,
     )
 }
 
@@ -5150,21 +5380,53 @@ fn complete_file_len(path: &Path) -> Option<u64> {
 /// unit is the directory rather than a single file. The incremental
 /// fingerprint is therefore the combined size of the session's JSONL files,
 /// and the rebuild is scoped to the session's `messages.jsonl` path.
+#[cfg(test)]
 pub(crate) fn sync_mcode_usage_logs(conn: &mut Connection, mcode_dir: &Path) -> Result<(), String> {
     sync_mcode_usage_logs_with_ledger(conn, mcode_dir, &get_mcode_state_db_path())
 }
 
+pub(crate) fn sync_mcode_usage_logs_with_cancel(
+    conn: &mut Connection,
+    mcode_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    sync_mcode_usage_logs_with_ledger_and_cancel(
+        conn,
+        mcode_dir,
+        &get_mcode_state_db_path(),
+        should_cancel,
+    )
+}
+
+#[cfg(test)]
 fn sync_mcode_usage_logs_with_ledger(
     conn: &mut Connection,
     mcode_dir: &Path,
     ledger: &Path,
 ) -> Result<(), String> {
-    let session_dirs = crate::mcode::find_session_dirs(mcode_dir);
+    sync_mcode_usage_logs_with_ledger_and_cancel(conn, mcode_dir, ledger, &|| false)
+}
+
+fn sync_mcode_usage_logs_with_ledger_and_cancel(
+    conn: &mut Connection,
+    mcode_dir: &Path,
+    ledger: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    if should_cancel() {
+        return Ok(());
+    }
+    let sync_states = load_sync_state_for_prefix(conn, "mcode");
+    let mut session_dirs = crate::mcode::find_session_dirs(mcode_dir);
+    session_dirs.sort_by(|left, right| right.cmp(left));
     // The runtime ledger is opened lazily and only when a session actually
     // changed, so an uninstalled MiniMax Code runtime costs nothing.
     let mut runtime_meta: Option<HashMap<String, McodeRuntimeSessionMeta>> = None;
 
     for session_dir in session_dirs {
+        if should_cancel() {
+            return Ok(());
+        }
         let files = crate::mcode::session_jsonl_files(&session_dir);
         if files.is_empty() {
             continue;
@@ -5187,12 +5449,9 @@ fn sync_mcode_usage_logs_with_ledger(
 
         let state_name = portable_relative_path(mcode_dir, &session_dir);
         let state_key = source_sync_key("mcode", mcode_dir, &state_name);
-        let last_synced_size: u64 = conn
-            .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
-                params![state_key],
-                |row| row.get(0),
-            )
+        let last_synced_size: u64 = sync_states
+            .get(&state_key)
+            .map(|(size, _)| *size)
             .unwrap_or(0);
 
         if current_size == last_synced_size {
@@ -5243,6 +5502,7 @@ fn sync_mcode_usage_logs_with_ledger(
         .map_err(|error| format!("更新 MiniMax Code sync state 失敗: {error}"))?;
         tx.commit()
             .map_err(|error| format!("提交 MiniMax Code transaction 失敗: {error}"))?;
+        bump_sync_data_revision();
     }
 
     Ok(())
@@ -5250,13 +5510,21 @@ fn sync_mcode_usage_logs_with_ledger(
 
 /// Unified sync function triggering sync for all supported assistants
 pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
-    let config = crate::config::SourceConfig::load()?;
-    sync_configured_sources(conn, &config)
+    sync_usage_logs_with_cancel(conn, &|| false)
 }
 
-fn sync_configured_sources(
+pub fn sync_usage_logs_with_cancel(
+    conn: &mut Connection,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    let config = crate::config::SourceConfig::load()?;
+    sync_configured_sources_with_cancel(conn, &config, should_cancel)
+}
+
+fn sync_configured_sources_with_cancel(
     conn: &mut Connection,
     config: &crate::config::SourceConfig,
+    should_cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
     use crate::config::Harness;
     // Preserve collector order: Cursor metadata first; Copilot hook/App rows
@@ -5275,61 +5543,102 @@ fn sync_configured_sources(
         Harness::Muse,
         Harness::Mcode,
     ] {
+        if should_cancel() {
+            return Ok(());
+        }
         let roots = config.roots(harness);
         if harness == Harness::Vscode {
-            if let Err(error) = sync_vscode_chat_sessions_from(
+            if let Err(error) = sync_vscode_chat_sessions_from_with_cancel(
                 conn,
                 &crate::vscode::workspace_storage_roots(&roots),
+                should_cancel,
             ) {
                 eprintln!("❌ 同步 VS Code Copilot 失敗: {error}");
             }
             continue;
         }
         if harness == Harness::Codex {
-            if let Err(error) = sync_codex_usage_logs_from(conn, &roots) {
+            if let Err(error) = sync_codex_usage_logs_from_with_cancel(conn, &roots, should_cancel)
+            {
                 eprintln!("❌ 同步 Codex 失敗: {error}");
             }
             continue;
         }
+        let sqlite_total_changes = |c: &Connection| -> i64 {
+            c.query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap_or(0)
+        };
         for (index, root) in roots.iter().enumerate() {
+            if should_cancel() {
+                return Ok(());
+            }
+            let changes_before = sqlite_total_changes(conn);
             let result = match harness {
-                Harness::Cursor if index == 0 => sync_cursor_usage_logs(conn, root),
-                Harness::Cursor => cursor::sync_cursor_usage_logs_with_ledger(
+                Harness::Cursor if index == 0 => {
+                    cursor::sync_cursor_usage_logs_with_cancel(conn, root, should_cancel)
+                }
+                Harness::Cursor => cursor::sync_cursor_usage_logs_with_ledger_and_cancel(
                     conn,
                     root,
                     &root.join("state.vscdb"),
+                    should_cancel,
                 ),
-                Harness::Antigravity => sync_hook_usage_logs(conn, "antigravity", root),
-                Harness::Copilot => sync_hook_usage_logs(conn, "copilot", root),
+                Harness::Antigravity => {
+                    sync_hook_usage_logs_with_cancel(conn, "antigravity", root, should_cancel)
+                }
+                Harness::Copilot => {
+                    sync_hook_usage_logs_with_cancel(conn, "copilot", root, should_cancel)
+                }
                 Harness::CopilotApp => sync_copilot_app_usage_logs_from(conn, root),
-                Harness::Claude => sync_claude_usage_logs_from(conn, root),
-                Harness::Grok => sync_grok_usage_logs(conn, root),
-                Harness::Pi => sync_pi_usage_logs(conn, root),
-                Harness::Omp => sync_omp_usage_logs(conn, root),
-                Harness::Muse => sync_muse_usage_logs(conn, root),
-                Harness::Mcode if index == 0 => sync_mcode_usage_logs(conn, root),
-                Harness::Mcode => sync_mcode_usage_logs_with_ledger(
+                Harness::Claude => {
+                    sync_claude_usage_logs_from_with_cancel(conn, root, should_cancel)
+                }
+                Harness::Grok => sync_grok_usage_logs_with_cancel(conn, root, should_cancel),
+                Harness::Pi => sync_pi_usage_logs_with_cancel(conn, root, should_cancel),
+                Harness::Omp => sync_omp_usage_logs_with_cancel(conn, root, should_cancel),
+                Harness::Muse => sync_muse_usage_logs_with_cancel(conn, root, should_cancel),
+                Harness::Mcode if index == 0 => {
+                    sync_mcode_usage_logs_with_cancel(conn, root, should_cancel)
+                }
+                Harness::Mcode => sync_mcode_usage_logs_with_ledger_and_cancel(
                     conn,
                     root,
                     &root.join("sqlite/runtime-state.sqlite"),
+                    should_cancel,
                 ),
                 Harness::Vscode | Harness::Codex => unreachable!("handled as a group above"),
             };
+            if matches!(harness, Harness::CopilotApp) && sqlite_total_changes(conn) > changes_before
+            {
+                bump_sync_data_revision();
+            }
             if let Err(error) = result {
                 eprintln!("❌ 同步 {harness:?} ({}) 失敗: {error}", root.display());
             }
         }
         if harness == Harness::CopilotApp {
             for root in config.roots(Harness::Copilot) {
+                if should_cancel() {
+                    return Ok(());
+                }
+                let changes_before = sqlite_total_changes(conn);
                 if let Err(error) = sync_copilot_cli_agent_usage_logs_from(conn, &root) {
                     eprintln!(
                         "❌ 同步 Copilot CLI agent ({}) 失敗: {error}",
                         root.display()
                     );
+                } else if sqlite_total_changes(conn) > changes_before {
+                    bump_sync_data_revision();
                 }
             }
+            if should_cancel() {
+                return Ok(());
+            }
+            let changes_before = sqlite_total_changes(conn);
             if let Err(error) = backfill_copilot_cwd(conn) {
                 eprintln!("❌ 補填 Copilot CWD 失敗: {error}");
+            } else if sqlite_total_changes(conn) > changes_before {
+                bump_sync_data_revision();
             }
         }
     }

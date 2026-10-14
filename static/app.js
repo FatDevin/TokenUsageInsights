@@ -771,9 +771,39 @@ function updateLanguageUI() {
   updateCodexRateLimit();
 }
 
+let startupSyncKnownRevision = null;
+let startupSyncRefreshInFlight = false;
+
+async function refreshDashboardAfterSyncAdvance() {
+  if (startupSyncRefreshInFlight) return;
+  startupSyncRefreshInFlight = true;
+  try {
+    const dateSelect = document.getElementById('date-select');
+    const wasFollowingLatestDate =
+      !initialUrlParams.get('date') &&
+      (!dateSelect?.value ||
+        availableDates.length === 0 ||
+        dateSelect.value === availableDates[0]);
+
+    if (wasFollowingLatestDate && dateSelect) {
+      dateSelect.value = '';
+    }
+
+    await fetchDates(wasFollowingLatestDate ? null : dateSelect?.value || null);
+    if (activeTab === 'monthly') {
+      await reloadMonthlyData();
+    } else if (activeTab === 'yearly') {
+      await reloadYearlyData();
+    }
+  } catch (error) {
+    console.error('背景同步完成後自動刷新失敗', error);
+  } finally {
+    startupSyncRefreshInFlight = false;
+  }
+}
+
 async function loadAppVersion() {
   const versionElement = document.getElementById('app-version');
-  if (!versionElement) return;
 
   try {
     const response = await fetch('/api/version', { cache: 'no-store' });
@@ -783,11 +813,24 @@ async function loadAppVersion() {
 
     const payload = await response.json();
     const version = typeof payload.version === 'string' ? payload.version.trim() : '';
-    if (!version) {
-      throw new Error('版本 API 未提供有效版本');
+    if (version && versionElement) {
+      versionElement.textContent = `v${version}`;
     }
 
-    versionElement.textContent = `v${version}`;
+    if (typeof payload.data_revision === 'number') {
+      if (startupSyncKnownRevision === null) {
+        startupSyncKnownRevision = payload.data_revision;
+      } else if (payload.data_revision > startupSyncKnownRevision) {
+        startupSyncKnownRevision = payload.data_revision;
+        await refreshDashboardAfterSyncAdvance();
+      }
+    }
+
+    if (payload.syncing || payload.initial_sync_completed === false) {
+      window.setTimeout(() => {
+        void loadAppVersion();
+      }, 2000);
+    }
   } catch (error) {
     console.error('無法載入應用程式版本', error);
   }

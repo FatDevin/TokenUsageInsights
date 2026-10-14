@@ -207,6 +207,15 @@ pub(super) fn parse_claude_session_file(filepath: &Path) -> Result<Vec<UsageEntr
             Ok(line) => line,
             Err(_) => continue,
         };
+        if session_name_selector.is_complete()
+            && session_cwd.is_some()
+            && session_version.is_some()
+            && !line.contains("\"usage\"")
+            && !line.contains("custom-title")
+            && !line.contains("customTitle")
+        {
+            continue;
+        }
         let event: serde_json::Value = match serde_json::from_str(&line) {
             Ok(value) => value,
             Err(_) => continue,
