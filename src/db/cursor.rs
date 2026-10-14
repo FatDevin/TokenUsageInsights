@@ -278,23 +278,25 @@ pub(super) fn open_cursor_state_db(state_db_path: &Path) -> Result<Connection, S
     .map_err(|error| format!("無法唯讀開啟 Cursor state.vscdb: {error}"))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|error| format!("設定 Cursor state.vscdb busy timeout 失敗: {error}"))?;
-    let has_cursor_disk_kv: bool = conn
-        .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'table' AND name = 'cursorDiskKV'
-            )",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("檢查 Cursor cursorDiskKV 表失敗: {error}"))?;
-    if !has_cursor_disk_kv {
-        return Err("Cursor state.vscdb 缺少 cursorDiskKV 表".to_string());
-    }
     Ok(conn)
 }
 
+fn cursor_state_has_disk_kv_table(conn: &Connection) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'cursorDiskKV'
+        )",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|error| format!("檢查 Cursor cursorDiskKV 表失敗: {error}"))
+}
+
 fn cursor_state_max_rowid(conn: &Connection) -> Result<i64, String> {
+    if !cursor_state_has_disk_kv_table(conn)? {
+        return Ok(0);
+    }
     conn.query_row(
         "SELECT COALESCE(MAX(rowid), 0) FROM cursorDiskKV",
         [],
@@ -1483,6 +1485,33 @@ mod tests {
         assert_eq!(values, [None; 8]);
         assert_eq!(measured_values, [10, 20, 30, 40, 1, 2, 3, 4]);
         assert_eq!(migration_count, 1);
+    }
+
+    #[test]
+    fn cursor_state_db_without_cursor_disk_kv_table_is_treated_as_empty() {
+        let state_db_path = temp_jsonl_path("cursor-state-no-disk-kv").with_extension("vscdb");
+        let writer = Connection::open(&state_db_path).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE ItemTable (
+                    key TEXT UNIQUE ON CONFLICT REPLACE,
+                    value BLOB
+                 );
+                 INSERT INTO ItemTable (key, value) VALUES ('workbench.panel', X'7B7D');",
+            )
+            .unwrap();
+        drop(writer);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let metadata_source_id = sync_cursor_session_metadata(&mut conn, &state_db_path)
+            .expect("missing cursorDiskKV table should not fail session metadata sync");
+        let model_source_id = sync_cursor_model_signatures(&mut conn, &state_db_path)
+            .expect("missing cursorDiskKV table should not fail model signature sync");
+        assert_eq!(metadata_source_id, model_source_id);
+
+        let _ = fs::remove_file(&state_db_path);
     }
 
     #[test]
