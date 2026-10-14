@@ -2,12 +2,24 @@
 
 本文件記錄 TokenUsageInsights 各正式版本的實際變更。內容依 Git 標籤間的提交記錄與檔案差異整理，格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)，版本編號遵循 [Semantic Versioning](https://semver.org/lang/zh-TW/)。
 
-## [未發行]
+## [1.3.0] - 2026-10-15
 
 ### 新增與改善
 
 - Antigravity CLI 可直接讀取原生會話記錄中的 Token 與會話資料庫模型資訊，不再需要事先設定 Status Line；保留舊版 `usage/` 收集檔相容性，並更新資料來源偵測、五種語言的使用指南與空白狀態說明。模型或價格不明時，費用無法可靠估算。
 - 補齊 Antigravity 原生會話的工作目錄（CWD），從會話 workspace URI 還原路徑，並在同步時補齊既有歷史資料；不以工具臨時工作目錄猜測會話目錄。
+
+### 修正
+
+- 修正舊版或尚未初始化 Composer／Agent DiskKV 儲存的 Cursor `state.vscdb` 缺少 `cursorDiskKV` 資料表時，每次同步皆輸出 `同步 Cursor composerData Session 中繼資料失敗` 與 `同步 Cursor agentKv 模型資訊失敗` 錯誤訊息的問題；現在缺少 `cursorDiskKV` 表時視為空表處理，並在資料庫重置時正常清理快取。
+
+### 資料影響
+
+- Antigravity CLI 同步會自動掃描原生會話記錄（`brain/<session-id>/.system_generated/logs/transcript.jsonl`）與會話資料庫模型中繼資料，並為既有原生會話回補工作目錄（CWD），同時與舊版 `usage/` 收集檔去重；原始會話檔案維持唯讀不變。
+
+### 相容性
+
+- 保留舊版 Antigravity `usage/` 狀態列收集檔相容性；未變更資料庫結構、環境變數或安裝流程。
 
 ## [1.2.2] - 2026-10-14
 
