@@ -662,7 +662,7 @@ function setSetupModalTitle(assistant) {
 function setSetupModalBody(assistant) {
   const bodyIds = {
     all: 'setup-body-all',
-    antigravity: 'setup-body-statusline',
+    antigravity: 'setup-body-antigravity',
     copilot: 'setup-body-statusline',
     codex: 'setup-body-codex',
     claude: 'setup-body-claude',
@@ -7145,7 +7145,10 @@ async function loadSetupInfo(assistant = currentAssistant) {
     if (resolvedAssistant === ALL_ASSISTANTS) {
       latestAllAgentSetupInfo = data;
       renderAllAgentSourceList(data);
-    } else if (resolvedAssistant === 'antigravity' || resolvedAssistant === 'copilot') {
+    } else if (resolvedAssistant === 'antigravity') {
+      const pathLabel = document.getElementById('lbl-detected-home-antigravity');
+      if (pathLabel) pathLabel.textContent = abbreviateHomePath(data.antigravity?.data_path || '');
+    } else if (resolvedAssistant === 'copilot') {
       const assistantSetup = data[resolvedAssistant] || {};
       const targetScriptPath = assistantSetup.script_path || '';
       const sourceScriptPath = assistantSetup.source_script_path || '';
@@ -7188,33 +7191,18 @@ async function loadSetupInfo(assistant = currentAssistant) {
       const step5H3 = document.getElementById('setup-step-5');
       const step5DescP = document.getElementById('setup-step-5-desc');
 
-      if (resolvedAssistant === 'copilot') {
-        if (introP) introP.setAttribute('data-i18n', 'copilot_setup_modal_intro');
-        if (stepCloneH3) stepCloneH3.setAttribute('data-i18n', 'copilot_setup_step_clone');
-        if (stepCloneDescP) stepCloneDescP.setAttribute('data-i18n', 'copilot_setup_step_clone_desc');
-        if (step1H3) step1H3.setAttribute('data-i18n', 'copilot_setup_step_1');
-        if (step1DescP) step1DescP.setAttribute('data-i18n', 'copilot_setup_step_1_desc');
-        if (step2H3) step2H3.setAttribute('data-i18n', 'copilot_setup_step_2');
-        if (step2DescP) step2DescP.setAttribute('data-i18n', 'copilot_setup_step_2_desc');
-        if (step3H3) step3H3.setAttribute('data-i18n', 'copilot_setup_step_3');
-        if (step4H3) step4H3.setAttribute('data-i18n', 'copilot_setup_step_4');
-        if (step4DescP) step4DescP.setAttribute('data-i18n', 'copilot_setup_step_4_desc');
-        if (step5H3) step5H3.setAttribute('data-i18n', 'copilot_setup_step_5');
-        if (step5DescP) step5DescP.setAttribute('data-i18n', 'copilot_setup_step_5_desc');
-      } else {
-        if (introP) introP.setAttribute('data-i18n', 'setup_modal_intro');
-        if (stepCloneH3) stepCloneH3.setAttribute('data-i18n', 'setup_step_clone');
-        if (stepCloneDescP) stepCloneDescP.setAttribute('data-i18n', 'setup_step_clone_desc');
-        if (step1H3) step1H3.setAttribute('data-i18n', 'setup_step_1');
-        if (step1DescP) step1DescP.setAttribute('data-i18n', 'setup_step_1_desc');
-        if (step2H3) step2H3.setAttribute('data-i18n', 'setup_step_2');
-        if (step2DescP) step2DescP.setAttribute('data-i18n', 'setup_step_2_desc');
-        if (step3H3) step3H3.setAttribute('data-i18n', 'setup_step_3');
-        if (step4H3) step4H3.setAttribute('data-i18n', 'setup_step_4');
-        if (step4DescP) step4DescP.setAttribute('data-i18n', 'setup_step_4_desc');
-        if (step5H3) step5H3.setAttribute('data-i18n', 'setup_step_5');
-        if (step5DescP) step5DescP.setAttribute('data-i18n', 'setup_step_5_desc');
-      }
+      if (introP) introP.setAttribute('data-i18n', 'copilot_setup_modal_intro');
+      if (stepCloneH3) stepCloneH3.setAttribute('data-i18n', 'copilot_setup_step_clone');
+      if (stepCloneDescP) stepCloneDescP.setAttribute('data-i18n', 'copilot_setup_step_clone_desc');
+      if (step1H3) step1H3.setAttribute('data-i18n', 'copilot_setup_step_1');
+      if (step1DescP) step1DescP.setAttribute('data-i18n', 'copilot_setup_step_1_desc');
+      if (step2H3) step2H3.setAttribute('data-i18n', 'copilot_setup_step_2');
+      if (step2DescP) step2DescP.setAttribute('data-i18n', 'copilot_setup_step_2_desc');
+      if (step3H3) step3H3.setAttribute('data-i18n', 'copilot_setup_step_3');
+      if (step4H3) step4H3.setAttribute('data-i18n', 'copilot_setup_step_4');
+      if (step4DescP) step4DescP.setAttribute('data-i18n', 'copilot_setup_step_4_desc');
+      if (step5H3) step5H3.setAttribute('data-i18n', 'copilot_setup_step_5');
+      if (step5DescP) step5DescP.setAttribute('data-i18n', 'copilot_setup_step_5_desc');
 
       // Render to DOM
       const jsonCodeEl = document.getElementById('code-setup-json');

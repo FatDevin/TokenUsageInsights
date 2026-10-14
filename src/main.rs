@@ -12,6 +12,8 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
+mod antigravity;
+mod antigravity_metadata;
 mod browser;
 mod cli;
 mod config;

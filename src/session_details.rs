@@ -96,9 +96,13 @@ pub(crate) fn parse_session_timeline_file(
     })?;
     let reader = BufReader::new(file);
     match assistant {
-        "antigravity" => {
-            parse_antigravity_timeline(reader, db_entries, &mut timeline, &mut metadata)
-        }
+        "antigravity" => parse_antigravity_timeline(
+            reader,
+            db_entries,
+            &mut timeline,
+            &mut metadata,
+            source_kind == crate::antigravity::SOURCE_KIND,
+        ),
         "copilot" => parse_copilot_timeline_filtered(
             reader,
             db_entries,

@@ -1484,6 +1484,108 @@ fn get_antigravity_session_name(base_dir: &Path, session_id: &str) -> Option<Str
     selector.into_name()
 }
 
+/// Native records supersede hook snapshots only for the same source/session.
+fn sync_antigravity_usage_logs_with_cancel(
+    conn: &mut Connection,
+    root: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    sync_hook_usage_logs_with_cancel(conn, "antigravity", root, should_cancel)?;
+    let root = crate::config::absolute_root(root);
+    let source_key = encode_hex(root.as_os_str().as_encoded_bytes());
+    let source_kind = crate::antigravity::SOURCE_KIND;
+    let sync_states = load_sync_state_for_prefix(conn, "antigravity");
+    for path in crate::antigravity::find_session_files(&root)? {
+        if should_cancel() {
+            return Ok(());
+        }
+        let session_id =
+            crate::antigravity::session_id(&path).ok_or("無效的 Antigravity session 路徑")?;
+        let transcript = path.to_string_lossy().into_owned();
+        let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+        // Metadata may arrive after the transcript (including in SQLite WAL).
+        // Include all source revisions so a later model resolution is imported.
+        let modified = {
+            use std::hash::{Hash, Hasher};
+            let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+            for file in [
+                path.clone(),
+                root.join("conversations").join(format!("{session_id}.db")),
+                root.join("conversations")
+                    .join(format!("{session_id}.db-wal")),
+            ] {
+                if let Ok(meta) = fs::metadata(file) {
+                    meta.len().hash(&mut fingerprint);
+                    meta.modified().ok().hash(&mut fingerprint);
+                }
+            }
+            (fingerprint.finish() & i64::MAX as u64) as i64
+        };
+        let state_key =
+            source_sync_key("antigravity", &root, &portable_relative_path(&root, &path));
+        let legacy_rows: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM usage_entries WHERE assistant_type = 'antigravity'
+             AND source_kind = 'legacy' AND session_id = ? AND transcript_path = ?)",
+                params![session_id, transcript],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if sync_states.get(&state_key) == Some(&(metadata.len(), modified)) && !legacy_rows {
+            continue;
+        }
+        // Wait for the writer to finish its last line before replacing a snapshot.
+        if metadata.len() > 0 {
+            let mut file = File::open(&path).map_err(|e| e.to_string())?;
+            file.seek(SeekFrom::End(-1)).map_err(|e| e.to_string())?;
+            let mut byte = [0];
+            file.read_exact(&mut byte).map_err(|e| e.to_string())?;
+            if byte[0] != b'\n' {
+                continue;
+            }
+        }
+        let mut entries = match crate::antigravity::parse_session(&path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!("解析 Antigravity session {} 失敗: {error}", path.display());
+                continue;
+            }
+        };
+        // Old transcripts may lack usage entirely. Preserve their hook records.
+        if entries.is_empty() {
+            continue;
+        }
+        let name = get_antigravity_session_name(&root, session_id);
+        for entry in &mut entries {
+            entry.source_dir_key = Some(source_key.clone());
+            entry.session_name = name.clone();
+            if entry.model.is_none() {
+                entry.model = Some("Unknown Model".to_owned());
+            }
+        }
+        if should_cancel() {
+            return Ok(());
+        }
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM usage_entries WHERE assistant_type = 'antigravity' AND session_id = ?
+             AND ((source_kind = ? AND source_dir_key = ?)
+                  OR (source_kind = 'legacy' AND transcript_path = ?))",
+            params![session_id, source_kind, source_key, transcript],
+        )
+        .map_err(|e| e.to_string())?;
+        register_usage_source_directory(&tx, "antigravity", source_kind, &source_key, &root)?;
+        insert_usage_entries(&tx, "antigravity", "Antigravity", &entries)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
+            params![state_key, metadata.len() as i64, modified],
+        ).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        bump_sync_data_revision();
+    }
+    Ok(())
+}
+
 fn get_copilot_session_name(copilot_dir: &Path, session_id: &str) -> Option<String> {
     let events_path = copilot_dir
         .join("session-state")
@@ -1710,6 +1812,27 @@ fn sync_hook_usage_logs_with_cancel(
                 let mut resolved_names = HashMap::<String, Option<String>>::new();
                 let mut session_names_to_update = HashMap::<String, String>::new();
                 for entry in &parsed_entries {
+                    // Once native usage is authoritative, hook updates must not
+                    // reintroduce totals while a transcript is being written or
+                    // temporarily unreadable. Matching the path isolates roots.
+                    if assistant_type == "antigravity" {
+                        let native_exists: bool = tx
+                            .query_row(
+                                "SELECT EXISTS(SELECT 1 FROM usage_entries
+                             WHERE assistant_type = 'antigravity' AND source_kind = ?
+                             AND session_id = ? AND transcript_path = ?)",
+                                params![
+                                    crate::antigravity::SOURCE_KIND,
+                                    entry.session_id,
+                                    entry.transcript_path.as_deref()
+                                ],
+                                |row| row.get(0),
+                            )
+                            .map_err(|e| format!("檢查 Antigravity 原生使用量失敗: {e}"))?;
+                        if native_exists {
+                            continue;
+                        }
+                    }
                     let tokens = entry.tokens.as_ref();
                     let delta = entry.delta_tokens.as_ref();
                     let cost = entry.cost.as_ref();
@@ -5194,12 +5317,12 @@ fn insert_usage_entries(
                     assistant_type, source_kind, usage_identity, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
                     delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
-                    duration_ms, premium_requests, reported_cost_usd, reasoning_effort
+                    duration_ms, premium_requests, reported_cost_usd, reasoning_effort, source_dir_key
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?
+                    ?, ?, ?, ?, ?
                 )",
             params![
                 assistant_type,
@@ -5231,6 +5354,7 @@ fn insert_usage_entries(
                 cost.and_then(|value| value.total_premium_requests.map(|v| v as i64)),
                 cost.and_then(|value| value.reported_cost_usd),
                 entry.reasoning_effort.as_deref(),
+                entry.source_dir_key.as_deref(),
             ],
         )
         .map_err(|error| format!("寫入 {assistant_label} 資料庫失敗: {error}"))?;
@@ -5584,7 +5708,7 @@ fn sync_configured_sources_with_cancel(
                     should_cancel,
                 ),
                 Harness::Antigravity => {
-                    sync_hook_usage_logs_with_cancel(conn, "antigravity", root, should_cancel)
+                    sync_antigravity_usage_logs_with_cancel(conn, root, should_cancel)
                 }
                 Harness::Copilot => {
                     sync_hook_usage_logs_with_cancel(conn, "copilot", root, should_cancel)
@@ -7664,6 +7788,181 @@ mod tests {
             entry.delta_tokens.as_ref().map(|tokens| tokens.input),
             Some(42_530)
         );
+    }
+
+    #[test]
+    fn antigravity_native_sync_without_statusline_is_scoped_and_idempotent() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let root = temp_jsonl_path("antigravity-native").with_extension("");
+        let other = root.join("other");
+        let relative = "brain/shared/.system_generated/logs/transcript_full.jsonl";
+        let path = root.join(relative);
+        let other_path = other.join(relative);
+        let record = "{\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-10-10T01:00:00Z\",\"input_tokens\":12,\"cache_read_tokens\":80,\"output_tokens\":3}\n";
+        for file in [&path, &other_path] {
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, record).unwrap();
+        }
+        for dir in [&root, &other, &root] {
+            sync_antigravity_usage_logs_with_cancel(&mut conn, dir, &|| false).unwrap();
+        }
+        let totals: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(delta_input), SUM(delta_cache_read), SUM(delta_total)
+             FROM usage_entries WHERE assistant_type = 'antigravity'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(totals, (2, 24, 160, 190));
+        // Partial writes leave the previous snapshot intact, then import on completion.
+        fs::write(&path, format!("{record}{{\"type\":")).unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        fs::write(&path, format!("{record}{record}")).unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+        // Truncation replaces only this source; malformed data preserves prior rows.
+        fs::write(&path, "invalid\n").unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        let healthy_path =
+            root.join("brain/z-healthy/.system_generated/logs/transcript_full.jsonl");
+        fs::create_dir_all(healthy_path.parent().unwrap()).unwrap();
+        fs::write(&healthy_path, record).unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 4);
+        fs::write(&path, record).unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_native_reloads_late_metadata_and_preserves_model_on_read_error() {
+        fn field(number: u32, value: &[u8]) -> Vec<u8> {
+            let mut tag = (number << 3) | 2;
+            let mut bytes = Vec::new();
+            while tag >= 128 {
+                bytes.push((tag as u8 & 127) | 128);
+                tag >>= 7;
+            }
+            bytes.push(tag as u8);
+            assert!(value.len() < 128);
+            bytes.push(value.len() as u8);
+            bytes.extend_from_slice(value);
+            bytes
+        }
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let root = temp_jsonl_path("antigravity-late-metadata").with_extension("");
+        let path = root.join("brain/a-session/.system_generated/logs/transcript_full.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let record = "{\"type\":\"PLANNER_RESPONSE\",\"step_index\":7,\"created_at\":\"2026-10-10T01:00:00Z\",\"input_tokens\":12,\"output_tokens\":3}\n";
+        fs::write(&path, record).unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        let model = |conn: &Connection| -> String {
+            conn.query_row(
+                "SELECT model FROM usage_entries WHERE session_id = 'a-session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(model(&conn), "Unknown Model");
+        fs::create_dir_all(root.join("conversations")).unwrap();
+        let database = root.join("conversations/a-session.db");
+        {
+            let metadata = Connection::open(&database).unwrap();
+            metadata.execute_batch("CREATE TABLE gen_metadata (data BLOB); CREATE TABLE steps (idx INTEGER, metadata BLOB);").unwrap();
+            let mut generation = field(4, b"generation-id");
+            generation.extend(field(1, &field(19, b"agy-demo-medium")));
+            metadata
+                .execute("INSERT INTO gen_metadata VALUES (?)", params![generation])
+                .unwrap();
+            metadata
+                .execute(
+                    "INSERT INTO steps VALUES (7, ?)",
+                    params![field(12, b"generation-id")],
+                )
+                .unwrap();
+        }
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        assert_eq!(model(&conn), "Gemini 4 Argon (Medium)");
+        // The transcript did not change. A temporarily invalid metadata database
+        // must preserve the established model without starving later sessions.
+        fs::write(&database, b"temporarily invalid SQLite data").unwrap();
+        let healthy = root.join("brain/z-session/.system_generated/logs/transcript_full.jsonl");
+        fs::create_dir_all(healthy.parent().unwrap()).unwrap();
+        fs::write(&healthy, record).unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        assert_eq!(model(&conn), "Gemini 4 Argon (Medium)");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_native_replaces_hooks_but_preserves_legacy_only_sessions() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let root = temp_jsonl_path("antigravity-mixed").with_extension("");
+        let path = root.join("brain/native/.system_generated/logs/transcript_full.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::create_dir_all(root.join("usage")).unwrap();
+        let mut native_hook = sample_import_record().entry;
+        native_hook.session_id = "native".to_owned();
+        let mut legacy_hook = native_hook.clone();
+        legacy_hook.session_id = "legacy-only".to_owned();
+        let hook = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&native_hook).unwrap(),
+            serde_json::to_string(&legacy_hook).unwrap()
+        );
+        fs::write(root.join("usage/usage-2026-10-10.jsonl"), &hook).unwrap();
+        fs::write(&path, "{\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-10-10T01:00:00Z\",\"input_tokens\":12,\"output_tokens\":3}\n").unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        // Newly arriving hook snapshots must not resurrect duplicate costs.
+        native_hook.turn_no += 1;
+        fs::write(
+            root.join("usage/usage-2026-10-10.jsonl"),
+            format!("{hook}{}\n", serde_json::to_string(&native_hook).unwrap()),
+        )
+        .unwrap();
+        fs::write(&path, "{\"type\":").unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        native_hook.turn_no += 1;
+        fs::write(
+            root.join("usage/usage-2026-10-11.jsonl"),
+            format!("{}\n", serde_json::to_string(&native_hook).unwrap()),
+        )
+        .unwrap();
+        fs::write(&path, "invalid\n").unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        let rows: (i64, i64, i64) = conn.query_row(
+            "SELECT COUNT(*), SUM(source_kind = 'legacy'), SUM(source_kind = 'antigravity-session') FROM usage_entries", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(rows, (2, 1, 1));
+        let model: String = conn
+            .query_row(
+                "SELECT model FROM usage_entries WHERE source_kind = 'antigravity-session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(model, "Unknown Model");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

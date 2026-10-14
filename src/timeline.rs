@@ -46,13 +46,19 @@ pub enum TimelineItem {
 }
 
 pub fn parse_antigravity_timeline(
-    reader: BufReader<File>,
+    reader: impl BufRead,
     db_entries: &HashMap<u32, (TokenStats, String)>,
     timeline: &mut Vec<TimelineItem>,
     metadata: &mut HashMap<String, serde_json::Value>,
+    native_usage: bool,
 ) {
     let mut turn_no = 1;
-    let mut current_model = "Gemini".to_string();
+    let mut current_model = if native_usage {
+        UNKNOWN_MODEL
+    } else {
+        "Gemini"
+    }
+    .to_string();
     let mut pending_tool_indices: Vec<usize> = Vec::new();
 
     for line_res in reader.lines() {
@@ -95,17 +101,23 @@ pub fn parse_antigravity_timeline(
                     .unwrap_or("")
                     .to_string();
                 let reasoning = step
-                    .get("reasoning")
+                    .get("thinking")
+                    .or_else(|| step.get("reasoning"))
                     .and_then(|r| r.as_str())
                     .map(|s| s.to_string());
 
-                if !content.is_empty() {
+                // Native usage records every planner response, including tool-only
+                // responses. Legacy statusline rows retain their text-reply numbering.
+                if native_usage || !content.is_empty() {
                     // 讀取該回合在 SQLite 中的增量 token
                     let (tokens, model_name) =
                         if let Some((stats, model)) = db_entries.get(&turn_no) {
                             current_model = model.clone();
                             (Some(stats.clone()), current_model.clone())
                         } else {
+                            if native_usage {
+                                current_model = UNKNOWN_MODEL.to_string();
+                            }
                             (None, current_model.clone())
                         };
 
@@ -3192,6 +3204,104 @@ pub fn parse_mcode_timeline(
         "selected_model".to_string(),
         serde_json::Value::String(current_model),
     );
+}
+
+#[cfg(test)]
+mod antigravity_tests {
+    use super::*;
+
+    fn stats(input: u64) -> TokenStats {
+        TokenStats {
+            input,
+            output: 2,
+            cache_read: Some(3),
+            cache_write: None,
+            cache_write_5m: None,
+            cache_write_1h: None,
+            reasoning: None,
+            total: input + 5,
+        }
+    }
+
+    #[test]
+    fn native_antigravity_counts_tool_only_responses_and_keeps_usage_aligned() {
+        let transcript = concat!(
+            "{\"type\":\"USER_INPUT\",\"content\":\"Check files\"}\n",
+            "{\"type\":\"PLANNER_RESPONSE\",\"thinking\":\"Inspect first\",\"tool_calls\":[{\"name\":\"ls\",\"args\":{}}]}\n",
+            "{\"type\":\"LIST_DIRECTORY\",\"content\":\"README.md\"}\n",
+            "{\"type\":\"PLANNER_RESPONSE\",\"content\":\"Done\",\"reasoning\":\"Legacy field\"}\n",
+            "{\"type\":\"PLANNER_RESPONSE\",\"content\":\"No model recorded\"}\n",
+        );
+        let entries = HashMap::from([
+            (1, (stats(10), "model-a".to_string())),
+            (2, (stats(20), "model-b".to_string())),
+        ]);
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_antigravity_timeline(
+            transcript.as_bytes(),
+            &entries,
+            &mut timeline,
+            &mut metadata,
+            true,
+        );
+        let replies: Vec<_> = timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::AgentReply {
+                    turn_no,
+                    model,
+                    tokens,
+                    reasoning,
+                    ..
+                } => Some((
+                    *turn_no,
+                    model.as_str(),
+                    tokens.as_ref().map(|s| s.input),
+                    reasoning.as_deref(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replies,
+            vec![
+                (1, "model-a", Some(10), Some("Inspect first")),
+                (2, "model-b", Some(20), Some("Legacy field")),
+                (3, UNKNOWN_MODEL, None, None),
+            ]
+        );
+        assert!(timeline.iter().any(|item| matches!(item,
+            TimelineItem::ToolStep { tool_name, stdout, status, .. }
+            if tool_name == "ls" && stdout == "README.md" && status == "success"
+        )));
+    }
+
+    #[test]
+    fn legacy_antigravity_keeps_text_reply_turn_numbering() {
+        let transcript = concat!(
+            "{\"type\":\"PLANNER_RESPONSE\",\"tool_calls\":[{\"name\":\"ls\"}]}\n",
+            "{\"type\":\"PLANNER_RESPONSE\",\"content\":\"Done\"}\n",
+        );
+        let entries = HashMap::from([(1, (stats(10), "legacy-model".to_string()))]);
+        let mut timeline = Vec::new();
+        parse_antigravity_timeline(
+            transcript.as_bytes(),
+            &entries,
+            &mut timeline,
+            &mut HashMap::new(),
+            false,
+        );
+        let replies: Vec<_> = timeline
+            .iter()
+            .filter(|item| matches!(item, TimelineItem::AgentReply { .. }))
+            .collect();
+        assert_eq!(replies.len(), 1);
+        assert!(
+            matches!(replies[0], TimelineItem::AgentReply { turn_no: 1, model, tokens: Some(tokens), .. }
+            if model == "legacy-model" && tokens.input == 10)
+        );
+    }
 }
 
 #[cfg(test)]

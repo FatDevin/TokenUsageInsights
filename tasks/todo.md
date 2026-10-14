@@ -396,3 +396,42 @@
 - Remote：PR #29 head `3ddc533ccf8ebe99d5bbdb21a334fdd675fe386c`；PR #30 head `d0b6052de11a4cf15e39fd43c0f5c45abe95f4aa`。
 - PR #29 與 PR #30 目前皆為 open、GitHub `mergeable=true`；`git merge-tree --write-tree` 以 PR #29 head 與 PR #30 head 模擬合併成功，且 PR #29 head 是 PR #30 的 ancestor。
 - 替代 PR 依官方現行定價頁恢復 Grok Build 0.1 的獨立歷史費率，並保留不誤套 Grok 4.5 的安全判斷。
+
+# 2026-10-15 Antigravity 原生 Session 匯入
+
+## 目標與驗收
+- 不設定 statusline 即可從 Antigravity 原生 transcript 匯入 Token，保留會話時間軸。
+- 以可驗證 metadata 歸屬模型；未知模型不猜價；相同 session 的舊 usage 不重複加總。
+- 更新設定偵測、各語系指引、README 與公開網站說明，保留 Copilot 設定需求。
+
+## 計畫
+- [x] A：確認原生格式、模型 metadata、Token 語意與既有同步慣例。
+- [x] B：實作原生匯入與舊資料相容、時間軸對齊。
+- [x] C：更新設定與文件，補回歸測試。
+- [x] D：執行 fmt、測試、clippy、零警告 release build、前端檢查與本機唯讀來源驗證。
+- [x] E：檢查差異、記錄結果並建立正體中文詳細 commit。
+
+## 風險與回滾
+- 中風險：影響 Antigravity Token 與費用彙整；來源資料只讀，不修改個人 session。
+- 原生來源與 legacy 去重必須有測試；避免以目前設定推測歷史模型。
+- 回滾以 revert 本次 commit，重新由來源同步；驗證使用獨立暫存資料庫。
+
+## 環境與工作筆記
+- Rust/Cargo、Node.js、Windows PowerShell；不新增套件，個人資料不得加入版本控制。
+- 原生 transcript 已確認有 input_tokens、cache_read_tokens、output_tokens；模型依 generation UUID 對應原生 SQLite metadata；內部 UID 別名以本機 `agy models` 清單確認，未使用目前設定猜測歷史模型。
+
+
+## 結果
+- 新增原生 transcript 與唯讀 SQLite metadata 解析，使用每次回應的輸入／快取／輸出用量；保留 legacy-only session 並去重。
+- 同步支援來源隔離、metadata 延後到達、部分寫入、損壞記錄隔離；模型資訊讀取暫時失敗時保留先前快照並重試。
+- 修正工具專用回應與 thinking 在時間軸的 Token／模型對齊。
+- 五種語言 README、設定指南與空白狀態同步更新；Copilot 指引維持 statusline 流程。
+- `src/updater.rs` 只做 C 字串、clamp 與 iterator 的等價修正，消除目前工具鏈偵測到的 10 個既有 Clippy 警告。
+- `cargo test --locked --quiet`：416 單元測試 + 1 多來源整合測試 + 2 CLI 測試通過。
+- `cargo clippy --locked --all-targets --all-features -- -D warnings` 通過。
+- `scripts/build.ps1`：同樣 419 項 release 測試及 `cargo build --release --locked --all-targets` 通過，零警告、零錯誤。
+- `node --test tests/antigravity-setup.test.mjs tests/session-utils.test.mjs tests/chart-utils.test.mjs`：8/8 通過；app.js / i18n.js 語法檢查通過。
+- 使用 C: 暫存 target 完成建置，避免 G: 空間不足；測試來源與資料庫使用隔離暫存目錄。
+- 使用者提供的 session 快照驗證：230 回應；輸入 2,039,363、快取 28,280,788、輸出 319,385，模型 Gemini 4 Argon (Medium)，現有價格表估算 US$20.2013096；API 與時間軸加總一致。
+- 瀏覽器確認原生指南、Copilot 舊指南、Session 抽屜及 390px 原生指南不橫向溢出；無 console errors。截圖保留於暫存目錄，未提交個人會話資料。
+- 最終 `cargo fmt -- --check` 與 `git diff --check` 通過。未發佈版本或改動正式使用量資料庫。

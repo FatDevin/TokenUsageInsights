@@ -46,7 +46,7 @@ http://localhost:3003
 
 | 工具 | 是否需要額外設定 | 預設資料來源 | 說明 |
 | --- | --- | --- | --- |
-| Google Antigravity CLI | 需要 | `~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl` | 透過 `statusline-token.sh` 或 Windows `statusline-token.ps1` 收集 Token 資料 |
+| Google Antigravity CLI | 不需要 | `~/.gemini/antigravity-cli/brain/` 與 `conversations/` | 直接讀取原生會話 Token 與模型資訊；相容舊版 `usage/` 收集檔 |
 | GitHub Copilot CLI | 需要 | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | 透過 `statusline-token.sh` 或 Windows `statusline-token.ps1` 收集 Token 資料 |
 | GitHub Copilot App | 不需要 | `~/.copilot/data.db`、`~/.copilot/session-store.db` | 看板直接讀取 Copilot 桌面應用程式的本機 SQLite |
 | GitHub Copilot Chat（VS Code） | 不需要 | VS Code `workspaceStorage/chatSessions` | 看板直接掃描 VS Code Stable 與 Insiders 的本機聊天 Session |
@@ -148,58 +148,26 @@ http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/To
 
 * * *
 
-## Google Antigravity CLI 設定
+## Google Antigravity CLI 資料來源
 
-Antigravity CLI 需要把本專案的 Status Line 腳本接到 `settings.json`。腳本會把每次對話後的 Token 累計與增量寫入：
-
-```text
-~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl
-```
-
-### 1. 安裝收集腳本
-
-完成一行安裝後，執行：
-
-```bash
-mkdir -p ~/.gemini/antigravity-cli && cp ~/.local/share/token-usage-insights/shell/antigravity/statusline-token.sh ~/.gemini/antigravity-cli/statusline-token.sh && chmod +x ~/.gemini/antigravity-cli/statusline-token.sh
-```
-
-若使用自訂安裝位置，請將指令中的 `~/.local/share/token-usage-insights` 替換為 `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` 指定的位置。
-
-### 2. 設定 `~/.gemini/antigravity-cli/settings.json`
-
-若檔案不存在，可以建立以下內容。若檔案已存在，請只合併 `statusLine` 區塊，不要覆蓋原本設定。
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "/ABSOLUTE/HOME/.gemini/antigravity-cli/statusline-token.sh",
-    "padding": 1
-  }
-}
-```
-
-請將 `/ABSOLUTE/HOME` 替換成 `echo $HOME` 顯示的實際家目錄路徑，例如 `/Users/your-name` 或 `/home/your-name`。
-
-### 3. 驗證
-
-```bash
-echo '{}' | ~/.gemini/antigravity-cli/statusline-token.sh
-jq . ~/.gemini/antigravity-cli/settings.json
-```
-
-完成後重新進入 Antigravity CLI Session，狀態列會輸出類似格式：
+**Antigravity CLI 不需要設定 Status Line、Hook 或安裝額外收集腳本。** 使用 CLI 進行對話後，看板會直接讀取原生記錄：
 
 ```text
-model-name • #3 • input 12.3k • cache 4.5k/0 • output 1.2k • reasoning 500 • total 18.5k
+~/.gemini/antigravity-cli/brain/<session-id>/.system_generated/logs/transcript_full.jsonl
+~/.gemini/antigravity-cli/conversations/<session-id>.db
 ```
+
+看板會讀取每次回應的輸入、快取讀取與輸出 Token，並從對應會話資料庫取得模型資訊以估算費用。費用是依模型費率換算的估算值，不等於 Antigravity 實際扣款；模型或價格無法辨識時，無法可靠估算費用，也不代表免費。
+
+Windows 預設資料目錄為 `%USERPROFILE%\.gemini\antigravity-cli`；可使用 `ANTIGRAVITY_DIR` 或額外資料來源設定指定其他位置。複製歷史資料時，請一併保留 `brain/` 與 `conversations/`。
+
+舊版 Status Line 產生的 `usage/usage-YYYY-MM-DD.jsonl` 仍受支援，不需要刪除既有記錄或設定。
 
 * * *
 
 ## GitHub Copilot CLI 設定
 
-Copilot CLI 與 Antigravity CLI 一樣，需要把本專案的 Status Line 腳本接到 `settings.json`。腳本會把 Token 資料寫入：
+Copilot CLI 需要把本專案的 Status Line 腳本接到 `settings.json`。腳本會把 Token 資料寫入：
 
 ```text
 ~/.copilot/usage/usage-YYYY-MM-DD.jsonl
@@ -645,7 +613,7 @@ additional_sources:
 | `claude`、`cursor` | `projects/` |
 | `copilot` | `usage/`、`session-state/`、`session-store.db`；同目錄有 Copilot App 資料時也會一併匯入 |
 | `copilot_app` | `data.db`、`session-store.db`、`session-state/`；適用於另外存放的 Copilot App 目錄 |
-| `antigravity` | `usage/` 與 `brain/`；需包含原本由 Status Line 收集的用量檔案 |
+| `antigravity` | `brain/` 與 `conversations/` 原生會話記錄；亦支援舊版 `usage/` |
 | `grok`、`muse` | `sessions/` |
 | `pi`、`omp` | `agent/sessions/` |
 | `mcode` | `sessions/` 與選用的 `sqlite/runtime-state.sqlite`，即 `.minimax/v2` 根目錄 |
@@ -986,7 +954,7 @@ systemctl --user reset-failed
 依工具檢查資料來源是否存在：
 
 ```bash
-ls ~/.gemini/antigravity-cli/usage
+ls ~/.gemini/antigravity-cli/brain
 ls ~/.copilot/usage
 ls ~/.copilot/data.db ~/.copilot/session-store.db
 ls ~/.codex/sessions
@@ -999,12 +967,12 @@ ls ~/.omp/agent/sessions
 ls ~/.local/share/muse/sessions
 ```
 
-Antigravity CLI 與 Copilot CLI 還需要確認 `settings.json` 已設定 `statusLine`，且腳本具備執行權限。
+Copilot CLI 還需要確認 `settings.json` 已設定 `statusLine`，且腳本具備執行權限。
 
 Windows PowerShell 可直接檢查原生資料目錄：
 
 ```powershell
-Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\usage"
+Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\brain"
 Get-ChildItem "$env:USERPROFILE\.copilot\usage"
 Get-ChildItem "$env:USERPROFILE\.copilot\data.db", "$env:USERPROFILE\.copilot\session-store.db"
 Get-ChildItem "$env:USERPROFILE\.codex\sessions"
@@ -1017,7 +985,7 @@ Get-ChildItem "$env:USERPROFILE\.omp\agent\sessions"
 Get-ChildItem "$env:USERPROFILE\.local\share\muse\sessions"
 ```
 
-### Status Line 腳本無法執行
+### Status Line 腳本無法執行（Copilot CLI 或選用舊版 Antigravity 收集器）
 
 ```bash
 command -v jq

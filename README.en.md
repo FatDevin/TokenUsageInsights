@@ -46,7 +46,7 @@ http://localhost:3003
 
 | Tool | Additional setup | Default data source | Description |
 | --- | --- | --- | --- |
-| Google Antigravity CLI | Required | `~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl` | Collects token data through `statusline-token.sh` or the Windows `statusline-token.ps1` |
+| Google Antigravity CLI | Not required | `~/.gemini/antigravity-cli/brain/` / `conversations/` | Reads native session tokens and model metadata; legacy `usage/` files remain supported |
 | GitHub Copilot CLI | Required | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | Collects token data through `statusline-token.sh` or the Windows `statusline-token.ps1` |
 | GitHub Copilot App | Not required | `~/.copilot/data.db`, `~/.copilot/session-store.db` | The dashboard reads the desktop app's local SQLite databases directly |
 | GitHub Copilot Chat (VS Code) | Not required | VS Code `workspaceStorage/chatSessions` | The dashboard scans local chat sessions from VS Code Stable and Insiders directly |
@@ -149,58 +149,24 @@ http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/To
 
 * * *
 
-## Google Antigravity CLI setup
+## Google Antigravity CLI Local data sources
 
-Antigravity CLI requires connecting this project's Status Line script to `settings.json`. The script writes cumulative and incremental tokens after each conversation to:
-
-```text
-~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl
-```
-
-### 1. Install the collector script
-
-After the one-line installation, run:
-
-```bash
-mkdir -p ~/.gemini/antigravity-cli && cp ~/.local/share/token-usage-insights/shell/antigravity/statusline-token.sh ~/.gemini/antigravity-cli/statusline-token.sh && chmod +x ~/.gemini/antigravity-cli/statusline-token.sh
-```
-
-If you use a custom installation location, replace `~/.local/share/token-usage-insights` in the command with the location specified by `TOKEN_USAGE_INSIGHTS_INSTALL_DIR`.
-
-### 2. Configure `~/.gemini/antigravity-cli/settings.json`
-
-If the file does not exist, you can create it with the following content. If it already exists, merge only the `statusLine` block; do not overwrite the existing settings.
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "/ABSOLUTE/HOME/.gemini/antigravity-cli/statusline-token.sh",
-    "padding": 1
-  }
-}
-```
-
-Replace `/ABSOLUTE/HOME` with the actual home-directory path shown by `echo $HOME`, such as `/Users/your-name` or `/home/your-name`.
-
-### 3. Verify
-
-```bash
-echo '{}' | ~/.gemini/antigravity-cli/statusline-token.sh
-jq . ~/.gemini/antigravity-cli/settings.json
-```
-
-Afterward, re-enter an Antigravity CLI session. The status line will output a format similar to:
+**Antigravity CLI requires no Status Line setup, hooks, or collector scripts.** After using the CLI, the dashboard reads these native records:
 
 ```text
-model-name • #3 • input 12.3k • cache 4.5k/0 • output 1.2k • reasoning 500 • total 18.5k
+~/.gemini/antigravity-cli/brain/<session-id>/.system_generated/logs/transcript_full.jsonl
+~/.gemini/antigravity-cli/conversations/<session-id>.db
 ```
+
+Input, cache-read, and output tokens are read per response. Model metadata from the session database is used to estimate costs. Estimates are not actual Antigravity charges; unknown models or prices prevent reliable estimates and do not mean usage is free.
+
+On Windows, the default root is `%USERPROFILE%\.gemini\antigravity-cli`. Override it with `ANTIGRAVITY_DIR` or additional source settings. When copying historical data, keep both `brain/` and `conversations/`. Legacy `usage/usage-YYYY-MM-DD.jsonl` files remain supported; existing files and settings do not need to be removed.
 
 * * *
 
 ## GitHub Copilot CLI setup
 
-Like Antigravity CLI, Copilot CLI requires connecting this project's Status Line script to `settings.json`. The script writes token data to:
+Copilot CLI requires connecting this project's Status Line script to `settings.json`. The script writes token data to:
 
 ```text
 ~/.copilot/usage/usage-YYYY-MM-DD.jsonl
@@ -627,7 +593,7 @@ additional_sources:
 | `claude`, `cursor` | `projects/` |
 | `copilot` | `usage/`, `session-state/`, `session-store.db`; App data in the same home is also imported |
 | `copilot_app` | `data.db`, `session-store.db`, `session-state/` in a separate App home |
-| `antigravity` | `usage/` and `brain/`, including existing Status Line usage logs |
+| `antigravity` | Native `brain/` and `conversations/` records; also supports legacy `usage/` |
 | `grok`, `muse` | `sessions/` |
 | `pi`, `omp` | `agent/sessions/` |
 | `mcode` | `sessions/` and optional `sqlite/runtime-state.sqlite` under `.minimax/v2` |
@@ -950,7 +916,7 @@ systemctl --user reset-failed
 Check whether the data source exists for each tool:
 
 ```bash
-ls ~/.gemini/antigravity-cli/usage
+ls ~/.gemini/antigravity-cli/brain
 ls ~/.copilot/usage
 ls ~/.copilot/data.db ~/.copilot/session-store.db
 ls ~/.codex/sessions
@@ -963,12 +929,12 @@ ls ~/.omp/agent/sessions
 ls ~/.local/share/muse/sessions
 ```
 
-Antigravity CLI and Copilot CLI also require `settings.json` to define `statusLine` and the scripts to have execute permission.
+Copilot CLI also requires `settings.json` to define `statusLine` and the scripts to have execute permission.
 
 On Windows PowerShell, inspect the native data directories directly:
 
 ```powershell
-Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\usage"
+Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\brain"
 Get-ChildItem "$env:USERPROFILE\.copilot\usage"
 Get-ChildItem "$env:USERPROFILE\.copilot\data.db", "$env:USERPROFILE\.copilot\session-store.db"
 Get-ChildItem "$env:USERPROFILE\.codex\sessions"
@@ -981,7 +947,7 @@ Get-ChildItem "$env:USERPROFILE\.omp\agent\sessions"
 Get-ChildItem "$env:USERPROFILE\.local\share\muse\sessions"
 ```
 
-### Status Line script cannot run
+### Status Line script cannot run (Copilot CLI or optional legacy Antigravity collector)
 
 ```bash
 command -v jq

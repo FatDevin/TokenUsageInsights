@@ -46,7 +46,7 @@ http://localhost:3003
 
 | 도구 | 추가 설정 | 기본 데이터 원본 | 설명 |
 | --- | --- | --- | --- |
-| Google Antigravity CLI | 필요 | `~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl` | `statusline-token.sh` 또는 Windows의 `statusline-token.ps1`로 Token 데이터를 수집 |
+| Google Antigravity CLI | 불필요 | `~/.gemini/antigravity-cli/brain/` / `conversations/` | 기본 Session Token 및 모델 정보를 읽으며 기존 `usage/` 파일도 지원 |
 | GitHub Copilot CLI | 필요 | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | `statusline-token.sh` 또는 Windows의 `statusline-token.ps1`로 Token 데이터를 수집 |
 | GitHub Copilot App | 불필요 | `~/.copilot/data.db`, `~/.copilot/session-store.db` | 대시보드가 데스크톱 앱의 로컬 SQLite를 직접 읽음 |
 | GitHub Copilot Chat(VS Code) | 불필요 | VS Code `workspaceStorage/chatSessions` | VS Code Stable 및 Insiders의 로컬 채팅 Session을 직접 스캔 |
@@ -149,58 +149,24 @@ http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/To
 
 * * *
 
-## Google Antigravity CLI 설정
+## Google Antigravity CLI 로컬 데이터 소스
 
-Antigravity CLI는 이 프로젝트의 Status Line 스크립트를 `settings.json`에 연결해야 합니다. 스크립트는 각 대화 후 누적 Token과 증분을 다음 위치에 기록합니다.
-
-```text
-~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl
-```
-
-### 1. 수집 스크립트 설치
-
-한 줄 설치가 끝난 후 다음을 실행합니다.
-
-```bash
-mkdir -p ~/.gemini/antigravity-cli && cp ~/.local/share/token-usage-insights/shell/antigravity/statusline-token.sh ~/.gemini/antigravity-cli/statusline-token.sh && chmod +x ~/.gemini/antigravity-cli/statusline-token.sh
-```
-
-사용자 지정 설치 위치를 사용한다면 명령의 `~/.local/share/token-usage-insights`를 `TOKEN_USAGE_INSIGHTS_INSTALL_DIR`로 지정한 위치로 바꾸세요.
-
-### 2. `~/.gemini/antigravity-cli/settings.json` 설정
-
-파일이 없다면 다음 내용으로 만들 수 있습니다. 이미 존재한다면 `statusLine` 블록만 병합하고 기존 설정을 덮어쓰지 마세요.
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "/ABSOLUTE/HOME/.gemini/antigravity-cli/statusline-token.sh",
-    "padding": 1
-  }
-}
-```
-
-`/ABSOLUTE/HOME`을 `echo $HOME`에 표시되는 실제 홈 디렉터리 경로(예: `/Users/your-name` 또는 `/home/your-name`)로 바꾸세요.
-
-### 3. 확인
-
-```bash
-echo '{}' | ~/.gemini/antigravity-cli/statusline-token.sh
-jq . ~/.gemini/antigravity-cli/settings.json
-```
-
-그 후 Antigravity CLI Session에 다시 들어가면 상태 표시줄에 다음과 비슷한 형식이 출력됩니다.
+**Antigravity CLI는 Status Line 설정, Hook 또는 수집 스크립트가 필요하지 않습니다.** CLI에서 대화한 후 다음 기본 기록을 직접 읽습니다.
 
 ```text
-model-name • #3 • input 12.3k • cache 4.5k/0 • output 1.2k • reasoning 500 • total 18.5k
+~/.gemini/antigravity-cli/brain/<session-id>/.system_generated/logs/transcript_full.jsonl
+~/.gemini/antigravity-cli/conversations/<session-id>.db
 ```
+
+각 응답의 입력, 캐시 읽기, 출력 Token과 Session 데이터베이스의 모델 정보로 비용을 추정합니다. 추정치는 Antigravity의 실제 청구 금액과 다를 수 있습니다. 모델이나 가격을 알 수 없으면 신뢰할 수 있는 추정이 불가능하며 무료를 의미하지 않습니다.
+
+Windows 기본 디렉터리는 `%USERPROFILE%\.gemini\antigravity-cli`입니다. `ANTIGRAVITY_DIR` 또는 추가 데이터 소스 설정으로 변경할 수 있습니다. 기록을 복사할 때 `brain/`과 `conversations/`를 모두 보관하세요. 기존 `usage/usage-YYYY-MM-DD.jsonl`도 지원하므로 기존 기록이나 설정을 삭제할 필요가 없습니다.
 
 * * *
 
 ## GitHub Copilot CLI 설정
 
-Copilot CLI도 Antigravity CLI와 마찬가지로 이 프로젝트의 Status Line 스크립트를 `settings.json`에 연결해야 합니다. 스크립트는 Token 데이터를 다음 위치에 기록합니다.
+Copilot CLI는 이 프로젝트의 Status Line 스크립트를 `settings.json`에 연결해야 합니다. 스크립트는 Token 데이터를 다음 위치에 기록합니다.
 
 ```text
 ~/.copilot/usage/usage-YYYY-MM-DD.jsonl
@@ -627,7 +593,7 @@ additional_sources:
 | `claude`, `cursor` | `projects/` |
 | `copilot` | `usage/`, `session-state/`, `session-store.db`. 같은 홈의 App 데이터도 가져옴 |
 | `copilot_app` | 별도 App 홈의 `data.db`, `session-store.db`, `session-state/` |
-| `antigravity` | 기존 Status Line 사용량 로그를 포함한 `usage/`, `brain/` |
+| `antigravity` | 기본 `brain/`, `conversations/` 기록 및 기존 `usage/` 지원 |
 | `grok`, `muse` | `sessions/` |
 | `pi`, `omp` | `agent/sessions/` |
 | `mcode` | `.minimax/v2` 아래 `sessions/` 및 선택적 `sqlite/runtime-state.sqlite` |
@@ -950,7 +916,7 @@ systemctl --user reset-failed
 도구별로 데이터 원본이 존재하는지 확인합니다.
 
 ```bash
-ls ~/.gemini/antigravity-cli/usage
+ls ~/.gemini/antigravity-cli/brain
 ls ~/.copilot/usage
 ls ~/.copilot/data.db ~/.copilot/session-store.db
 ls ~/.codex/sessions
@@ -963,12 +929,12 @@ ls ~/.omp/agent/sessions
 ls ~/.local/share/muse/sessions
 ```
 
-Antigravity CLI와 Copilot CLI는 `settings.json`에 `statusLine`이 설정되어 있고 스크립트에 실행 권한이 있는지도 확인해야 합니다.
+Copilot CLI는 `settings.json`에 `statusLine`이 설정되어 있고 스크립트에 실행 권한이 있는지도 확인해야 합니다.
 
 Windows PowerShell에서는 네이티브 데이터 디렉터리를 직접 확인할 수 있습니다.
 
 ```powershell
-Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\usage"
+Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\brain"
 Get-ChildItem "$env:USERPROFILE\.copilot\usage"
 Get-ChildItem "$env:USERPROFILE\.copilot\data.db", "$env:USERPROFILE\.copilot\session-store.db"
 Get-ChildItem "$env:USERPROFILE\.codex\sessions"
@@ -981,7 +947,7 @@ Get-ChildItem "$env:USERPROFILE\.omp\agent\sessions"
 Get-ChildItem "$env:USERPROFILE\.local\share\muse\sessions"
 ```
 
-### Status Line 스크립트를 실행할 수 없음
+### Status Line 스크립트를 실행할 수 없음 (Copilot CLI 또는 선택적인 기존 Antigravity 수집기)
 
 ```bash
 command -v jq

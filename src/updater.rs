@@ -371,11 +371,11 @@ fn get_process_cmdline(pid: u32) -> Option<Vec<String>> {
     use std::os::windows::ffi::OsStringExt;
 
     unsafe {
-        let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
         if ntdll.is_null() {
             return None;
         }
-        let func_ptr = GetProcAddress(ntdll, b"NtQueryInformationProcess\0".as_ptr());
+        let func_ptr = GetProcAddress(ntdll, c"NtQueryInformationProcess".as_ptr().cast());
         if func_ptr.is_null() {
             return None;
         }
@@ -456,11 +456,11 @@ fn get_process_cmdline(pid: u32) -> Option<Vec<String>> {
 #[cfg(windows)]
 fn get_process_ppid(pid: u32) -> Option<u32> {
     unsafe {
-        let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
         if ntdll.is_null() {
             return None;
         }
-        let func_ptr = GetProcAddress(ntdll, b"NtQueryInformationProcess\0".as_ptr());
+        let func_ptr = GetProcAddress(ntdll, c"NtQueryInformationProcess".as_ptr().cast());
         if func_ptr.is_null() {
             return None;
         }
@@ -803,11 +803,11 @@ fn get_process_cwd(pid: u32) -> Option<PathBuf> {
 #[cfg(windows)]
 fn get_process_relevant_envs(pid: u32) -> Option<Vec<(String, String)>> {
     unsafe {
-        let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
         if ntdll.is_null() {
             return None;
         }
-        let func_ptr = GetProcAddress(ntdll, b"NtQueryInformationProcess\0".as_ptr());
+        let func_ptr = GetProcAddress(ntdll, c"NtQueryInformationProcess".as_ptr().cast());
         if func_ptr.is_null() {
             return None;
         }
@@ -878,7 +878,7 @@ fn get_process_relevant_envs(pid: u32) -> Option<Vec<(String, String)>> {
 
         while all_u16.len() * 2 < MAX_ENV_BYTES {
             let bytes_to_page_end = 4096 - (curr_ptr & 0xFFF);
-            let read_size = bytes_to_page_end.max(512).min(4096);
+            let read_size = bytes_to_page_end.clamp(512, 4096);
             let mut page_buf = vec![0u8; read_size];
             let mut chunk_bytes_read = 0usize;
 
@@ -901,8 +901,8 @@ fn get_process_relevant_envs(pid: u32) -> Option<Vec<(String, String)>> {
 
             // 檢查是否已出現雙重 NUL 結尾
             let mut start = 0;
-            for i in 0..all_u16.len() {
-                if all_u16[i] == 0 {
+            for (i, &unit) in all_u16.iter().enumerate() {
+                if unit == 0 {
                     if i == start {
                         block_terminated = true;
                         break;
@@ -951,11 +951,11 @@ fn get_process_cwd(pid: u32) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
 
     unsafe {
-        let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
         if ntdll.is_null() {
             return None;
         }
-        let func_ptr = GetProcAddress(ntdll, b"NtQueryInformationProcess\0".as_ptr());
+        let func_ptr = GetProcAddress(ntdll, c"NtQueryInformationProcess".as_ptr().cast());
         if func_ptr.is_null() {
             return None;
         }

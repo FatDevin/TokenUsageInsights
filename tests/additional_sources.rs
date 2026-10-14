@@ -57,6 +57,20 @@ fn hook_session(root: &Path, session: &str) {
     );
 }
 
+fn antigravity_session(root: &Path, session: &str, input: u64) {
+    write_jsonl(
+        &root
+            .join("brain")
+            .join(session)
+            .join(".system_generated/logs/transcript_full.jsonl"),
+        &[
+            json!({"type":"USER_INPUT","created_at":"2026-09-11T10:00:00Z","content":"Native session without statusline"}),
+            json!({"type":"PLANNER_RESPONSE","step_index":1,"created_at":"2026-09-11T10:00:01Z","thinking":"Check the tool","input_tokens":input,"cache_read_tokens":200,"output_tokens":10,"tool_calls":[{"name":"list_directory","args":{}}]}),
+            json!({"type":"PLANNER_RESPONSE","step_index":2,"created_at":"2026-09-11T10:00:02Z","content":"Done","input_tokens":20,"cache_read_tokens":300,"output_tokens":5}),
+        ],
+    );
+}
+
 fn pi_session(root: &Path, session: &str, input: u64) {
     write_jsonl(
         &root.join("agent/sessions/project/same-name.jsonl"),
@@ -129,8 +143,9 @@ async fn startup_and_manual_sync_reload_extra_homes_without_losing_defaults() {
             json!({"type":"assistant","timestamp":"2026-09-11T10:00:00Z","sessionId":"extra-only","message":{"id":"response-1","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"Extra Claude home"}],"usage":{"input_tokens":123,"output_tokens":10}}}),
         ],
     );
+    antigravity_session(&remote.join("antigravity"), "native-only", 100);
     let config_path = root.join("insights/config.yaml");
-    fs::write(&config_path, "auto_update: false\nadditional_sources:\n  codex: ['../cloud/laptop/codex']\n  copilot: ['../cloud/laptop/copilot']\n  pi: ['../cloud/laptop/pi']\n  claude: ['../cloud/laptop/claude']\n").unwrap();
+    fs::write(&config_path, "auto_update: false\nadditional_sources:\n  codex: ['../cloud/laptop/codex']\n  copilot: ['../cloud/laptop/copilot']\n  pi: ['../cloud/laptop/pi']\n  claude: ['../cloud/laptop/claude']\n  antigravity: ['../cloud/laptop/antigravity']\n").unwrap();
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -231,7 +246,7 @@ async fn startup_and_manual_sync_reload_extra_homes_without_losing_defaults() {
         later.join("codex/sessions").join(rollout),
     )
     .unwrap();
-    fs::write(&config_path, "auto_update: false\nadditional_sources:\n  codex:\n    - '../cloud/laptop/codex'\n    - '../cloud/desktop/codex'\n    - '../cloud/desktop/codex'\n    - '../offline/codex'\n  copilot: ['../cloud/laptop/copilot']\n  pi: ['../cloud/laptop/pi']\n  claude: ['../cloud/laptop/claude']\n").unwrap();
+    fs::write(&config_path, "auto_update: false\nadditional_sources:\n  codex:\n    - '../cloud/laptop/codex'\n    - '../cloud/desktop/codex'\n    - '../cloud/desktop/codex'\n    - '../offline/codex'\n  copilot: ['../cloud/laptop/copilot']\n  pi: ['../cloud/laptop/pi']\n  claude: ['../cloud/laptop/claude']\n  antigravity: ['../cloud/laptop/antigravity']\n").unwrap();
     for _ in 0..2 {
         client
             .get(format!("{}/api/codex/sync", server.url))
@@ -280,6 +295,58 @@ async fn startup_and_manual_sync_reload_extra_homes_without_losing_defaults() {
         .json::<Value>()
         .await
         .unwrap();
+    assert_eq!(setup["antigravity"]["exists"], true);
+    assert_eq!(
+        PathBuf::from(setup["antigravity"]["data_path"].as_str().unwrap()),
+        displayed_root(&remote.join("antigravity/brain"))
+    );
+    assert!(!remote.join("antigravity/usage").exists());
+    let native_rows = records(&client, &server, "antigravity").await;
+    assert_eq!(
+        native_rows.len(),
+        2,
+        "repeated sync must not duplicate native usage"
+    );
+    assert_eq!(
+        native_rows
+            .iter()
+            .map(|row| row["delta_tokens"]["input"].as_u64().unwrap())
+            .sum::<u64>(),
+        120
+    );
+    assert_eq!(
+        native_rows
+            .iter()
+            .map(|row| row["delta_tokens"]["cache_read"].as_u64().unwrap())
+            .sum::<u64>(),
+        500
+    );
+    let details = client
+        .get(format!(
+            "{}/api/antigravity/session/native-only?source_kind=antigravity-session&source_dir_key={}",
+            server.url, native_rows[0]["source_dir_key"].as_str().unwrap()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let replies: Vec<_> = details["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["event_type"] == "AssistantReply")
+        .collect();
+    assert_eq!(
+        replies.len(),
+        2,
+        "tool-only native replies must retain usage in timeline"
+    );
+    assert_eq!(replies[0]["event_data"]["input_tokens"], 100);
+    assert_eq!(replies[1]["event_data"]["input_tokens"], 20);
     assert_eq!(setup["claude"]["exists"], true);
     assert_eq!(
         PathBuf::from(setup["claude"]["dir_path"].as_str().unwrap()),

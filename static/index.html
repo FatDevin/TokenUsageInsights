@@ -1091,11 +1091,26 @@
             <span class="icon-glyph icon-chevron-left" aria-hidden="true"></span>
             <span data-i18n="setup_back_to_sources">返回資料來源</span>
           </button>
-          <h2 id="setup-modal-title" data-i18n="setup_modal_title">Google Antigravity CLI 前置設定與啟用教學</h2>
+          <h2 id="setup-modal-title" data-i18n="setup_modal_title">Antigravity CLI 本機資料來源</h2>
         </div>
         <button class="close-btn" id="close-setup-modal-btn" data-i18n-aria-label="close" aria-label="關閉"><span class="icon-glyph icon-close" aria-hidden="true"></span></button>
       </div>
-      <!-- Status Line Setup Content (Antigravity & Copilot) -->
+      <!-- Antigravity native session data -->
+      <div class="modal-body" id="setup-body-antigravity" style="display: none;">
+        <p class="modal-text" data-i18n="antigravity_setup_modal_intro">本看板直接讀取 Antigravity CLI 的原生會話記錄，不需要設定 Status Line 或安裝收集腳本。</p>
+        <div class="modal-section">
+          <h3 data-i18n="antigravity_source_title">會話記錄位置</h3>
+          <p class="modal-text"><span data-i18n="antigravity_source_path">目前偵測到的資料路徑：</span> <code id="lbl-detected-home-antigravity">~/.gemini/antigravity-cli/brain</code></p>
+          <div class="code-block-container"><pre><code>brain/&lt;session-id&gt;/.system_generated/logs/transcript_full.jsonl
+conversations/&lt;session-id&gt;.db</code></pre></div>
+        </div>
+        <div class="modal-section">
+          <h3 data-i18n="antigravity_cost_title">費用估算與舊版資料</h3>
+          <p class="modal-text" data-i18n="antigravity_cost_desc">使用每次回應的 Token 與模型資訊估算費用；模型或價格不明時無法可靠估算，不代表免費。舊版 usage 收集檔仍受支援。</p>
+        </div>
+      </div>
+
+      <!-- Status Line Setup Content (Copilot) -->
       <div class="modal-body" id="setup-body-all" style="display: none;">
         <p class="modal-text" data-i18n="all_agents_setup_intro">合併模式會彙總下列本機資料來源；未偵測到的 Agent 不影響其他 Agent 的統計。點選「設定教學」可查看個別 Agent 的啟用方式。</p>
         <ul class="agent-source-list" id="all-agent-source-list" aria-live="polite"></ul>
@@ -1103,13 +1118,13 @@
 
       <div class="modal-body" id="setup-body-statusline">
         <div class="modal-text">
-          <p id="setup-modal-intro" data-i18n="setup_modal_intro">本看板主要解析並呈現 Google Antigravity CLI 的 <strong>Status Line (狀態列)</strong> 所收集的 Token 數據。我們將使用 <code>~/.gemini/antigravity-cli/statusline-token.sh</code> 進行每日數據統計與會話紀錄。</p>
+          <p id="setup-modal-intro" data-i18n="copilot_setup_modal_intro">本看板主要解析並呈現 GitHub Copilot CLI 的 <strong>Status Line (狀態列)</strong> 所收集的 Token 數據。我們將使用 <code>~/.copilot/statusline-token.sh</code> 進行每日數據統計與會話紀錄。</p>
         </div>
 
         <!-- 步驟 1：複製專案到本地 -->
         <div class="modal-section">
-          <h3 id="setup-step-clone" data-i18n="setup_step_clone"><span>01</span> 1. 複製專案到本地</h3>
-          <p class="modal-text" id="setup-step-clone-desc" data-i18n="setup_step_clone_desc">請在終端機中依序執行以下兩行指令；此寫法同時相容於 Bash、zsh 與 Windows PowerShell：</p>
+          <h3 id="setup-step-clone" data-i18n="copilot_setup_step_clone"><span>01</span> 1. 複製專案到本地</h3>
+          <p class="modal-text" id="setup-step-clone-desc" data-i18n="copilot_setup_step_clone_desc">請在終端機中依序執行以下兩行指令；此寫法同時相容於 Bash、zsh 與 Windows PowerShell：</p>
           <div class="code-block-container">
             <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製指令">複製指令</button>
             <pre><code>git clone https://github.com/doggy8088/TokenUsageInsights.git
@@ -1119,21 +1134,21 @@ cd TokenUsageInsights</code></pre>
 
         <!-- 步驟 2：確認 script 有執行權限 -->
         <div class="modal-section">
-          <h3 id="setup-step-1" data-i18n="setup_step_1"><span>02</span> 2. 確認 script 有執行權限</h3>
-          <p class="modal-text" id="setup-step-1-desc" data-i18n="setup_step_1_desc">首先建立設定目錄，並將專案中的收集腳本複製至家目錄的 <code>.gemini/antigravity-cli</code> 目錄下，最後賦予執行權限。下方指令會使用看板偵測到的腳本實際路徑，不受專案複製位置影響：</p>
+          <h3 id="setup-step-1" data-i18n="copilot_setup_step_1"><span>02</span> 2. 確認 script 有執行權限</h3>
+          <p class="modal-text" id="setup-step-1-desc" data-i18n="copilot_setup_step_1_desc">首先建立設定目錄，並將專案中的收集腳本複製至家目錄的 <code>.copilot</code> 目錄下，最後賦予執行權限。下方指令會使用看板偵測到的腳本實際路徑，不受專案複製位置影響：</p>
           <div class="code-block-container">
             <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製指令">複製指令</button>
-            <pre><code id="code-setup-cmd">mkdir -p ~/.gemini/antigravity-cli && cp shell/antigravity/statusline-token.sh ~/.gemini/antigravity-cli/statusline-token.sh && chmod +x ~/.gemini/antigravity-cli/statusline-token.sh</code></pre>
+            <pre><code id="code-setup-cmd">mkdir -p ~/.copilot && cp shell/copilot/statusline-token.sh ~/.copilot/statusline-token.sh && chmod +x ~/.copilot/statusline-token.sh</code></pre>
           </div>
         </div>
 
         <!-- 步驟 3：編輯設定檔 -->
         <div class="modal-section">
-          <h3 id="setup-step-2" data-i18n="setup_step_2"><span>03</span> 3. 編輯設定檔</h3>
-          <p class="modal-text" id="setup-step-2-desc" data-i18n="setup_step_2_desc">編輯或新增 Antigravity CLI 的設定檔 <code>~/.gemini/antigravity-cli/settings.json</code>：</p>
+          <h3 id="setup-step-2" data-i18n="copilot_setup_step_2"><span>03</span> 3. 編輯設定檔</h3>
+          <p class="modal-text" id="setup-step-2-desc" data-i18n="copilot_setup_step_2_desc">編輯或新增 Copilot CLI 的設定檔 <code>~/.copilot/settings.json</code>：</p>
           <div class="code-block-container" style="margin-bottom: 8px;">
             <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製指令">複製指令</button>
-            <pre><code id="code-edit-settings">vi ~/.gemini/antigravity-cli/settings.json</code></pre>
+            <pre><code id="code-edit-settings">vi ~/.copilot/settings.json</code></pre>
           </div>
           <p class="modal-text" data-i18n="setup_step_2_desc2">在設定檔中加入以下 <code>statusLine</code> 設定內容：</p>
           <div class="code-block-container">
@@ -1141,7 +1156,7 @@ cd TokenUsageInsights</code></pre>
             <pre><code id="code-setup-json">{
   "statusLine": {
     "type": "command",
-    "command": "$HOME/.gemini/antigravity-cli/statusline-token.sh",
+    "command": "$HOME/.copilot/statusline-token.sh",
     "padding": 1
   }
 }</code></pre>
@@ -1150,8 +1165,8 @@ cd TokenUsageInsights</code></pre>
 
         <!-- 步驟 4：已經有其他設定時（不要覆蓋） -->
         <div class="modal-section">
-          <h3 id="setup-step-3" data-i18n="setup_step_3"><span>04</span> 4. 已經有其他設定時（不要覆蓋）</h3>
-          <p class="modal-text" data-i18n="setup_step_3_desc">若您的 <code>settings.json</code> 中已經有其他現成設定，<strong>請勿整檔覆蓋</strong>，只需將 <code>statusLine</code> 屬性合併加入即可，例如：</p>
+          <h3 id="setup-step-3" data-i18n="copilot_setup_step_3"><span>04</span> 4. 已經有其他設定時（不要覆蓋）</h3>
+          <p class="modal-text" data-i18n="copilot_setup_step_3_desc">若您的 <code>settings.json</code> 中已經有其他現成設定，<strong>請勿整檔覆蓋</strong>，只需將 <code>statusLine</code> 屬性合併加入即可，例如：</p>
           <div class="code-block-container">
             <button class="copy-code-btn" id="btn-copy-json-merge" data-i18n="btn_copy_merge_example" title="複製合併範例">複製合併範例</button>
             <pre><code id="code-setup-json-merge">{
@@ -1161,7 +1176,7 @@ cd TokenUsageInsights</code></pre>
   },
   "statusLine": {
     "type": "command",
-    "command": "$HOME/.gemini/antigravity-cli/statusline-token.sh",
+    "command": "$HOME/.copilot/statusline-token.sh",
     "padding": 1
   }
 }</code></pre>
@@ -1170,14 +1185,14 @@ cd TokenUsageInsights</code></pre>
 
         <!-- 步驟 5：重開 CLI -->
         <div class="modal-section">
-          <h3 id="setup-step-4" data-i18n="setup_step_4"><span>05</span> 5. 重開 Antigravity CLI</h3>
-          <p class="modal-text" id="setup-step-4-desc" data-i18n="setup_step_4_desc">設定完成並存檔後，請<strong>退出目前的 Antigravity CLI 聊天會話，並重新進入</strong>以套用全新設定。</p>
+          <h3 id="setup-step-4" data-i18n="copilot_setup_step_4"><span>05</span> 5. 重開 Copilot CLI</h3>
+          <p class="modal-text" id="setup-step-4-desc" data-i18n="copilot_setup_step_4_desc">設定完成並存檔後，請<strong>退出目前的 Copilot CLI 聊天會話，並重新進入</strong>以套用全新設定。</p>
         </div>
 
         <!-- 步驟 6：檢查是否成功 -->
         <div class="modal-section">
-          <h3 id="setup-step-5" data-i18n="setup_step_5"><span>06</span> 6. 檢查是否成功</h3>
-          <p class="modal-text" id="setup-step-5-desc" data-i18n="setup_step_5_desc">進入 Antigravity CLI 會話後，畫面底部應該會顯示由本專案腳本產生的狀態列，如：</p>
+          <h3 id="setup-step-5" data-i18n="copilot_setup_step_5"><span>06</span> 6. 檢查是否成功</h3>
+          <p class="modal-text" id="setup-step-5-desc" data-i18n="copilot_setup_step_5_desc">進入 Copilot CLI 會話後，畫面底部應該會顯示由本專案腳本產生的狀態列，如：</p>
           <div class="code-block-container" style="background: rgba(255,255,255,0.02);">
             <pre style="color: var(--neon-green);"><code>Auto > GPT-5.3-Codex | #1 | in 22.8k | cache 22.0k/0 | out 61 | reasoning 29 | total 22.9k | ctx 9%</code></pre>
           </div>
@@ -1187,13 +1202,13 @@ cd TokenUsageInsights</code></pre>
             <p style="margin-top: 6px; margin-left: 12px;" data-i18n="setup_troubleshoot_a"><strong>A. 若狀態列未正常出現，請先單獨測試腳本是否能正常執行：</strong></p>
             <div class="code-block-container" style="margin-left: 12px; margin-top: 4px;">
               <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製">複製</button>
-              <pre><code id="code-troubleshoot-a">echo '{}' | ~/.gemini/antigravity-cli/statusline-token.sh</code></pre>
+              <pre><code id="code-troubleshoot-a">echo '{}' | ~/.copilot/statusline-token.sh</code></pre>
             </div>
             
             <p style="margin-top: 8px; margin-left: 12px;" data-i18n="setup_troubleshoot_b"><strong>B. 請確認 <code>settings.json</code> 是合法的 JSON 格式：</strong></p>
             <div class="code-block-container" style="margin-left: 12px; margin-top: 4px;">
               <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製">複製</button>
-              <pre><code id="code-troubleshoot-b">jq . ~/.gemini/antigravity-cli/settings.json</code></pre>
+              <pre><code id="code-troubleshoot-b">jq . ~/.copilot/settings.json</code></pre>
             </div>
           </div>
         </div>

@@ -138,6 +138,14 @@ pub async fn get_available_dates(Path(assistant): Path<String>) -> impl IntoResp
     }
 }
 
+fn antigravity_data_path(root: &std::path::Path) -> PathBuf {
+    ["brain", "conversations", "usage"]
+        .iter()
+        .map(|name| root.join(name))
+        .find(|path| path.is_dir())
+        .unwrap_or_else(|| root.join("brain"))
+}
+
 /// API 2: 獲取當前環境配置與安裝狀況資訊
 pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
@@ -182,7 +190,8 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
             .cloned()
             .unwrap_or_default()
     };
-    let anti_dir = source_root(Harness::Antigravity, &["usage", script_name]);
+    let anti_dir = source_root(Harness::Antigravity, &["brain", "conversations", "usage"]);
+    let anti_data_path = antigravity_data_path(&anti_dir);
     let anti_script = anti_dir.join(script_name);
     let anti_source_relative = if cfg!(windows) {
         PathBuf::from("shell").join(script_name)
@@ -238,8 +247,8 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
         home_dir,
         antigravity: AssistantSetupStatus {
             dir_path: anti_dir.to_string_lossy().into_owned(),
-            data_path: anti_dir.join("usage").to_string_lossy().into_owned(),
-            exists: anti_script.exists() || anti_dir.join("usage").exists(),
+            data_path: anti_data_path.to_string_lossy().into_owned(),
+            exists: anti_data_path.is_dir(),
             script_path: anti_script.to_string_lossy().into_owned(),
             source_script_path: anti_source_script.to_string_lossy().into_owned(),
             settings_path: anti_dir
@@ -544,6 +553,26 @@ mod tests {
     use rusqlite::Connection;
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{collections::HashMap, fs};
+
+    #[test]
+    fn antigravity_setup_detects_native_sources_without_statusline() {
+        let root = std::env::temp_dir().join(format!(
+            "antigravity-setup-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(antigravity_data_path(&root), root.join("brain"));
+        assert!(!antigravity_data_path(&root).exists());
+        for name in ["usage", "conversations", "brain"] {
+            fs::create_dir(root.join(name)).unwrap();
+            assert_eq!(antigravity_data_path(&root), root.join(name));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn legacy_usage_entry(turn_no: u32, model: &str, tokens: TokenStats) -> UsageEntry {
         UsageEntry {
