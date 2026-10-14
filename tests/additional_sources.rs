@@ -65,10 +65,26 @@ fn antigravity_session(root: &Path, session: &str, input: u64) {
             .join(".system_generated/logs/transcript_full.jsonl"),
         &[
             json!({"type":"USER_INPUT","created_at":"2026-09-11T10:00:00Z","content":"Native session without statusline"}),
-            json!({"type":"PLANNER_RESPONSE","step_index":1,"created_at":"2026-09-11T10:00:01Z","thinking":"Check the tool","input_tokens":input,"cache_read_tokens":200,"output_tokens":10,"tool_calls":[{"name":"list_directory","args":{}}]}),
+            json!({"type":"PLANNER_RESPONSE","step_index":1,"created_at":"2026-09-11T10:00:01Z","thinking":"Check the tool","input_tokens":input,"cache_read_tokens":200,"output_tokens":10,"tool_calls":[{"name":"list_directory","args":{"Cwd":"/temporary/tool-directory"}}]}),
             json!({"type":"PLANNER_RESPONSE","step_index":2,"created_at":"2026-09-11T10:00:02Z","content":"Done","input_tokens":20,"cache_read_tokens":300,"output_tokens":5}),
         ],
     );
+    fs::create_dir_all(root.join("conversations")).unwrap();
+    let metadata =
+        rusqlite::Connection::open(root.join("conversations").join(format!("{session}.db")))
+            .unwrap();
+    metadata
+        .execute_batch("CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);")
+        .unwrap();
+    let uri = b"file:///example/project";
+    let mut blob = vec![0x3a, uri.len() as u8];
+    blob.extend_from_slice(uri);
+    metadata
+        .execute(
+            "INSERT INTO trajectory_metadata_blob VALUES ('main', ?)",
+            rusqlite::params![blob],
+        )
+        .unwrap();
 }
 
 fn pi_session(root: &Path, session: &str, input: u64) {
@@ -302,6 +318,9 @@ async fn startup_and_manual_sync_reload_extra_homes_without_losing_defaults() {
     );
     assert!(!remote.join("antigravity/usage").exists());
     let native_rows = records(&client, &server, "antigravity").await;
+    assert!(native_rows
+        .iter()
+        .all(|row| row["cwd"] == "/example/project"));
     assert_eq!(
         native_rows.len(),
         2,
@@ -334,6 +353,7 @@ async fn startup_and_manual_sync_reload_extra_homes_without_losing_defaults() {
         .json::<Value>()
         .await
         .unwrap();
+    assert_eq!(details["metadata"]["cwd"], "/example/project");
     let replies: Vec<_> = details["timeline"]
         .as_array()
         .unwrap()

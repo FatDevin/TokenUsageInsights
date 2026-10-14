@@ -435,3 +435,32 @@
 - 使用者提供的 session 快照驗證：230 回應；輸入 2,039,363、快取 28,280,788、輸出 319,385，模型 Gemini 4 Argon (Medium)，現有價格表估算 US$20.2013096；API 與時間軸加總一致。
 - 瀏覽器確認原生指南、Copilot 舊指南、Session 抽屜及 390px 原生指南不橫向溢出；無 console errors。截圖保留於暫存目錄，未提交個人會話資料。
 - 最終 `cargo fmt -- --check` 與 `git diff --check` 通過。未發佈版本或改動正式使用量資料庫。
+
+# 2026-10-15 Antigravity CWD 補齊
+
+## 目標與計畫
+- [x] 確認漏失原因：原生匯入器固定將 cwd 設為 None。
+- [x] 確認會話工作目錄的權威欄位，避免將工具臨時目錄當成 session CWD。
+- [x] 補上解析與同步快取版本，使已匯入的歷史 session 重新補齊 CWD。
+- [x] 回歸測試、完整 Rust 測試、Clippy、零警告 release build 與實際資料驗證。
+- [x] 記錄結果並建立正體中文詳細 commit。
+
+## 驗收與風險
+- Session 列表及明細可取得原生記錄的 CWD；未知或多工作區不得任意猜選。
+- Token 與估算費用保持相同；來源檔案唯讀，不將個人路徑或對話加入版本控制。
+- 中風險：同步快取需重新解析既有資料；回滾可 revert 本次提交並重新同步。
+- 沿用 C: 暫存 CARGO_TARGET_DIR，避免 G: 空間不足；不新增相依套件。
+
+
+## 工作紀錄
+- 權威來源：會話 SQLite 的 trajectory_metadata_blob，CortexTrajectoryMetadata.workspace_uris 為 field 7；僅在缺少該欄位時回退舊 workspaces field 1 → workspace_folder_absolute_uri field 1。欄位已核對安裝 CLI 的 protobuf descriptor。
+- 使用會話層級 workspace，不推測工具的臨時 Cwd；多工作區或無效 URI 保留未知。
+- URI 解碼保留 Windows drive、Unix、UNC 與百分比／UTF-8 編碼，以跨平台路徑字串儲存。
+- PARSER_VERSION = 2 納入同步 fingerprint，使未變動的既有記錄也會重新解析補齊工作目錄。
+- 隔離舊資料庫實測：更新前 230 筆 CWD 均空白，更新後 230 筆都有正確工作目錄；會話列表與明細 API 驗證通過，Token 與原先估算費用完全相同。
+- `cargo test --locked --quiet`：420 單元測試、1 多來源整合測試、2 CLI 測試通過；`cargo clippy --locked --all-targets --all-features -- -D warnings`、fmt 與 diff whitespace 檢查通過。
+- 原始會話未修改；驗證程序已停止。沒有 UI 變更，使用 API 及整合測試驗證資料傳遞。
+
+## 結果
+- `scripts/build.ps1` 通過：423 項 release 測試與 release all-targets 建置成功，零 compiler warnings、零錯誤。
+- 程式與回補行為已完成驗證，建立獨立修正提交；未發佈新版本。

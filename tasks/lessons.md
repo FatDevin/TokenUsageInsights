@@ -117,3 +117,10 @@
 - 偵測：390px 瀏覽器截圖顯示原生指南長路徑使 modal 橫向溢出，新增的 code-block class 在現有 CSS 中不存在。
 - 預防：沿用已定義的 code-block-container，讓長程式碼區塊自行捲動，不撐開 modal。
 - 檢查點：瀏覽器驗證容器 scrollWidth 等於 clientWidth；修正後均為 361px。
+
+## 2026-10-15 新資料來源不得漏掉工作目錄
+
+- 分類：驗收範圍不完整。
+- 偵測：原生 Antigravity Token 與模型皆正確，但使用者發現 CWD 缺失；匯入器固定寫入 None。
+- 預防：新來源的驗收包含會話名稱、模型、CWD、Token、費用與時間軸，不只核對用量總數。
+- 檢查點：對會話 metadata 的工作區欄位建立獨立 fixture，並確認同步快取升版後會補齊歷史資料。

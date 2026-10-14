@@ -6,6 +6,8 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 pub(crate) const SOURCE_KIND: &str = "antigravity-session";
+// Bump when parsed fields change so unchanged historical sources are re-imported.
+pub(crate) const PARSER_VERSION: u32 = 2;
 
 pub(crate) fn find_session_files(root: &Path) -> Result<Vec<PathBuf>, String> {
     let brain = root.join("brain");
@@ -38,12 +40,12 @@ pub(crate) fn session_id(path: &Path) -> Option<&str> {
 /// error so a partially rebuilt session never replaces previously known usage.
 pub(crate) fn parse_session(path: &Path) -> Result<Vec<UsageEntry>, String> {
     let session_id = session_id(path).ok_or("無效的 Antigravity transcript 路徑")?;
-    let models = path
+    let metadata = path
         .ancestors()
         .nth(5)
-        .map(|root| crate::antigravity_metadata::response_models(root, session_id))
+        .map(|root| crate::antigravity_metadata::read_session_metadata(root, session_id))
         .transpose()
-        .map_err(|e| format!("讀取 Antigravity 模型 metadata 失敗: {e}"))?
+        .map_err(|e| format!("讀取 Antigravity 會話 metadata 失敗: {e}"))?
         .unwrap_or_default();
     let file = File::open(path).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(file);
@@ -110,7 +112,7 @@ pub(crate) fn parse_session(path: &Path) -> Result<Vec<UsageEntry>, String> {
                     .get("step_index")
                     .and_then(Value::as_u64)
                     .and_then(|index| u32::try_from(index).ok())
-                    .and_then(|index| models.get(&index).cloned())
+                    .and_then(|index| metadata.models.get(&index).cloned())
             });
         let tokens = TokenStats {
             input,
@@ -127,7 +129,7 @@ pub(crate) fn parse_session(path: &Path) -> Result<Vec<UsageEntry>, String> {
             session_id: session_id.to_owned(),
             session_name: None,
             transcript_path: Some(path.to_string_lossy().into_owned()),
-            cwd: None,
+            cwd: metadata.cwd.clone(),
             version: None,
             turn_no,
             model: model.clone(),

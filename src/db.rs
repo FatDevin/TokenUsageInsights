@@ -1508,6 +1508,7 @@ fn sync_antigravity_usage_logs_with_cancel(
         let modified = {
             use std::hash::{Hash, Hasher};
             let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+            crate::antigravity::PARSER_VERSION.hash(&mut fingerprint);
             for file in [
                 path.clone(),
                 root.join("conversations").join(format!("{session_id}.db")),
@@ -7886,6 +7887,17 @@ mod tests {
             let mut generation = field(4, b"generation-id");
             generation.extend(field(1, &field(19, b"agy-demo-medium")));
             metadata
+                .execute_batch(
+                    "CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);",
+                )
+                .unwrap();
+            metadata
+                .execute(
+                    "INSERT INTO trajectory_metadata_blob VALUES ('main', ?)",
+                    params![field(7, b"file:///example/project")],
+                )
+                .unwrap();
+            metadata
                 .execute("INSERT INTO gen_metadata VALUES (?)", params![generation])
                 .unwrap();
             metadata
@@ -7897,6 +7909,52 @@ mod tests {
         }
         sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
         assert_eq!(model(&conn), "Gemini 4 Argon (Medium)");
+        let cwd = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT cwd FROM usage_entries WHERE session_id = 'a-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(cwd(&conn).as_deref(), Some("/example/project"));
+        // Simulate an unchanged snapshot imported by the previous parser, whose
+        // fingerprint omitted a parser version and whose CWD was always NULL.
+        use std::hash::{Hash, Hasher};
+        let mut old_fingerprint = std::collections::hash_map::DefaultHasher::new();
+        for file in [
+            &path,
+            &database,
+            &root.join("conversations/a-session.db-wal"),
+        ] {
+            if let Ok(metadata) = fs::metadata(file) {
+                metadata.len().hash(&mut old_fingerprint);
+                metadata.modified().ok().hash(&mut old_fingerprint);
+            }
+        }
+        let old_revision = (old_fingerprint.finish() & i64::MAX as u64) as i64;
+        conn.execute(
+            "UPDATE usage_entries SET cwd = NULL WHERE session_id = 'a-session'",
+            [],
+        )
+        .unwrap();
+        let canonical_root = crate::config::absolute_root(&root);
+        let state_key = source_sync_key(
+            "antigravity",
+            &canonical_root,
+            &portable_relative_path(
+                &canonical_root,
+                &canonical_root
+                    .join("brain/a-session/.system_generated/logs/transcript_full.jsonl"),
+            ),
+        );
+        conn.execute(
+            "UPDATE sync_state SET last_synced_time = ? WHERE filename = ?",
+            params![old_revision, state_key],
+        )
+        .unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        assert_eq!(cwd(&conn).as_deref(), Some("/example/project"));
         // The transcript did not change. A temporarily invalid metadata database
         // must preserve the established model without starving later sessions.
         fs::write(&database, b"temporarily invalid SQLite data").unwrap();

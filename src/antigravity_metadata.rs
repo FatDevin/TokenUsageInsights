@@ -2,19 +2,119 @@ use rusqlite::{Connection, OpenFlags};
 use std::collections::HashMap;
 use std::path::{Component, Path};
 
-/// Read per-response model identities without depending on the current CLI settings.
-pub fn response_models(root: &Path, session_id: &str) -> rusqlite::Result<HashMap<u32, String>> {
+#[derive(Default)]
+pub struct SessionMetadata {
+    pub models: HashMap<u32, String>,
+    pub cwd: Option<String>,
+}
+
+/// Read original workspace and model identities without using current CLI settings.
+pub fn read_session_metadata(root: &Path, session_id: &str) -> rusqlite::Result<SessionMetadata> {
     let mut components = Path::new(session_id).components();
     if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
-        return Ok(HashMap::new());
+        return Ok(SessionMetadata::default());
     }
     let path = root.join("conversations").join(format!("{session_id}.db"));
     let conn = match Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(conn) => conn,
-        Err(_) if matches!(path.try_exists(), Ok(false)) => return Ok(HashMap::new()),
+        Err(_) if matches!(path.try_exists(), Ok(false)) => return Ok(SessionMetadata::default()),
         Err(error) => return Err(error),
     };
-    read_response_models(&conn)
+    Ok(SessionMetadata {
+        models: read_response_models(&conn)?,
+        cwd: read_workspace(&conn)?,
+    })
+}
+
+fn read_workspace(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    let mut statement = conn.prepare("PRAGMA table_info(trajectory_metadata_blob)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|column| column == "data") {
+        return Ok(None);
+    }
+    let mut statement = conn.prepare("SELECT data FROM trajectory_metadata_blob")?;
+    let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut workspace = None;
+    let mut unresolved = false;
+    for row in rows {
+        let blob = row?;
+        let Some(fields) = protobuf_fields(&blob) else {
+            unresolved = true;
+            continue;
+        };
+        // Verified in the CLI's embedded CortexTrajectoryMetadata descriptor:
+        // field 7 = repeated workspace_uris; deprecated field 1 = workspaces,
+        // whose field 1 is CortexWorkspaceMetadata.workspace_folder_absolute_uri.
+        let uris = if fields.iter().any(|(number, _)| *number == 7) {
+            fields
+                .iter()
+                .filter(|(number, _)| *number == 7)
+                .map(|(_, value)| Some(*value))
+                .collect::<Vec<_>>()
+        } else {
+            fields
+                .iter()
+                .filter(|(number, _)| *number == 1)
+                .map(|(_, value)| protobuf_fields(value).and_then(|inner| bytes_field(&inner, 1)))
+                .collect::<Vec<_>>()
+        };
+        for uri in uris {
+            let Some(path) = uri
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(file_uri_path)
+            else {
+                unresolved = true;
+                continue;
+            };
+            if workspace.as_ref().is_some_and(|previous| previous != &path) {
+                unresolved = true;
+            } else {
+                workspace = Some(path);
+            }
+        }
+    }
+    Ok(if unresolved { None } else { workspace })
+}
+
+fn file_uri_path(value: &str) -> Option<String> {
+    if !value.starts_with("file://") || value.chars().any(char::is_control) {
+        return None;
+    }
+    let uri = reqwest::Url::parse(value).ok()?;
+    if uri.scheme() != "file" || uri.query().is_some() || uri.fragment().is_some() {
+        return None;
+    }
+    // Decode independently of the host OS: imported sessions may come from Windows
+    // while the dashboard runs on Unix (or vice versa).
+    let mut decoded = Vec::new();
+    let mut bytes = uri.path().as_bytes().iter().copied();
+    while let Some(byte) = bytes.next() {
+        decoded.push(if byte == b'%' {
+            let high = char::from(bytes.next()?).to_digit(16)?;
+            let low = char::from(bytes.next()?).to_digit(16)?;
+            ((high << 4) | low) as u8
+        } else {
+            byte
+        });
+    }
+    let path = String::from_utf8(decoded).ok()?;
+    if !path.starts_with('/') || path.chars().any(char::is_control) {
+        return None;
+    }
+    if let Some(host) = uri
+        .host_str()
+        .filter(|host| !host.is_empty() && *host != "localhost")
+    {
+        return Some(format!("//{host}{path}"));
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 4 && bytes[1].is_ascii_alphabetic() && bytes[2..4] == *b":/" {
+        Some(path[1..].to_owned())
+    } else {
+        Some(path)
+    }
 }
 
 fn read_response_models(conn: &Connection) -> rusqlite::Result<HashMap<u32, String>> {
@@ -236,8 +336,9 @@ mod tests {
 
     #[test]
     fn rejects_session_path_traversal() {
-        assert!(response_models(Path::new("."), "../invalid-session")
+        assert!(read_session_metadata(Path::new("."), "../invalid-session")
             .unwrap()
+            .models
             .is_empty());
     }
 
@@ -251,8 +352,9 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        assert!(response_models(&root, "missing-session")
+        assert!(read_session_metadata(&root, "missing-session")
             .unwrap()
+            .models
             .is_empty());
         assert!(!root.exists());
     }
@@ -279,10 +381,82 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let database = directory.join("invalid.db");
         std::fs::write(&database, b"This is deliberately not a SQLite database.").unwrap();
-        let result = response_models(&root, "invalid");
+        let result = read_session_metadata(&root, "invalid");
         std::fs::remove_file(database).unwrap();
         std::fs::remove_dir(directory).unwrap();
         std::fs::remove_dir(root).unwrap();
         assert!(result.is_err());
+    }
+
+    fn workspace_blob(blob: &[u8]) -> Option<String> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE trajectory_metadata_blob(data BLOB);")
+            .unwrap();
+        conn.execute("INSERT INTO trajectory_metadata_blob VALUES (?1)", [blob])
+            .unwrap();
+        read_workspace(&conn).unwrap()
+    }
+
+    #[test]
+    fn workspace_comes_from_session_metadata_and_prefers_current_field() {
+        let mut blob = field(1, &field(1, b"file:///old/workspace"));
+        blob.extend(field(7, b"file:///G:/Projects/block-out"));
+        assert_eq!(
+            workspace_blob(&blob).as_deref(),
+            Some("G:/Projects/block-out")
+        );
+        assert_eq!(
+            workspace_blob(&field(1, &field(1, b"file:///original/workspace"))).as_deref(),
+            Some("/original/workspace")
+        );
+    }
+
+    #[test]
+    fn ambiguous_or_invalid_workspaces_are_not_guessed() {
+        let mut duplicates = field(7, b"file:///workspace");
+        duplicates.extend(field(7, b"file:///workspace"));
+        assert_eq!(workspace_blob(&duplicates).as_deref(), Some("/workspace"));
+        duplicates.extend(field(7, b"file:///different"));
+        assert!(workspace_blob(&duplicates).is_none());
+        let mut invalid = field(1, &field(1, b"file:///old/workspace"));
+        invalid.extend(field(7, b"https://example.com/workspace"));
+        assert!(workspace_blob(&invalid).is_none());
+        assert!(workspace_blob(&[0x0a, 10, 1]).is_none());
+    }
+
+    #[test]
+    fn workspace_uri_decoding_preserves_source_platform_paths() {
+        for (uri, expected) in [
+            ("file:///home/user/My%20Project", "/home/user/My Project"),
+            ("file:///C:/Projects/%E5%B0%88%E6%A1%88", "C:/Projects/專案"),
+            ("file:///home/專案", "/home/專案"),
+            ("file://server/share/project", "//server/share/project"),
+            ("file://localhost/home/project", "/home/project"),
+        ] {
+            assert_eq!(file_uri_path(uri).as_deref(), Some(expected), "{uri}");
+        }
+        for uri in [
+            "relative/path",
+            "file:relative",
+            "https://example.com/path",
+            "file:///bad%",
+            "file:///bad%GG",
+            "file:///bad%FF",
+            "file:///bad%00",
+            "file:///path?query",
+            "file:///path#fragment",
+            "file:///bad\npath",
+        ] {
+            assert!(file_uri_path(uri).is_none(), "{uri}");
+        }
+    }
+
+    #[test]
+    fn missing_optional_workspace_schema_is_supported() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(read_workspace(&conn).unwrap().is_none());
+        conn.execute_batch("CREATE TABLE trajectory_metadata_blob(id TEXT);")
+            .unwrap();
+        assert!(read_workspace(&conn).unwrap().is_none());
     }
 }
