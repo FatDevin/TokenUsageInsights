@@ -2,7 +2,9 @@
 
 本文件記錄 TokenUsageInsights 各正式版本的實際變更。內容依 Git 標籤間的提交記錄與檔案差異整理，格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)，版本編號遵循 [Semantic Versioning](https://semver.org/lang/zh-TW/)。
 
-## [1.3.0] - 2026-10-15
+## [1.3.1] - 2026-10-15
+
+承接未完成發佈的 `v1.3.0`，納入 Antigravity 同步根目錄正規化順序修正。以下列出相較上一個正式版本 `v1.2.2` 的完整變更。
 
 ### 新增與改善
 
@@ -12,14 +14,19 @@
 ### 修正
 
 - 修正舊版或尚未初始化 Composer／Agent DiskKV 儲存的 Cursor `state.vscdb` 缺少 `cursorDiskKV` 資料表時，每次同步皆輸出 `同步 Cursor composerData Session 中繼資料失敗` 與 `同步 Cursor agentKv 模型資訊失敗` 錯誤訊息的問題；現在缺少 `cursorDiskKV` 表時視為空表處理，並在資料庫重置時正常清理快取。
+- 修正 Antigravity 同步在根目錄包含符號連結（如 macOS `/var` → `/private/var`）或 Windows 8.3 短檔名時，先以未正規化路徑執行舊版 Hook 同步再正規化掃描原生會話，導致 `transcript_path` 不一致而無法去重的問題。
 
 ### 資料影響
 
-- Antigravity CLI 同步會自動掃描原生會話記錄（`brain/<session-id>/.system_generated/logs/transcript.jsonl`）與會話資料庫模型中繼資料，並為既有原生會話回補工作目錄（CWD），同時與舊版 `usage/` 收集檔去重；原始會話檔案維持唯讀不變。
+- Antigravity CLI 同步會自動掃描原生會話記錄（`brain/<session-id>/.system_generated/logs/transcript_full.jsonl`）與會話資料庫模型中繼資料，並為既有原生會話回補工作目錄（CWD），同時與舊版 `usage/` 收集檔去重；原始會話檔案維持唯讀不變。
 
 ### 相容性
 
 - 保留舊版 Antigravity `usage/` 狀態列收集檔相容性；未變更資料庫結構、環境變數或安裝流程。
+
+## [1.3.0] - 2026-10-15
+
+此標籤於 macOS 與 Windows 執行 Antigravity 舊版 Hook 與原生會話混合去重單元測試時，因暫存目錄符號連結與 Windows 8.3 短路徑正規化順序不一致而失敗，發佈未完成；未建立正式 GitHub Release 或 npm 版本，標籤維持原狀。相關功能與修正合併記錄於 `1.3.1`。
 
 ## [1.2.2] - 2026-10-14
 
