@@ -41,6 +41,8 @@ use handlers::*;
 const MAX_IMPORT_PAYLOAD_BYTES: usize = 200_000_000;
 const DEFAULT_BIND_HOST: &str = "0.0.0.0";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// ISO date (YYYY-MM-DD) of the source commit, or empty when git metadata was unavailable.
+const APP_BUILD_DATE: &str = env!("APP_BUILD_DATE");
 
 fn import_usage_route() -> axum::routing::MethodRouter {
     post(import_usage_day).layer(DefaultBodyLimit::max(MAX_IMPORT_PAYLOAD_BYTES))

@@ -33,6 +33,8 @@ description: 升級 TokenUsageInsights 的 Rust 套件版本並完成正式 GitH
 - `Cargo.lock` 中 `token-usage-insights` package 的 `version`
 - `README.md` 內 `TOKEN_USAGE_INSIGHTS_VERSION` 的 Release tag 範例
 
+側邊欄版本旁的日期由 `build.rs` 在建置時取自來源 commit 日期（可用環境變數 `APP_BUILD_DATE=YYYY-MM-DD` 覆寫），經 `/api/version` 的 `build_date` 顯示。不得在 `static/index.html` 手寫日期；release commit 建立後再建置，日期才會是發佈日。
+
 使用 `rg` 搜尋舊版本，判斷其他命中是否為歷史範例或也應同步。不得機械式取代相依套件版本或歷史 Release 說明。
 
 ## 3. 本機驗證

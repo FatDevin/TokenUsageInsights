@@ -818,6 +818,15 @@ async function loadAppVersion() {
       versionElement.textContent = `v${version}`;
     }
 
+    const buildDateElement = document.getElementById('app-build-date');
+    const buildDateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(typeof payload.build_date === 'string' ? payload.build_date : '');
+    if (buildDateElement && buildDateMatch) {
+      const [, year, month, day] = buildDateMatch;
+      buildDateElement.dateTime = payload.build_date;
+      buildDateElement.textContent = `(${Number(year)}/${Number(month)}/${Number(day)})`;
+      buildDateElement.hidden = false;
+    }
+
     if (typeof payload.data_revision === 'number') {
       if (startupSyncKnownRevision === null) {
         startupSyncKnownRevision = payload.data_revision;
