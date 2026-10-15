@@ -2,6 +2,16 @@
 
 本文件記錄 TokenUsageInsights 各正式版本的實際變更。內容依 Git 標籤間的提交記錄與檔案差異整理，格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)，版本編號遵循 [Semantic Versioning](https://semver.org/lang/zh-TW/)。
 
+## [1.3.2] - 2026-10-15
+
+### 新增與改善
+
+- 側邊欄版本資訊會依建置來源 commit 日期顯示日期，無須在 HTML 手動維護；可用建置期環境變數 `APP_BUILD_DATE` 指定日期，缺少有效日期時隱藏日期。
+
+### 相容性
+
+- `/api/version` 新增 `build_date` 欄位，既有欄位維持不變；未變更資料庫結構、執行期環境變數或安裝流程。
+
 ## [1.3.1] - 2026-10-15
 
 承接未完成發佈的 `v1.3.0`，納入 Antigravity 同步根目錄正規化順序修正。以下列出相較上一個正式版本 `v1.2.2` 的完整變更。
