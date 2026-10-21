@@ -1459,6 +1459,28 @@ mod tests {
     }
 
     #[test]
+    fn muse_spark_open_resolves_ollama_pricing_from_csv() {
+        let rules = load_prepared_pricing_rules();
+
+        for model_name in ["muse-spark-open", "muse-spark-open:cloud"] {
+            for (input, output, cache_read, expected) in [
+                (1_000_000, 0, 0, 1.25),
+                (0, 0, 1_000_000, 0.15),
+                (0, 1_000_000, 0, 4.25),
+                (1_000_000, 1_000_000, 1_000_000, 5.65),
+            ] {
+                let cost = rules
+                    .calculate_cost(model_name, input, output, cache_read, 0, 0)
+                    .expect("Muse Spark Open should have an Ollama pricing rule");
+                assert!(
+                    (cost - expected).abs() < 1e-12,
+                    "unexpected cost for {model_name}: {cost}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn muse_spark_1_3_and_contributor_resolve_pricing_from_csv() {
         let rules = load_pricing_rules();
 
