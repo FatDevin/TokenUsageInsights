@@ -31,7 +31,9 @@ description: 升級 TokenUsageInsights 的 Rust 套件版本並完成正式 GitH
 
 - `Cargo.toml` 的 package `version`
 - `Cargo.lock` 中 `token-usage-insights` package 的 `version`
+- `package.json` 與 `package-lock.json` 的套件版本
 - `README.md` 內 `TOKEN_USAGE_INSIGHTS_VERSION` 的 Release tag 範例
+- `CHANGELOG.md` 的正式版本標題、日期及相較上一個正式版本的實際變更
 
 側邊欄版本旁的日期由 `build.rs` 在建置時取自來源 commit 日期（可用環境變數 `APP_BUILD_DATE=YYYY-MM-DD` 覆寫），經 `/api/version` 的 `build_date` 顯示。不得在 `static/index.html` 手寫日期；release commit 建立後再建置，日期才會是發佈日。
 
@@ -50,7 +52,7 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 git diff --check
 ```
 
-必須確認兩個 binary target 均零警告、零錯誤。不得以全域 suppress、忽略輸出或跳過測試完成發佈。
+必須確認目前 Cargo metadata 列出的所有 target 均零警告、零錯誤。不得以全域 suppress、忽略輸出或跳過測試完成發佈。
 
 驗證後重新檢查 `git status -sb` 與 `git diff`，確認只有版本與文件變更。
 
@@ -79,17 +81,34 @@ release: 升級版本至 vX.Y.Z
 5. 固定使用 `git commit -F "$commit_msg_file"`，不得使用 `git commit -m`。
 6. 推送 `main` 至 `origin`，確認遠端接受提交。
 
-## 5. 建立並推送附註標籤
+## 5. 等待同一個 commit 的四平台驗證
+
+推送 release commit 後，先等待 `main` 的 `Release` workflow 成功，再建立任何版本標籤。此時 workflow 只執行驗證與產出測試壓縮套件，不建立 GitHub Release 或發布 npm。
+
+```sh
+release_sha="$(git rev-parse HEAD)"
+gh run list --repo OWNER/TokenUsageInsights --workflow release.yml \
+  --branch main --event push --commit "$release_sha" \
+  --json databaseId,headSha,status,conclusion,url
+gh run watch RUN_ID --repo OWNER/TokenUsageInsights --interval 10 --exit-status
+gh run view RUN_ID --repo OWNER/TokenUsageInsights --json headSha,conclusion,jobs
+```
+
+完成條件：run 的 `headSha` 等於 `release_sha`、整體 `conclusion` 為 `success`，且四個 `Build <target>` jobs 全部成功，包含各平台的 Rust 測試、release 建置與安裝驗證。PR 的 merge commit 或其他 commit 的成功結果不算通過。
+
+驗證失敗時，取得失敗記錄、修正並提交，再推送 `main`；以新的 HEAD 重新等待完整驗證。此時尚未建立標籤，可保留原定版本號。若驗證期間 HEAD 有變更，改驗證新 HEAD。只有符合上述完成條件後才進入下一步。
+
+## 6. 建立並推送附註標籤
 
 1. 以 `tag_msg_file="$(mktemp -t codex-tag-message)"` 建立唯一的 UTF-8 標籤訊息檔。
 2. 標籤訊息使用正體中文，簡述本次 Release 的主要內容。
-3. 使用 `git tag -a vX.Y.Z -F "$tag_msg_file"` 建立 annotated tag。
+3. 再次確認 `HEAD` 等於通過四平台驗證的 `release_sha`，使用 `git tag -a vX.Y.Z "$release_sha" -F "$tag_msg_file"` 建立 annotated tag。
 4. 以 `git show --no-patch --format=fuller vX.Y.Z` 核對 tag 指向 release commit。
 5. 使用 `git push origin vX.Y.Z` 推送 tag，觸發 `.github/workflows/release.yml`。
 
 不得在 `main` 推送失敗時先推送 tag。不得使用 `--force`。
 
-## 6. 監看正式發佈
+## 7. 監看正式發佈
 
 1. 使用明確 repository，例如：
 
@@ -107,7 +126,7 @@ gh run watch RUN_ID --repo OWNER/TokenUsageInsights --interval 10 --exit-status
 4. 確認 `Create GitHub Release` job 成功。
 5. 若 workflow 失敗，使用 `gh run view RUN_ID --log-failed` 取得證據並回報。不得刪除或移動既有 tag；若修正需要改變 tag 所指內容，停止並要求使用者決定新版本號。
 
-## 7. 驗證 Release 成品
+## 8. 驗證 Release 成品
 
 使用明確 repository 查詢：
 
@@ -123,9 +142,11 @@ gh release view vX.Y.Z --repo OWNER/TokenUsageInsights \
 - 包含 `SHA256SUMS`
 - 包含 Apple Silicon macOS、Intel macOS、Linux x86_64、Windows x86_64 共四個壓縮套件
 
+依根目錄 `AGENTS.md` 完成實際 Release notes，包含上一個正式版本至新版本的完整比較連結，重新查詢確認公開內容正確。啟用 npm Trusted Publishing 時，亦須確認 npm 發布及 npx smoke-test job 成功，不能只確認 GitHub Release 建立。
+
 最後確認 `git status -sb` 顯示工作目錄乾淨且 `main` 與 `origin/main` 同步。
 
-## 8. 回報
+## 9. 回報
 
 以正體中文提供可驗證結果：
 

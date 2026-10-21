@@ -896,7 +896,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Service
 
 ### CI 驗證
 
-`Release` workflow 每次建置都會在 Linux、macOS 與 Windows 上實際執行對應的安裝腳本（`install.sh` / `install.ps1`），安裝後啟動可執行檔並確認：
+`Release` workflow 在 PR、`main` 推送與版本標籤推送時執行相同的四平台驗證，涵蓋 Linux x86_64、Intel macOS、Apple Silicon macOS 與 Windows x86_64。除了 Rust 測試與零警告 release 建置，也會實際執行對應的安裝腳本（`install.sh` / `install.ps1`），安裝後啟動可執行檔並確認：
 
 - 服務會在指定埠號回應 `/api/<assistant>/pricing`
 - 回應內容確實載入了套件內的 `pricing.csv`
@@ -906,12 +906,22 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Service
 
 ### 維護者發行
 
-推送 Git tag 後，GitHub Actions 會自動建立對應 Release：
+先將版本與變更記錄提交並推送至 `main`，等待該 commit 的 `Release` workflow 四平台驗證全部成功，再建立附註標籤。驗證失敗時可修正後繼續使用原定版本號，因為此時尚未建立標籤。
+
+以下命令中的 `RUN_ID` 必須是此 `release_sha` 在 `main` 上的 push run；確認成功結果與四平台 jobs 後，再執行標籤命令：
 
 ```bash
-git tag vX.Y.Z
+release_sha="$(git rev-parse HEAD)"
+gh run list --repo doggy8088/TokenUsageInsights --workflow release.yml \
+  --branch main --event push --commit "$release_sha"
+gh run watch RUN_ID --repo doggy8088/TokenUsageInsights --exit-status
+gh run view RUN_ID --repo doggy8088/TokenUsageInsights --json headSha,conclusion,jobs
+test "$(git rev-parse HEAD)" = "$release_sha"
+git tag -a vX.Y.Z "$release_sha"
 git push origin vX.Y.Z
 ```
+
+正式標籤的 workflow 會核對同一 commit 已通過 `main` 驗證，然後重新驗證並建立 Release。一般 PR 與 `main` 驗證只產出 Actions artifacts，不會建立公開 Release 或發布 npm。標籤建立後仍須等待正式發佈與 npm 驗證成功。
 
 npm 第一次上架、Trusted Publishing 的必要欄位、GitHub Environment、Repository variable 與後續 OIDC 自動發布流程，請依照 [npm 首次上架與 Trusted Publishing 設定](docs/npm-publishing.md) 操作。
 
