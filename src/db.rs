@@ -346,9 +346,9 @@ const COPILOT_CLI_AGENT_PENDING_PREFIX: &str = "sync:copilot_cli_agents:pending:
 
 /// Versioned, root-scoped repair key (canonical source key is appended).
 /// Upgrades scan all CLI sessions regardless of older SQLite cursors. Each
-/// session is replaced atomically with UTC daily/agent/model rows; failed
+/// session is replaced atomically with per-call rows; failed
 /// sessions retain durable pending markers for automatic retry.
-const COPILOT_CLI_AGENT_MIGRATION_KEY: &str = "migration:copilot_cli_daily_usage_v3";
+const COPILOT_CLI_AGENT_MIGRATION_KEY: &str = "migration:copilot_cli_per_call_usage_v4";
 
 /// One-time backfill of `cwd` for existing Copilot rows (`copilot-cli` and
 /// `copilot-app`) that were written before CWD was populated from
@@ -3290,15 +3290,12 @@ fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Aggregated per-agent token row for a CLI session, produced by grouping
-/// `assistant_usage_events` by `(session_id, UTC date, agent_id, model)`.
-///
-/// `agent_id = None` identifies the main agent; a non-null `agent_id`
-/// identifies a subagent (e.g. `call_f14xiouf`). `model` is taken verbatim
-/// from the events so a subagent never inherits the main agent's model.
-struct CopilotCliAgentRow {
+/// One reconciled API call. Date summaries are derived at query time so
+/// intraday charts keep the original call timestamps and token deltas.
+struct CopilotCliUsageRow {
     session_id: String,
-    /// Earliest event timestamp for this agent group (ISO 8601 normalized).
+    call_identity: String,
+    /// Original call timestamp in UTC, including fractional seconds.
     ts: String,
     model: Option<String>,
     /// `None` for the main agent, `Some(agent_id)` for a subagent.
@@ -3317,7 +3314,7 @@ struct CopilotCliAgentRow {
 }
 
 /// Test entry point for the production collector. Per-call transcript and
-/// SQLite sources are merged, then grouped by UTC date, agent, and model.
+/// SQLite sources are merged, retaining one independently identified row per call.
 /// Root-scoped repair markers force automatic historical backfill on upgrade.
 #[cfg(test)]
 fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String> {
@@ -3526,7 +3523,6 @@ fn sync_copilot_cli_agent_usage_logs_with_cancel(
             let calls = crate::copilot::read_calls(&path, &sid, should_cancel)?;
             let native = read_copilot_cli_native_calls(store.as_ref(), &sid)?;
             let calls = crate::copilot::merge_calls(calls, native)?;
-            let daily = crate::copilot::aggregate(calls)?;
             let after = copilot_cli_transcript_fingerprint(&path)?;
             if before != after {
                 return Err("Copilot 事件檔在讀取時變更，稍後重試".into());
@@ -3537,11 +3533,14 @@ fn sync_copilot_cli_agent_usage_logs_with_cancel(
             let cwd = store
                 .as_ref()
                 .and_then(|s| resolve_session_store_cwd(s, &sid));
-            let rows: Vec<_> = daily
+            let rows: Vec<_> = calls
                 .into_iter()
-                .map(|r| CopilotCliAgentRow {
+                .map(|r| CopilotCliUsageRow {
                     session_id: sid.clone(),
-                    ts: r.timestamp,
+                    call_identity: r.identity,
+                    ts: r
+                        .timestamp
+                        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
                     model: r.model,
                     agent_id: r.agent_id,
                     initiator: r.initiator,
@@ -3556,7 +3555,7 @@ fn sync_copilot_cli_agent_usage_logs_with_cancel(
                 .collect();
             let tx = conn.transaction().map_err(|e| e.to_string())?;
             if !rows.is_empty() {
-                replace_copilot_cli_daily_rows(&tx, &root, &source_key, &sid, &rows)?;
+                replace_copilot_cli_call_rows(&tx, &root, &source_key, &sid, &rows)?;
             }
             tx.execute(
                 "INSERT OR REPLACE INTO sync_state VALUES (?, ?, ?)",
@@ -3620,7 +3619,7 @@ fn read_copilot_cli_native_calls(
     let mut stmt = store
         .prepare(
             "SELECT created_at, model, agent_id, initiator, input_tokens, output_tokens,
-                cache_read_tokens, cache_write_tokens, reasoning_tokens, duration_ms
+                cache_read_tokens, cache_write_tokens, reasoning_tokens, duration_ms, id
          FROM assistant_usage_events WHERE session_id = ? ORDER BY created_at, id",
         )
         .map_err(|e| e.to_string())?;
@@ -3635,6 +3634,10 @@ fn read_copilot_cli_native_calls(
             u64::try_from(n).map_err(|_| "Copilot SQLite 用量不可為負數".into())
         };
         calls.push(crate::copilot::Call {
+            identity: format!(
+                "sqlite:{}",
+                row.get::<_, i64>(10).map_err(|e| e.to_string())?
+            ),
             timestamp: crate::copilot::parse_timestamp(
                 &row.get::<_, String>(0).map_err(|e| e.to_string())?,
             )?,
@@ -3657,13 +3660,14 @@ fn read_copilot_cli_native_calls(
     Ok(calls)
 }
 
-fn replace_copilot_cli_daily_rows(
+fn replace_copilot_cli_call_rows(
     tx: &rusqlite::Transaction<'_>,
     copilot_dir: &Path,
     source_key: &str,
     session_id: &str,
-    agent_rows: &[CopilotCliAgentRow],
+    agent_rows: &[CopilotCliUsageRow],
 ) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
     let transcript = copilot_dir
         .join("session-state")
         .join(session_id)
@@ -3752,10 +3756,13 @@ fn replace_copilot_cli_daily_rows(
             hook_total.max(previous_total)
         ));
     }
+    let mut delete = tx
+        .prepare_cached("DELETE FROM usage_entries WHERE id = ?")
+        .map_err(|e| e.to_string())?;
     for id in owned_ids {
-        tx.execute("DELETE FROM usage_entries WHERE id = ?", [id])
-            .map_err(|e| e.to_string())?;
+        delete.execute([id]).map_err(|e| e.to_string())?;
     }
+    drop(delete);
     register_usage_source_directory(
         tx,
         "copilot",
@@ -3764,66 +3771,8 @@ fn replace_copilot_cli_daily_rows(
         copilot_dir,
     )?;
     let session_name = get_copilot_session_name(copilot_dir, session_id);
-    // Insert the split per-agent rows.
-    for row in agent_rows {
-        let timestamp = &row.ts;
-        let date_str = timestamp.get(..10).unwrap_or(&row.ts).to_string();
-        // CLI accounting mirrors the hook: raw input + output. Since
-        // `input_tokens` was normalized to exclude cache reads, add
-        // `cache_read` back once. Reasoning and cache write remain separate
-        // breakdowns and are not added to tokens_total.
-        let total = row.input_tokens + row.cache_read + row.output_tokens;
-
-        let (row_session_id, parent_session_id, agent_nickname, agent_id_segment, agent_role) =
-            match &row.agent_id {
-                Some(agent) if !agent.is_empty() => {
-                    let synthetic = format!("{}__{}", row.session_id, agent);
-                    // Only surface agent_role when the source explicitly
-                    // marked the agent as a sub-agent; never guess.
-                    let role = if row.initiator.as_deref() == Some("sub-agent") {
-                        Some("sub-agent".to_string())
-                    } else {
-                        None
-                    };
-                    (
-                        synthetic,
-                        Some(row.session_id.clone()),
-                        Some(agent.clone()),
-                        agent.clone(),
-                        role,
-                    )
-                }
-                _ => (row.session_id.clone(), None, None, "main".to_string(), None),
-            };
-
-        let session_name = session_name.clone();
-        let session_name = match (&row.agent_id, &session_name) {
-            (Some(agent), Some(name)) if !agent.is_empty() => {
-                Some(format!("{} (subagent {})", name, agent))
-            }
-            (Some(agent), None) if !agent.is_empty() => Some(format!("Subagent {}", agent)),
-            _ => session_name,
-        };
-
-        // import_source_id namespace is distinct from copilot-app, the
-        // hook's FNV hash, and vscode-chat. Includes the canonical source
-        // directory, session, agent and model so re-runs upsert the same
-        // row instead of duplicating.
-        let model_identity = encode_hex(row.model.as_deref().unwrap_or("").as_bytes());
-        let usage_identity = format!(
-            "source={};date={};agent={};model={}",
-            source_key,
-            date_str,
-            encode_hex(agent_id_segment.as_bytes()),
-            model_identity
-        );
-        let import_source_id = format!(
-            "copilot-cli-agents:{}:{}:{}:{}:{}",
-            source_key, row.session_id, date_str, agent_id_segment, model_identity
-        );
-
-        let insert_res = tx.execute(
-                "INSERT OR IGNORE INTO usage_entries (
+    let transcript_path = transcript.to_string_lossy();
+    let mut insert = tx.prepare_cached("INSERT OR IGNORE INTO usage_entries (
                     assistant_type, source_kind, source_dir_key, usage_identity, timestamp, date, session_id, session_name,
                     transcript_path, cwd, version, turn_no, model, model_id,
                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
@@ -3839,44 +3788,93 @@ fn replace_copilot_cli_daily_rows(
                     ?, ?, ?, ?, ?, ?,
                     ?, NULL, ?, NULL,
                     ?, ?, ?
-                )",
-                params![
-                    "copilot",
-                    COPILOT_CLI_SOURCE_KIND,
-                    source_key,
-                    usage_identity,
-                    timestamp,
-                    date_str,
-                    row_session_id,
-                    session_name,
-                    hook_transcript_path(copilot_dir, "copilot", &row.session_id)
-                        .map(|path| path.to_string_lossy().into_owned()),
-                    row.cwd.as_deref(),
-                    // Daily aggregates retain the existing synthetic turn number.
-                    // usage_identity separates dates, agents, and models.
-                    1i64,
-                    row.model,
-                    row.model,
-                    row.input_tokens as i64,
-                    row.output_tokens as i64,
-                    row.cache_read as i64,
-                    row.cache_write as i64,
-                    row.reasoning as i64,
-                    total as i64,
-                    row.input_tokens as i64,
-                    row.output_tokens as i64,
-                    row.cache_read as i64,
-                    row.cache_write as i64,
-                    row.reasoning as i64,
-                    total as i64,
-                    row.duration_ms as i64,
-                    import_source_id,
-                    parent_session_id,
-                    agent_nickname,
-                    agent_role,
-                ],
-            );
-        insert_res.map_err(|e| format!("寫入 Copilot CLI 每日用量失敗: {e}"))?;
+                )").map_err(|e| e.to_string())?;
+    // Insert one row for every reconciled call.
+    for row in agent_rows {
+        let timestamp = &row.ts;
+        let date_str = timestamp.get(..10).unwrap_or(&row.ts).to_string();
+        // CLI accounting mirrors the hook: raw input + output. Since
+        // `input_tokens` was normalized to exclude cache reads, add
+        // `cache_read` back once. Reasoning and cache write remain separate
+        // breakdowns and are not added to tokens_total.
+        let total = row.input_tokens + row.cache_read + row.output_tokens;
+
+        let (row_session_id, parent_session_id, agent_nickname, agent_role) = match &row.agent_id {
+            Some(agent) if !agent.is_empty() => {
+                let synthetic = format!("{}__{}", row.session_id, agent);
+                // Only surface agent_role when the source explicitly
+                // marked the agent as a sub-agent; never guess.
+                let role = if row.initiator.as_deref() == Some("sub-agent") {
+                    Some("sub-agent".to_string())
+                } else {
+                    None
+                };
+                (
+                    synthetic,
+                    Some(row.session_id.clone()),
+                    Some(agent.clone()),
+                    role,
+                )
+            }
+            _ => (row.session_id.clone(), None, None, None),
+        };
+
+        let session_name = session_name.clone();
+        let session_name = match (&row.agent_id, &session_name) {
+            (Some(agent), Some(name)) if !agent.is_empty() => {
+                Some(format!("{} (subagent {})", name, agent))
+            }
+            (Some(agent), None) if !agent.is_empty() => Some(format!("Subagent {}", agent)),
+            _ => session_name,
+        };
+
+        // Independent call IDs preserve distinct calls even when their times,
+        // agents, models, and token counts are equal. Native-only calls keep
+        // SQLite row IDs; matched pairs retain the transcript API identity.
+        // Fixed-size keys avoid repeating potentially long API request IDs
+        // in every SQLite index and export record.
+        let call_identity = hex::encode(Sha256::digest(row.call_identity.as_bytes()));
+        let usage_identity = format!("source={source_key};call={call_identity}");
+        let import_source_id = format!(
+            "copilot-cli-agents:{source_key}:{}:call:{call_identity}",
+            row.session_id
+        );
+
+        let insert_res = insert.execute(params![
+            "copilot",
+            COPILOT_CLI_SOURCE_KIND,
+            source_key,
+            usage_identity,
+            timestamp,
+            date_str,
+            row_session_id,
+            session_name,
+            transcript_path.as_ref(),
+            row.cwd.as_deref(),
+            // Preserve the existing synthetic turn number; the call ID
+            // separates independent rows without inventing user turns.
+            1i64,
+            row.model,
+            row.model,
+            row.input_tokens as i64,
+            row.output_tokens as i64,
+            row.cache_read as i64,
+            row.cache_write as i64,
+            row.reasoning as i64,
+            total as i64,
+            row.input_tokens as i64,
+            row.output_tokens as i64,
+            row.cache_read as i64,
+            row.cache_write as i64,
+            row.reasoning as i64,
+            total as i64,
+            row.duration_ms as i64,
+            import_source_id,
+            parent_session_id,
+            agent_nickname,
+            agent_role,
+        ]);
+        insert_res.map_err(|e| format!("寫入 Copilot CLI 逐筆用量失敗: {e}"))?;
     }
     Ok(())
 }
@@ -15225,6 +15223,156 @@ mod tests {
     }
 
     #[test]
+    fn cli_reconciler_preserves_call_ids_for_identical_times_and_on_append() {
+        let base = temp_jsonl_path("cli-stable-call-ids").with_extension("");
+        let sid = "stable-call-ids";
+        let first = cli_usage_fixture(1, "2026-07-23T12:34:56.789Z");
+        let second = cli_usage_fixture(2, "2026-07-23T12:34:56.789Z");
+        write_cli_usage_fixture(&base, sid, &[first.clone(), second.clone()]);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let read = |conn: &Connection| -> Vec<(String, String, i64)> {
+            conn.prepare(
+                "SELECT usage_identity,timestamp,delta_total FROM usage_entries
+                WHERE session_id=? ORDER BY usage_identity",
+            )
+            .unwrap()
+            .query_map([sid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+        };
+        sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
+        let initial = read(&conn);
+        assert_eq!(initial.len(), 2);
+        assert_ne!(initial[0].0, initial[1].0);
+        assert_eq!(initial[0].1, initial[1].1);
+        assert_eq!(initial[0].2, 110);
+        assert_eq!(initial[1].2, 110);
+        // Reordering existing events and appending another call must leave
+        // both previous identities and precise timestamps unchanged.
+        write_cli_usage_fixture(
+            &base,
+            sid,
+            &[
+                second,
+                first,
+                cli_usage_fixture(3, "2026-07-23T12:35:00.001Z"),
+            ],
+        );
+        sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
+        let appended = read(&conn);
+        assert_eq!(appended.len(), 3);
+        assert!(initial.iter().all(|row| appended.contains(row)));
+        assert_eq!(
+            cli_daily_totals(&conn, sid),
+            vec![("2026-07-23".into(), 330)]
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn cli_reconciler_repairs_daily_aggregates_into_calls_at_their_actual_times() {
+        let base = temp_jsonl_path("cli-intraday-repair").with_extension("");
+        fs::create_dir_all(&base).unwrap();
+        let sid = "intraday-repair";
+        let store = build_cli_reconciler_fixture(&base, &[], &[sid]);
+        for (id, input, timestamp) in [
+            (1, 100, "2026-07-23T09:01:00Z"),
+            (2, 200, "2026-07-23T12:34:56.789Z"),
+        ] {
+            insert_cli_event(
+                &store,
+                CliEventIdentity {
+                    id,
+                    session_id: sid,
+                    model: "B",
+                    agent_id: None,
+                    initiator: None,
+                },
+                CliEventTokens {
+                    input,
+                    output: input / 10,
+                    cache_read: input * 8 / 10,
+                    cache_write: 0,
+                    reasoning: 0,
+                    duration_ms: 50,
+                },
+                timestamp,
+            );
+        }
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let source = encode_hex(
+            crate::config::absolute_root(&base)
+                .as_os_str()
+                .as_encoded_bytes(),
+        );
+        let import_id = format!("copilot-cli-agents:{source}:{sid}:2026-07-23:main:42");
+        conn.execute("INSERT INTO usage_entries (assistant_type,source_kind,source_dir_key,
+            session_id,date,timestamp,turn_no,model,usage_identity,import_source_id,tokens_total,delta_total)
+            VALUES ('copilot','copilot-cli',?1,?2,'2026-07-23','2026-07-23T09:01:00Z',1,'B',
+            'daily-aggregate',?3,330,330)",params![source,sid,import_id]).unwrap();
+        conn.execute(
+            "INSERT INTO sync_state VALUES (?,1,0)",
+            [format!("migration:copilot_cli_daily_usage_v3:{source}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state VALUES (?,0,0)",
+            [format!(
+                "{COPILOT_CLI_AGENT_CURSOR_PREFIX}{source}::2026-07-23T12:34:56.789Z::2"
+            )],
+        )
+        .unwrap();
+        let fingerprint = copilot_cli_transcript_fingerprint(
+            &base.join("session-state").join(sid).join("events.jsonl"),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state VALUES (?,?,?)",
+            params![
+                format!("copilot-cli-transcript:{source}:{sid}"),
+                fingerprint.0,
+                fingerprint.1
+            ],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
+            let rows: Vec<(String, i64)> = conn
+                .prepare(
+                    "SELECT timestamp,delta_total FROM usage_entries
+                WHERE session_id=? ORDER BY timestamp",
+                )
+                .unwrap()
+                .query_map([sid], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                rows.len(),
+                2,
+                "must preserve each call, including later evening activity"
+            );
+            assert_eq!(
+                crate::copilot::parse_timestamp(&rows[0].0).unwrap(),
+                crate::copilot::parse_timestamp("2026-07-23T09:01:00Z").unwrap()
+            );
+            assert_eq!(
+                crate::copilot::parse_timestamp(&rows[1].0).unwrap(),
+                crate::copilot::parse_timestamp("2026-07-23T12:34:56.789Z").unwrap()
+            );
+            assert_eq!(rows.iter().map(|r| r.1).collect::<Vec<_>>(), vec![110, 220]);
+            assert_eq!(
+                cli_daily_totals(&conn, sid),
+                vec![("2026-07-23".into(), 330)]
+            );
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn cli_reconciler_fills_544_transcript_calls_overlapping_22_sqlite_calls() {
         let base = temp_jsonl_path("cli-resume-coverage").with_extension("");
         fs::create_dir_all(&base).unwrap();
@@ -16086,7 +16234,10 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(row.0, 1, "cumulative hook rows must be replaced");
+        assert_eq!(
+            row.0, 2,
+            "cumulative Hook rows must be replaced by both calls"
+        );
         assert_eq!(row.1, 330, "hook delta sum must cover both reset segments");
         assert!(row
             .2
@@ -16147,7 +16298,7 @@ mod tests {
 
         let row: (i64, Option<String>) = conn
             .query_row(
-                "SELECT tokens_total, import_source_id
+                "SELECT SUM(tokens_total), MAX(import_source_id)
                  FROM usage_entries
                  WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
                    AND session_id = ? AND parent_session_id IS NULL",
@@ -16697,7 +16848,7 @@ mod tests {
         sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
         let main_total: i64 = conn
             .query_row(
-                "SELECT tokens_total FROM usage_entries
+                "SELECT SUM(tokens_total) FROM usage_entries
                  WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
                    AND session_id = ? AND parent_session_id IS NULL",
                 params![session_id],
@@ -16739,7 +16890,7 @@ mod tests {
         sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
         let new_main_total: i64 = conn
             .query_row(
-                "SELECT tokens_total FROM usage_entries
+                "SELECT SUM(tokens_total) FROM usage_entries
                  WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
                    AND session_id = ? AND parent_session_id IS NULL",
                 params![session_id],
@@ -16748,7 +16899,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             new_main_total, 660,
-            "must re-aggregate from full history and upsert"
+            "must rebuild all calls from full history without duplicating previous calls"
         );
 
         if let Some(value) = old_dir {

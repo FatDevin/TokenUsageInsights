@@ -1,13 +1,13 @@
 //! Read and reconcile Copilot CLI's per-call usage without counting snapshots.
-use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-pub(crate) const PARSER_VERSION: u32 = 1;
+pub(crate) const PARSER_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Metrics {
@@ -44,6 +44,8 @@ impl Metrics {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Call {
+    /// Stable within the source directory and parent session; independent of time/model.
+    pub identity: String,
     pub timestamp: DateTime<Utc>,
     pub model: Option<String>,
     pub agent_id: Option<String>,
@@ -150,7 +152,12 @@ pub(crate) fn read_calls(
         };
         let mut validate = Metrics::default();
         validate.add(&metrics)?;
+        let key = (source_session.to_owned(), agent_id.clone(), identity);
         let call = Call {
+            identity: format!(
+                "event:{}",
+                serde_json::to_string(&key).map_err(|e| e.to_string())?
+            ),
             timestamp: parse_timestamp(event.timestamp.as_deref().ok_or("Copilot 用量缺少時間")?)?,
             model: usage["model"]
                 .as_str()
@@ -162,7 +169,6 @@ pub(crate) fn read_calls(
         };
         // Agent sequences restart independently. Stable API identities are
         // scoped to the agent, never to sequence or the selected model.
-        let key = (source_session.to_owned(), call.agent_id.clone(), identity);
         if let Some(previous) = identities.get(&key) {
             if previous != &call {
                 return Err("Copilot 相同用量識別碼的內容不一致".into());
@@ -250,41 +256,6 @@ pub(crate) fn merge_calls(
     Ok(transcript)
 }
 
-pub(crate) struct DailyUsage {
-    pub timestamp: String,
-    pub model: Option<String>,
-    pub agent_id: Option<String>,
-    pub initiator: Option<String>,
-    pub metrics: Metrics,
-}
-
-pub(crate) fn aggregate(calls: Vec<Call>) -> Result<Vec<DailyUsage>, String> {
-    let mut groups = BTreeMap::new();
-    for call in calls {
-        let key = (
-            call.timestamp.date_naive(),
-            call.agent_id.clone(),
-            call.model.clone(),
-        );
-        let row = groups.entry(key).or_insert_with(|| DailyUsage {
-            timestamp: call.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true),
-            model: call.model,
-            agent_id: call.agent_id,
-            initiator: call.initiator.clone(),
-            metrics: Metrics::default(),
-        });
-        let timestamp = call.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true);
-        if timestamp < row.timestamp {
-            row.timestamp = timestamp;
-        }
-        if call.initiator.as_deref() == Some("sub-agent") {
-            row.initiator = call.initiator;
-        }
-        row.metrics.add(&call.metrics)?;
-    }
-    Ok(groups.into_values().collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,10 +300,9 @@ mod tests {
             json!({"type":"session.usage_checkpoint","data":{"usage":{}}})], "", false).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].agent_id.as_deref(), Some("child"));
-        let daily = aggregate(rows).unwrap();
-        assert_eq!(daily.len(), 2);
-        assert_eq!(daily[1].model.as_deref(), Some("B"));
-        assert_eq!(daily[1].metrics.input + daily[1].metrics.output, 110);
+        assert_eq!(rows[1].model.as_deref(), Some("B"));
+        assert_eq!(rows[1].metrics.input + rows[1].metrics.output, 110);
+        assert_ne!(rows[0].identity, rows[1].identity);
     }
 
     #[test]
@@ -378,11 +348,8 @@ mod tests {
         let c = call("2026-07-23T02:00:00Z");
         let merged = merge_calls(vec![a.clone(), b], vec![native, c]).unwrap();
         assert_eq!(merged.len(), 3);
-        let daily = aggregate(merged).unwrap();
-        assert_eq!(daily.len(), 2);
-        assert!(daily[0].timestamp.starts_with("2026-07-22"));
-        assert_eq!(daily[0].metrics.input, 100);
-        assert_eq!(daily[1].metrics.input, 200);
+        assert_eq!(merged[0].timestamp, a.timestamp);
+        assert_eq!(merged.iter().map(|c| c.metrics.input).sum::<u64>(), 300);
         // Exact matches win before a neighbouring call is considered.
         let mut nearby = a.clone();
         nearby.timestamp += chrono::Duration::milliseconds(1);
@@ -410,14 +377,19 @@ mod tests {
     }
 
     #[test]
-    fn aggregates_in_utc_across_models_and_rejects_sum_overflow() {
+    fn normalizes_call_times_to_utc_and_rejects_sum_overflow() {
         let a = call("2026-07-23T07:59:59+08:00");
         let b = call("2026-07-23T08:00:00+08:00");
-        let daily = aggregate(vec![a.clone(), b]).unwrap();
-        assert!(daily[0].timestamp.starts_with("2026-07-22"));
-        assert!(daily[1].timestamp.starts_with("2026-07-23"));
-        let mut huge = a.clone();
-        huge.metrics.input = i64::MAX as u64 - 10;
-        assert!(aggregate(vec![huge, a]).is_err());
+        assert_eq!(
+            a.timestamp,
+            parse_timestamp("2026-07-22T23:59:59Z").unwrap()
+        );
+        assert_eq!(
+            b.timestamp,
+            parse_timestamp("2026-07-23T00:00:00Z").unwrap()
+        );
+        let mut huge = a.metrics.clone();
+        huge.input = i64::MAX as u64 - 10;
+        assert!(huge.add(&a.metrics).is_err());
     }
 }
