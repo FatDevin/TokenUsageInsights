@@ -15369,6 +15369,8 @@ mod tests {
                 vec![("2026-07-23".into(), 330)]
             );
         }
+        // Windows requires the fixture database handle to close before deletion.
+        store.close().unwrap();
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -15441,6 +15443,8 @@ mod tests {
             .unwrap();
         assert_eq!(child.agent_role.as_deref(), Some("sub-agent"));
         assert_eq!(child.model.as_deref(), Some("C"));
+        // Windows requires the fixture database handle to close before deletion.
+        store.close().unwrap();
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -15508,6 +15512,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pending, 0);
+        // Windows requires the fixture database handle to close before deletion.
+        store.close().unwrap();
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -15694,6 +15700,8 @@ mod tests {
         assert_eq!(read(&conn), expected);
         sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
         assert_eq!(read(&conn), expected);
+        // Windows requires the fixture database handle to close before deletion.
+        store.close().unwrap();
         fs::remove_dir_all(base).unwrap();
     }
 
