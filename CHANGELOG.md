@@ -2,6 +2,22 @@
 
 本文件記錄 TokenUsageInsights 各正式版本的實際變更。內容依 Git 標籤間的提交記錄與檔案差異整理，格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)，版本編號遵循 [Semantic Versioning](https://semver.org/lang/zh-TW/)。
 
+## [未發行]
+
+### 修正
+
+- 修正 Copilot CLI 跨日接續同一個 session 時，後續用量被歸入該模型首次使用日期，導致當日看不到 session 的問題；現在依實際 UTC 日期、代理與模型分別統計，支援切換模型及子代理跨日續用。
+- 補讀 Copilot CLI 原生事件檔的逐筆使用量，與 `session-store.db` 以一對一方式去重，補齊 SQLite 未完整記錄的續用用量；累計快照不重複加入統計。
+
+### 資料影響
+
+- 更新後首次同步會自動重新核對既有 Copilot CLI 歷史資料，不受舊同步游標限制，無須清除資料庫或手動匯入。每日修補結果也會反映於月度及年度報表。
+- 修補依來源目錄隔離並逐 session 交易寫入；事件檔尚未寫完、資料無法唯一配對或來源用量尚未補齊時，保留既有資料並自動重試。保留手動匯入與其他 Copilot 來源資料，原始 Copilot 檔案維持唯讀。
+
+### 相容性
+
+- 沿用目前的 UTC 日期與 Token 計算規則，保留舊版 SQLite／Status Line Hook 收集相容性；未新增公開 API、資料表或環境變數。
+
 ## [1.3.2] - 2026-10-15
 
 ### 新增與改善

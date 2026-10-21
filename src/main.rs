@@ -17,6 +17,7 @@ mod antigravity_metadata;
 mod browser;
 mod cli;
 mod config;
+mod copilot;
 mod db;
 mod grok;
 mod handlers;
