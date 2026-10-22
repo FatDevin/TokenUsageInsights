@@ -139,6 +139,7 @@ pub struct UsageDetailsResponse {
     pub summary: DaySummary,
     pub sessions: Vec<SessionSummary>,
     pub raw_entries: Vec<RawUsageEntry>,
+    pub models: Vec<MonthlyModelSummary>,
 }
 
 #[derive(Serialize)]
@@ -489,6 +490,12 @@ mod tests {
             .collect::<Vec<_>>();
         daily_agents.sort();
         assert_eq!(daily_agents, vec!["claude", "codex"]);
+
+        let daily_models = daily["models"].as_array().unwrap();
+        assert_eq!(daily_models.len(), 1);
+        assert_eq!(daily_models[0]["model"], "gpt-5.5");
+        assert_eq!(daily_models[0]["sessions_count"], 2);
+        assert_eq!(daily_models[0]["total_tokens"], 3_850);
 
         // 需要明確單一來源的 API 仍拒絕合併範圍。
         let export = super::export_usage_day(Path(("all".to_string(), "2026-07-01".to_string())))

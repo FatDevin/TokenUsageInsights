@@ -23,6 +23,7 @@ pub struct ModelSessionsQuery {
 
 #[derive(Clone, Copy)]
 enum ModelSessionPeriod {
+    Day,
     Month,
     Year,
 }
@@ -69,6 +70,9 @@ fn parse_model_session_period(value: &str) -> Option<ModelSessionPeriod> {
         7 => chrono::NaiveDate::parse_from_str(&format!("{value}-01"), "%Y-%m-%d")
             .ok()
             .map(|_| ModelSessionPeriod::Month),
+        10 => chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+            .ok()
+            .map(|_| ModelSessionPeriod::Day),
         _ => None,
     }
 }
@@ -229,7 +233,7 @@ pub async fn get_model_sessions(
     let Some(period_kind) = parse_model_session_period(&period) else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "期間必須是 YYYY 或 YYYY-MM" })),
+            Json(serde_json::json!({ "error": "期間必須是 YYYY、YYYY-MM 或 YYYY-MM-DD" })),
         )
             .into_response();
     };
@@ -248,6 +252,16 @@ pub async fn get_model_sessions(
     let result = tokio::task::spawn_blocking(move || {
         let conn = db::get_db_conn()?;
         let entries = match period_kind {
+            ModelSessionPeriod::Day => {
+                db::get_usage_entries_by_date(&conn, &period_for_query, &assistant_for_query)?
+                    .into_iter()
+                    .map(|row| db::DatedUsageEntry {
+                        entry: row.record.entry,
+                        assistant_type: row.assistant_type,
+                        date: row.date,
+                    })
+                    .collect()
+            }
             ModelSessionPeriod::Month => {
                 db::get_usage_entries_by_month(&conn, &period_for_query, &assistant_for_query)?
             }
@@ -431,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn model_session_period_accepts_only_valid_months_and_years() {
+    fn model_session_period_accepts_valid_days_months_and_years() {
         assert!(matches!(
             parse_model_session_period("2026"),
             Some(ModelSessionPeriod::Year)
@@ -440,9 +454,13 @@ mod tests {
             parse_model_session_period("2026-07"),
             Some(ModelSessionPeriod::Month)
         ));
+        assert!(matches!(
+            parse_model_session_period("2026-07-10"),
+            Some(ModelSessionPeriod::Day)
+        ));
         assert!(parse_model_session_period("2026-13").is_none());
         assert!(parse_model_session_period("20x6").is_none());
-        assert!(parse_model_session_period("2026-07-10").is_none());
+        assert!(parse_model_session_period("2026-02-30").is_none());
     }
 
     #[test]

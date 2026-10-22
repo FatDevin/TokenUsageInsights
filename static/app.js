@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=38';
+import i18n from './i18n.js?v=39';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -3110,7 +3110,7 @@ function renderDashboard(data) {
   }
 
   const dailyViewData = buildDailyViewData(data);
-  const { summary, sessions } = dailyViewData;
+  const { summary, sessions, models } = dailyViewData;
 
   // 1. 更新標題
   setTitleMarkup('calendar', date);
@@ -3217,7 +3217,10 @@ function renderDashboard(data) {
   // 5. 繪製 Token 圖表
   renderChart(dailyViewData);
 
-  // 6. 渲染 Session 列表
+  // 6. 渲染模型佔比列表
+  renderDailyModelsTable(models, date);
+
+  // 7. 渲染 Session 列表
   if (shouldRefreshSearch) {
     scheduleSessionPromptSearch(currentSessionSearchQuery, { immediate: true });
   } else {
@@ -6768,6 +6771,19 @@ function renderMonthlyProjectsTable(projects) {
 // =========================================================================
 // 渲染模型佔比列表 Table
 // =========================================================================
+function renderDailyModelsTable(models, period) {
+  const tbody = document.getElementById('daily-models-body');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+
+  if (!Array.isArray(models) || models.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="5" class="placeholder-text">${t('placeholder_no_daily_models')}</td></tr>`;
+    return;
+  }
+
+  appendModelSummaryRows(tbody, models, period);
+}
+
 function renderMonthlyModelsTable(models, period) {
   const tbody = document.getElementById('monthly-models-body');
   tbody.innerHTML = '';
