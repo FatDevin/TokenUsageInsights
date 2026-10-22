@@ -4,6 +4,10 @@
 
 ## [未發行]
 
+## [1.5.0] - 2026-10-23
+
+本次 minor release 新增每日報表模型佔比，並強化發佈前的跨平台驗證流程。
+
 ### 新增與改善
 
 - 每日報表新增「使用的模型佔比」區塊，沿用月度與年度報表的模型彙總、費用估算與 Session 明細展開；`/api/:assistant/usage/:date` 新增 `models` 欄位，模型 Session 明細 API 支援 `YYYY-MM-DD` 期間。
@@ -11,6 +15,10 @@
 ### 變更
 
 - 將四平台 Rust 測試、零警告 release 建置與安裝驗證提前至 PR 與 `main` 推送時執行；建立正式標籤前須先確認同一 commit 驗證成功，避免首次發佈才發現跨平台問題而消耗原定版本號。正式 Release workflow 亦會核對此驗證結果，一般 CI 不建立公開 Release 或發布 npm。
+
+### 相容性
+
+- `/api/:assistant/usage/:date` 新增 `models` 欄位，模型 Session 明細 API 新增 `YYYY-MM-DD` 期間支援，兩者皆為向後相容的擴充；未變更資料庫結構、環境變數或安裝流程。
 
 ## [1.4.1] - 2026-10-21
 
